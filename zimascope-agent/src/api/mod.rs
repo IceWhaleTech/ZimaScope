@@ -21,9 +21,10 @@ mod settings;
 mod store;
 
 use std::{
+    convert::Infallible,
     path::Path,
     sync::{Arc, Mutex, MutexGuard},
-    time::SystemTime,
+    time::{Duration, SystemTime},
 };
 
 use axum::{
@@ -32,9 +33,14 @@ use axum::{
         FromRequest, FromRequestParts, OriginalUri, Path as AxumPath, Query, Request, State,
     },
     http::{HeaderMap, HeaderValue, Method, StatusCode, header, request::Parts},
-    response::{IntoResponse, Response},
+    response::{
+        IntoResponse, Response,
+        sse::{Event, KeepAlive, Sse},
+    },
     routing::{delete, get},
 };
+use tokio::sync::broadcast;
+use tokio_stream::{Stream, StreamExt, wrappers::BroadcastStream};
 
 use zimascope_common::model::CollectionBatch;
 
@@ -43,19 +49,25 @@ use self::{
         API_VERSION, AuditEntryDto, ClearHistoryQuery, CollectorHealthDto, CreateExportRequest,
         DomainDetailDto, DomainListQuery, DomainSummaryDto, EndpointDetailDto, EndpointListQuery,
         EndpointSummaryDto, EnrichmentStatusDto, ExportTaskDto, FlowDto, FlowListQuery,
-        OverviewDto, Page, ServiceStatusDto, SettingsSummaryDto, TimeRange, unix_millis,
+        OverviewDto, Page, ServiceStatusDto, SettingsSummaryDto, StreamQuery, TimeRange,
+        unix_millis,
     },
     error::ApiError,
     settings::{Settings, SettingsPatch},
-    store::Store,
+    store::{Store, StreamEvent},
 };
 
 pub use self::{dto::ExportFormat, error::PROBLEM_CONTENT_TYPE, store::ApiConfig};
+
+/// Number of collection intervals buffered per SSE subscriber before lagging
+/// subscribers are asked to resync over REST.
+const STREAM_CHANNEL_CAPACITY: usize = 64;
 
 /// Cloneable shared state for every API handler.
 #[derive(Clone)]
 pub struct ApiState {
     inner: Arc<Mutex<Inner>>,
+    events: broadcast::Sender<Arc<StreamEvent>>,
 }
 
 struct Inner {
@@ -69,6 +81,7 @@ struct Inner {
 
 impl ApiState {
     pub fn new(config: ApiConfig) -> Self {
+        let (events, _) = broadcast::channel(STREAM_CHANNEL_CAPACITY);
         Self {
             inner: Arc::new(Mutex::new(Inner {
                 store: Store::new(&config),
@@ -78,17 +91,24 @@ impl ApiState {
                 started_at: SystemTime::now(),
                 version: config.version,
             })),
+            events,
         }
     }
 
-    /// Feeds one collection interval into the read model.
+    /// Feeds one collection interval into the read model and notifies SSE
+    /// subscribers.
     pub fn ingest_batch(&self, batch: CollectionBatch) {
-        self.lock().store.ingest(batch);
+        let event = self.lock().store.ingest(batch);
+        let _ = self.events.send(Arc::new(event));
     }
 
     /// Records why collection is unavailable so `/v1/status` can explain it.
     pub fn set_collector_error(&self, error: impl Into<String>) {
         self.lock().collector_error = Some(error.into());
+    }
+
+    fn subscribe(&self) -> broadcast::Receiver<Arc<StreamEvent>> {
+        self.events.subscribe()
     }
 
     fn lock(&self) -> MutexGuard<'_, Inner> {
@@ -162,6 +182,7 @@ pub fn router(state: ApiState) -> Router {
         .route("/v1", get(describe))
         .route("/v1/status", get(status))
         .route("/v1/overview", get(overview))
+        .route("/v1/stream", get(stream))
         .route("/v1/flows", get(list_flows))
         .route("/v1/flows/{id}", get(get_flow))
         .route("/v1/endpoints", get(list_endpoints))
@@ -245,6 +266,10 @@ async fn describe() -> Json<ApiDescription> {
                 href: "/v1/overview",
             },
             ResourceLink {
+                name: "stream",
+                href: "/v1/stream",
+            },
+            ResourceLink {
                 name: "flows",
                 href: "/v1/flows",
             },
@@ -287,6 +312,53 @@ async fn overview(
 ) -> Json<OverviewDto> {
     let range = query.range.unwrap_or_default();
     Json(state.lock().store.overview(range, SystemTime::now()))
+}
+
+/// Streams one `tick` per collection interval over Server-Sent Events.
+///
+/// Reconnects (`Last-Event-ID`) and lagging subscribers receive a `resync`
+/// event instead of silently missing updates; clients should then reload
+/// `/v1/flows`, `/v1/overview` or `/v1/status` and keep consuming the stream.
+async fn stream(
+    State(state): State<ApiState>,
+    ApiQuery(query): ApiQuery<StreamQuery>,
+    headers: HeaderMap,
+) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, ApiError> {
+    let filter = query.filter();
+    let receiver = state.subscribe();
+    let resumed = headers.contains_key("last-event-id");
+    let initial = resumed.then(|| Ok(resync_event("client reconnected; resync required")));
+
+    let updates = BroadcastStream::new(receiver).map(move |message| {
+        let event = match message {
+            Ok(event) => tick_event(&event, &filter),
+            Err(_) => resync_event("subscriber fell behind; resync required"),
+        };
+        Ok::<Event, Infallible>(event)
+    });
+
+    let stream = tokio_stream::iter(initial).chain(updates);
+    Ok(Sse::new(stream).keep_alive(
+        KeepAlive::new()
+            .interval(Duration::from_secs(15))
+            .text("keep-alive"),
+    ))
+}
+
+fn tick_event(event: &StreamEvent, filter: &dto::StreamFilter) -> Event {
+    let tick = event.tick(filter);
+    match serde_json::to_string(&tick) {
+        Ok(data) => Event::default()
+            .id(event.sequence.to_string())
+            .event("tick")
+            .data(data),
+        Err(_) => resync_event("event serialization failed"),
+    }
+}
+
+fn resync_event(reason: &str) -> Event {
+    let data = serde_json::json!({ "reason": reason }).to_string();
+    Event::default().event("resync").data(data)
 }
 
 async fn list_flows(
@@ -563,6 +635,26 @@ mod tests {
         bytes: u64,
         age: Duration,
     ) -> FlowUpdate {
+        flow_with(
+            Protocol::Tcp,
+            direction,
+            source,
+            destination,
+            packets,
+            bytes,
+            age,
+        )
+    }
+
+    fn flow_with(
+        protocol: Protocol,
+        direction: FlowDirection,
+        source: (&str, u16),
+        destination: (&str, u16),
+        packets: u64,
+        bytes: u64,
+        age: Duration,
+    ) -> FlowUpdate {
         let now = Instant::now();
         FlowUpdate {
             key: FlowKey {
@@ -575,7 +667,7 @@ mod tests {
                     port: Some(destination.1),
                 },
                 interface_index: NonZeroU32::new(7).expect("non-zero ifindex"),
-                protocol: Protocol::Tcp,
+                protocol,
                 direction,
             },
             delta: TrafficCounters { packets, bytes },
@@ -1138,8 +1230,226 @@ mod tests {
         assert_eq!(body["profile"]["asn"], 15169);
         assert_eq!(body["profile"]["organization"], "Google LLC");
 
+        let body = body_json(call(&state, get("/v1/flows")).await).await;
+        assert_eq!(body["items"][0]["remote_profile"]["country"], "US");
+        assert_eq!(body["items"][0]["remote_profile"]["asn"], 15169);
+        assert_eq!(
+            body["items"][0]["remote_profile"]["organization"],
+            "Google LLC"
+        );
+
         let body = body_json(call(&state, get("/v1/overview?range=15m")).await).await;
         assert_eq!(body["top_countries"][0]["country"], "US");
         assert_eq!(body["top_asns"][0]["asn"], 15169);
+    }
+
+    async fn next_frame(body: &mut Body) -> String {
+        let frame = tokio::time::timeout(Duration::from_secs(5), body.frame())
+            .await
+            .expect("frame arrives")
+            .expect("stream stays open")
+            .expect("frame is valid");
+        String::from_utf8(frame.into_data().expect("data frame").to_vec()).expect("UTF-8 frame")
+    }
+
+    fn assert_event_stream(response: &Response) {
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some("text/event-stream")
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_pushes_filtered_tick_events() {
+        let state = state();
+        let response = call(&state, get("/v1/stream?direction=inbound")).await;
+        assert_event_stream(&response);
+        let mut body = response.into_body();
+
+        state.ingest_batch(batch(
+            7,
+            vec![
+                outbound(("1.1.1.1", 443), 10, 1_000, Duration::ZERO),
+                flow(
+                    FlowDirection::Inbound,
+                    ("9.9.9.9", 55_000),
+                    ("10.0.0.2", 443),
+                    30,
+                    3_000,
+                    Duration::ZERO,
+                ),
+            ],
+        ));
+
+        let frame = next_frame(&mut body).await;
+        assert!(frame.contains("event: tick"), "frame: {frame}");
+        assert!(frame.contains("id: 7"), "frame: {frame}");
+        assert!(frame.contains("9.9.9.9"), "frame: {frame}");
+        assert!(!frame.contains("1.1.1.1"), "frame: {frame}");
+        assert!(frame.contains("\"inbound_bps\":"), "frame: {frame}");
+        assert!(frame.contains("\"health\":"), "frame: {frame}");
+        assert!(frame.contains("\"remote_profile\":"), "frame: {frame}");
+        assert!(frame.contains("\"scope\":\"public\""), "frame: {frame}");
+    }
+
+    #[tokio::test]
+    async fn stream_conveys_domain_observations() {
+        let state = state();
+        let response = call(&state, get("/v1/stream?domain=example.com")).await;
+        assert_event_stream(&response);
+        let mut body = response.into_body();
+
+        let mut incoming = batch(
+            1,
+            vec![outbound(("93.184.216.34", 443), 40, 4_000, Duration::ZERO)],
+        );
+        incoming.domains = vec![observation(
+            "Example.COM.",
+            "93.184.216.34",
+            DomainEvidence::Dns,
+            AssociationConfidence::Inferred,
+        )];
+        state.ingest_batch(incoming);
+
+        let frame = next_frame(&mut body).await;
+        assert!(frame.contains("event: tick"), "frame: {frame}");
+        assert!(
+            frame.contains("\"domain\":\"example.com\""),
+            "frame: {frame}"
+        );
+        assert!(frame.contains("93.184.216.34"), "frame: {frame}");
+    }
+
+    #[tokio::test]
+    async fn stream_resyncs_lagging_subscribers() {
+        let state = state();
+        let response = call(&state, get("/v1/stream")).await;
+        assert_event_stream(&response);
+        let mut body = response.into_body();
+
+        for sequence in 0..(STREAM_CHANNEL_CAPACITY + 8) {
+            state.ingest_batch(batch(sequence as u64, vec![]));
+        }
+
+        let frame = next_frame(&mut body).await;
+        assert!(frame.contains("event: resync"), "frame: {frame}");
+    }
+
+    #[tokio::test]
+    async fn last_event_id_forces_a_resync() {
+        let state = state();
+        let request = Request::builder()
+            .uri("/v1/stream")
+            .header("last-event-id", "41")
+            .body(Body::empty())
+            .expect("valid request");
+        let response = call(&state, request).await;
+        assert_event_stream(&response);
+        let mut body = response.into_body();
+
+        let frame = next_frame(&mut body).await;
+        assert!(frame.contains("event: resync"), "frame: {frame}");
+        assert!(frame.contains("reconnected"), "frame: {frame}");
+    }
+
+    #[tokio::test]
+    async fn stream_rejects_unsupported_filters() {
+        let response = call(&state(), get("/v1/stream?country=US")).await;
+        assert_problem(&response, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn generic_search_spans_flows_endpoints_domains_and_exports() {
+        let state = state();
+        let mut incoming = batch(
+            1,
+            vec![
+                outbound(("93.184.216.34", 443), 40, 4_000, Duration::ZERO),
+                flow_with(
+                    Protocol::Udp,
+                    FlowDirection::Outbound,
+                    ("10.0.0.2", 40_000),
+                    ("8.8.8.8", 53),
+                    5,
+                    500,
+                    Duration::ZERO,
+                ),
+            ],
+        );
+        incoming.domains = vec![observation(
+            "Example.COM.",
+            "93.184.216.34",
+            DomainEvidence::Dns,
+            AssociationConfidence::Inferred,
+        )];
+        state.ingest_batch(incoming);
+
+        let body = body_json(call(&state, get("/v1/flows?q=UDP")).await).await;
+        assert_eq!(body["total"], 1);
+        assert_eq!(body["items"][0]["remote"]["address"], "8.8.8.8");
+
+        let body = body_json(call(&state, get("/v1/flows?q=93.184")).await).await;
+        assert_eq!(body["total"], 1);
+        assert_eq!(body["items"][0]["remote"]["address"], "93.184.216.34");
+
+        let body = body_json(call(&state, get("/v1/flows?q=EXAMPLE")).await).await;
+        assert_eq!(body["total"], 1);
+        assert_eq!(body["items"][0]["domains"][0]["domain"], "example.com");
+
+        let body = body_json(call(&state, get("/v1/domains?q=example")).await).await;
+        assert_eq!(body["total"], 1);
+        assert_eq!(body["items"][0]["domain"], "example.com");
+
+        let body = body_json(call(&state, get("/v1/endpoints?q=93.184")).await).await;
+        assert_eq!(body["total"], 1);
+        assert_eq!(body["items"][0]["address"], "93.184.216.34");
+
+        let body = body_json(call(&state, get("/v1/flows?q=no-such-thing")).await).await;
+        assert_eq!(body["total"], 0);
+
+        let response = call(
+            &state,
+            json_request(
+                Method::POST,
+                "/v1/exports",
+                serde_json::json!({ "format": "json", "q": "udp" }),
+            ),
+        )
+        .await;
+        let body = body_json(response).await;
+        assert_eq!(body["record_count"], 1);
+    }
+
+    #[tokio::test]
+    async fn stream_applies_generic_search() {
+        let state = state();
+        let response = call(&state, get("/v1/stream?q=udp")).await;
+        assert_event_stream(&response);
+        let mut body = response.into_body();
+
+        state.ingest_batch(batch(
+            1,
+            vec![
+                outbound(("1.1.1.1", 443), 10, 1_000, Duration::ZERO),
+                flow_with(
+                    Protocol::Udp,
+                    FlowDirection::Outbound,
+                    ("10.0.0.2", 40_000),
+                    ("8.8.8.8", 53),
+                    5,
+                    500,
+                    Duration::ZERO,
+                ),
+            ],
+        ));
+
+        let frame = next_frame(&mut body).await;
+        assert!(frame.contains("event: tick"), "frame: {frame}");
+        assert!(frame.contains("8.8.8.8"), "frame: {frame}");
+        assert!(!frame.contains("1.1.1.1"), "frame: {frame}");
     }
 }

@@ -98,6 +98,13 @@ pub enum DirectionParam {
 }
 
 impl DirectionParam {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Inbound => "inbound",
+            Self::Outbound => "outbound",
+        }
+    }
+
     pub const fn matches(self, direction: FlowDirection) -> bool {
         match self {
             Self::Inbound => matches!(direction, FlowDirection::Inbound),
@@ -114,6 +121,13 @@ pub enum ProtocolParam {
 }
 
 impl ProtocolParam {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Tcp => "tcp",
+            Self::Udp => "udp",
+        }
+    }
+
     pub const fn matches(self, protocol: Protocol) -> bool {
         match self {
             Self::Tcp => matches!(protocol, Protocol::Tcp),
@@ -130,6 +144,13 @@ pub enum FlowStateParam {
 }
 
 impl FlowStateParam {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::Ended => "ended",
+        }
+    }
+
     pub const fn matches(self, state: FlowState) -> bool {
         match self {
             Self::Active => matches!(state, FlowState::Active),
@@ -213,6 +234,10 @@ impl ConfidenceParam {
 /// `/v1/domains` and export requests.
 #[derive(Clone, Debug, Default, Deserialize)]
 pub struct FlowFilter {
+    /// Generic case-insensitive substring search over Flow id, direction,
+    /// protocol, state, end reason, source/destination IP and port, interface
+    /// name and associated domains.
+    pub q: Option<String>,
     pub range: Option<TimeRange>,
     pub direction: Option<DirectionParam>,
     pub protocol: Option<ProtocolParam>,
@@ -236,6 +261,7 @@ macro_rules! flow_filter_method {
     () => {
         pub fn filter(&self) -> FlowFilter {
             FlowFilter {
+                q: self.q.clone(),
                 range: self.range,
                 direction: self.direction,
                 protocol: self.protocol,
@@ -257,6 +283,7 @@ macro_rules! flow_filter_method {
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct FlowListQuery {
+    pub q: Option<String>,
     pub range: Option<TimeRange>,
     pub direction: Option<DirectionParam>,
     pub protocol: Option<ProtocolParam>,
@@ -282,6 +309,7 @@ impl FlowListQuery {
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct EndpointListQuery {
+    pub q: Option<String>,
     pub range: Option<TimeRange>,
     pub direction: Option<DirectionParam>,
     pub protocol: Option<ProtocolParam>,
@@ -307,6 +335,7 @@ impl EndpointListQuery {
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct DomainListQuery {
+    pub q: Option<String>,
     pub range: Option<TimeRange>,
     pub direction: Option<DirectionParam>,
     pub protocol: Option<ProtocolParam>,
@@ -321,7 +350,6 @@ pub struct DomainListQuery {
     pub scope: Option<ScopeParam>,
     pub state: Option<FlowStateParam>,
     pub has_domain: Option<bool>,
-    pub q: Option<String>,
     pub evidence: Option<EvidenceParam>,
     pub confidence: Option<ConfidenceParam>,
     pub sort: Option<String>,
@@ -331,6 +359,165 @@ pub struct DomainListQuery {
 
 impl DomainListQuery {
     flow_filter_method!();
+}
+
+/// Filters accepted by `GET /v1/stream`.
+///
+/// Only filters that can be evaluated on a live Flow update are accepted;
+/// historical (`range`) and enrichment-backed filters (`country`, `asn`,
+/// `organization`, `scope`) are rejected so the stream never pretends to
+/// apply a filter it cannot evaluate. `q` uses the same searchable fields as
+/// the REST lists.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StreamQuery {
+    pub q: Option<String>,
+    pub direction: Option<DirectionParam>,
+    pub protocol: Option<ProtocolParam>,
+    pub ip: Option<std::net::IpAddr>,
+    pub src_ip: Option<std::net::IpAddr>,
+    pub dst_ip: Option<std::net::IpAddr>,
+    pub port: Option<u16>,
+    pub domain: Option<String>,
+    pub state: Option<FlowStateParam>,
+    pub has_domain: Option<bool>,
+}
+
+impl StreamQuery {
+    pub fn filter(&self) -> StreamFilter {
+        StreamFilter {
+            q: self
+                .q
+                .as_deref()
+                .map(|q| q.trim().to_ascii_lowercase())
+                .filter(|q| !q.is_empty()),
+            direction: self.direction,
+            protocol: self.protocol,
+            ip: self.ip.map(|ip| ip.to_string()),
+            src_ip: self.src_ip.map(|ip| ip.to_string()),
+            dst_ip: self.dst_ip.map(|ip| ip.to_string()),
+            port: self.port,
+            domain: self
+                .domain
+                .as_deref()
+                .map(|domain| domain.trim().trim_end_matches('.').to_ascii_lowercase()),
+            state: self.state,
+            has_domain: self.has_domain,
+        }
+    }
+}
+
+/// Precomputed filter for live Flow updates.
+#[derive(Clone, Debug, Default)]
+pub struct StreamFilter {
+    q: Option<String>,
+    direction: Option<DirectionParam>,
+    protocol: Option<ProtocolParam>,
+    ip: Option<String>,
+    src_ip: Option<String>,
+    dst_ip: Option<String>,
+    port: Option<u16>,
+    domain: Option<String>,
+    state: Option<FlowStateParam>,
+    has_domain: Option<bool>,
+}
+
+impl StreamFilter {
+    pub fn matches(&self, flow: &FlowDto) -> bool {
+        if let Some(q) = &self.q {
+            if !flow_search_text(flow).contains(q.as_str()) {
+                return false;
+            }
+        }
+        if let Some(direction) = self.direction {
+            if flow.direction != direction.as_str() {
+                return false;
+            }
+        }
+        if let Some(protocol) = self.protocol {
+            if flow.protocol != protocol.as_str() {
+                return false;
+            }
+        }
+        if let Some(ip) = &self.ip {
+            if &flow.source.address != ip && &flow.destination.address != ip {
+                return false;
+            }
+        }
+        if let Some(src_ip) = &self.src_ip {
+            if &flow.source.address != src_ip {
+                return false;
+            }
+        }
+        if let Some(dst_ip) = &self.dst_ip {
+            if &flow.destination.address != dst_ip {
+                return false;
+            }
+        }
+        if let Some(port) = self.port {
+            if flow.source.port != Some(port) && flow.destination.port != Some(port) {
+                return false;
+            }
+        }
+        if let Some(domain) = &self.domain {
+            if !flow
+                .domains
+                .iter()
+                .any(|candidate| &candidate.domain == domain)
+            {
+                return false;
+            }
+        }
+        if let Some(state) = self.state {
+            if flow.state != state.as_str() {
+                return false;
+            }
+        }
+        if let Some(has_domain) = self.has_domain {
+            if flow.domains.is_empty() == has_domain {
+                return false;
+            }
+        }
+        true
+    }
+
+    pub fn matches_domain(&self, domain: &str) -> bool {
+        self.domain
+            .as_deref()
+            .is_none_or(|candidate| candidate == domain)
+    }
+}
+
+/// Lowercase searchable text of a Flow update, matching the fields used by
+/// the REST `q` filter.
+fn flow_search_text(flow: &FlowDto) -> String {
+    use std::fmt::Write as _;
+
+    let mut text = String::with_capacity(160);
+    let _ = write!(
+        text,
+        "{} {} {} {} ",
+        flow.id, flow.direction, flow.protocol, flow.state
+    );
+    if let Some(reason) = flow.end_reason {
+        let _ = write!(text, "{reason} ");
+    }
+    let _ = write!(text, "{} ", flow.source.address);
+    if let Some(port) = flow.source.port {
+        let _ = write!(text, "{port} ");
+    }
+    let _ = write!(text, "{} ", flow.destination.address);
+    if let Some(port) = flow.destination.port {
+        let _ = write!(text, "{port} ");
+    }
+    if let Some(interface) = &flow.interface {
+        let _ = write!(text, "{interface} ");
+    }
+    for domain in &flow.domains {
+        let _ = write!(text, "{} ", domain.domain);
+    }
+    text.make_ascii_lowercase();
+    text
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -364,6 +551,9 @@ pub struct FlowDto {
     /// Direction-relative peer: the source for inbound Flows, the
     /// destination for outbound Flows.
     pub remote: EndpointDto,
+    /// Locally enriched profile of `remote.address` (PRD 8.5). Always
+    /// present; without a GeoIP/ASN database it carries `scope` only.
+    pub remote_profile: IpProfileDto,
     pub interface: Option<String>,
     pub packets: u64,
     pub bytes: u64,
@@ -521,6 +711,39 @@ pub struct DomainVisibilityDto {
     pub flows_with_domain: u64,
     pub flows_total: u64,
     pub ratio: f64,
+}
+
+/// Server-Sent Event payload for `GET /v1/stream` (`event: tick`).
+///
+/// One `tick` describes a single collection interval. `flows` are complete
+/// upserts keyed by `id`: replace any locally known Flow with the same id.
+/// `domains` are new or refreshed associations observed in the interval.
+#[derive(Clone, Debug, Serialize)]
+pub struct TickDto {
+    pub sequence: u64,
+    pub collected_at: i64,
+    pub interval_ms: u64,
+    pub traffic: TickTrafficDto,
+    pub flows: Vec<FlowDto>,
+    pub domains: Vec<DomainObservationDto>,
+    pub health: Option<CollectorHealthDto>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize)]
+pub struct TickTrafficDto {
+    pub inbound_bps: u64,
+    pub outbound_bps: u64,
+    pub inbound: CountersDto,
+    pub outbound: CountersDto,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct DomainObservationDto {
+    pub domain: String,
+    pub address: String,
+    pub evidence: &'static str,
+    pub confidence: &'static str,
+    pub observed_at: i64,
 }
 
 #[derive(Clone, Debug, Serialize)]

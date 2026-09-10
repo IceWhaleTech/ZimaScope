@@ -28,12 +28,13 @@ use crate::enrichment::{DEFAULT_CACHE_CAPACITY, Enricher, EnrichmentStats};
 
 use super::dto::{
     AsnCountDto, CollectorHealthDto, CountersDto, CountryCountDto, CreateExportRequest,
-    DirectionTotalsDto, DomainAddressDto, DomainDetailDto, DomainListQuery, DomainRefDto,
-    DomainSummaryDto, DomainVisibilityDto, EndpointDetailDto, EndpointDto, EndpointListQuery,
-    EndpointSummaryDto, EvidenceCountDto, ExportFormat, ExportTaskDto, FlowDto, FlowFilter,
-    FlowListQuery, IpProfileDto, OverviewDto, Page, PortUsageDto, RateDto, TimeRange, TimelineDto,
-    TimelinePointDto, confidence_name, direction_name, end_reason_name, evidence_name,
-    protocol_name, scope_name, state_name, unix_millis,
+    DirectionTotalsDto, DomainAddressDto, DomainDetailDto, DomainListQuery, DomainObservationDto,
+    DomainRefDto, DomainSummaryDto, DomainVisibilityDto, EndpointDetailDto, EndpointDto,
+    EndpointListQuery, EndpointSummaryDto, EvidenceCountDto, ExportFormat, ExportTaskDto, FlowDto,
+    FlowFilter, FlowListQuery, IpProfileDto, OverviewDto, Page, PortUsageDto, RateDto,
+    StreamFilter, TickDto, TickTrafficDto, TimeRange, TimelineDto, TimelinePointDto,
+    confidence_name, direction_name, end_reason_name, evidence_name, protocol_name, scope_name,
+    state_name, unix_millis,
 };
 use super::error::ApiError;
 use super::settings::Settings;
@@ -167,6 +168,56 @@ pub(crate) struct ExportContent {
     pub bytes: Vec<u8>,
 }
 
+/// One collection interval prepared for SSE subscribers.
+pub(crate) struct StreamEvent {
+    pub sequence: u64,
+    pub collected_at: SystemTime,
+    pub interval: Duration,
+    pub inbound: TrafficCounters,
+    pub outbound: TrafficCounters,
+    pub inbound_bps: u64,
+    pub outbound_bps: u64,
+    pub flows: Vec<FlowDto>,
+    pub domains: Vec<DomainObservationDto>,
+    pub health: CollectorHealthDto,
+}
+
+impl StreamEvent {
+    /// Projects the interval into a filtered `tick` payload.
+    pub(crate) fn tick(&self, filter: &StreamFilter) -> TickDto {
+        TickDto {
+            sequence: self.sequence,
+            collected_at: unix_millis(self.collected_at),
+            interval_ms: self.interval.as_millis() as u64,
+            traffic: TickTrafficDto {
+                inbound_bps: self.inbound_bps,
+                outbound_bps: self.outbound_bps,
+                inbound: CountersDto {
+                    packets: self.inbound.packets,
+                    bytes: self.inbound.bytes,
+                },
+                outbound: CountersDto {
+                    packets: self.outbound.packets,
+                    bytes: self.outbound.bytes,
+                },
+            },
+            flows: self
+                .flows
+                .iter()
+                .filter(|flow| filter.matches(flow))
+                .cloned()
+                .collect(),
+            domains: self
+                .domains
+                .iter()
+                .filter(|domain| filter.matches_domain(&domain.domain))
+                .cloned()
+                .collect(),
+            health: Some(self.health.clone()),
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 struct EndpointAggregate {
     address: IpAddr,
@@ -260,7 +311,7 @@ impl Store {
 
     // ----------------------------------------------------------------- ingest
 
-    pub(crate) fn ingest(&mut self, batch: CollectionBatch) {
+    pub(crate) fn ingest(&mut self, batch: CollectionBatch) -> StreamEvent {
         let now_instant = Instant::now();
         let now_system = SystemTime::now();
         let CollectionBatch {
@@ -275,24 +326,36 @@ impl Store {
         self.batch_sequence = sequence;
         self.last_batch_at = Some(collected_at);
         self.last_interval = interval;
+
+        let health_dto = CollectorHealthDto::from_health(&health);
+        for interface in &health.attached_interfaces {
+            self.interfaces
+                .insert(interface.ifindex.get(), interface.name.clone());
+        }
         self.health = Some(health);
 
-        if let Some(health) = &self.health {
-            for interface in &health.attached_interfaces {
-                self.interfaces
-                    .insert(interface.ifindex.get(), interface.name.clone());
-            }
-        }
-
+        let mut touched: Vec<u64> = Vec::new();
+        let mut domain_events: Vec<DomainObservationDto> = Vec::new();
         let mut changed_addresses = HashSet::new();
         for observation in &domains {
             if self.store_observation(observation, now_instant, now_system) {
                 changed_addresses.insert(observation.address);
+                domain_events.push(DomainObservationDto {
+                    domain: normalize_domain(&observation.domain),
+                    address: observation.address.to_string(),
+                    evidence: evidence_name(observation.evidence),
+                    confidence: confidence_name(observation.confidence),
+                    observed_at: unix_millis(instant_to_system(
+                        observation.observed_at,
+                        now_instant,
+                        now_system,
+                    )),
+                });
             }
         }
 
         if !changed_addresses.is_empty() {
-            for record in self.flows.values_mut() {
+            for (id, record) in self.flows.iter_mut() {
                 let address = remote_endpoint(&record.key).address;
                 if changed_addresses.contains(&address) {
                     record.domains = associate_observations(
@@ -301,6 +364,7 @@ impl Store {
                         address,
                         now_system,
                     );
+                    touched.push(*id);
                 }
             }
         }
@@ -323,7 +387,29 @@ impl Store {
         self.add_buckets(collected_at, inbound, outbound);
 
         for update in flows {
+            touched.push(flow_id(&update.key));
             self.observe_flow(update, now_instant, now_system);
+        }
+
+        let mut seen = HashSet::new();
+        let updated_flows = touched
+            .into_iter()
+            .filter(|id| seen.insert(*id))
+            .filter_map(|id| self.flows.get(&id))
+            .map(|record| flow_dto(record, &self.interfaces))
+            .collect();
+
+        StreamEvent {
+            sequence,
+            collected_at,
+            interval,
+            inbound,
+            outbound,
+            inbound_bps: self.rates.inbound_bps,
+            outbound_bps: self.rates.outbound_bps,
+            flows: updated_flows,
+            domains: domain_events,
+            health: health_dto,
         }
     }
 
@@ -677,10 +763,6 @@ impl Store {
         let mut aggregates: Vec<DomainAggregate> =
             self.aggregate_domains(&filter, now).into_values().collect();
 
-        if let Some(q) = &query.q {
-            let q = q.to_ascii_lowercase();
-            aggregates.retain(|aggregate| aggregate.domain.contains(&q));
-        }
         if let Some(evidence) = query.evidence {
             aggregates.retain(|aggregate| {
                 aggregate
@@ -1142,9 +1224,16 @@ impl Store {
 
     fn selected_flows(&self, filter: &FlowFilter, now: SystemTime) -> Vec<&FlowRecord> {
         let cutoff = filter.range.map(|range| range.cutoff(now));
+        let query = filter
+            .q
+            .as_deref()
+            .map(|q| q.trim().to_ascii_lowercase())
+            .filter(|q| !q.is_empty());
         self.flows
             .values()
-            .filter(|record| flow_matches(record, filter, cutoff))
+            .filter(|record| {
+                flow_matches(record, filter, cutoff, query.as_deref(), &self.interfaces)
+            })
             .collect()
     }
 
@@ -1431,6 +1520,12 @@ fn endpoint_dto(endpoint: &Endpoint) -> EndpointDto {
 }
 
 fn flow_dto(record: &FlowRecord, interfaces: &HashMap<u32, Box<str>>) -> FlowDto {
+    let remote = remote_endpoint(&record.key).address;
+    let profile = record
+        .remote_profile
+        .clone()
+        .unwrap_or_else(|| Arc::new(scope_only_profile(remote, SystemTime::now())));
+
     FlowDto {
         id: format!("{:016x}", record.id),
         direction: direction_name(record.key.direction),
@@ -1443,6 +1538,7 @@ fn flow_dto(record: &FlowRecord, interfaces: &HashMap<u32, Box<str>>) -> FlowDto
         source: endpoint_dto(&record.key.source),
         destination: endpoint_dto(&record.key.destination),
         remote: endpoint_dto(remote_endpoint(&record.key)),
+        remote_profile: profile_dto(&profile),
         interface: interfaces
             .get(&record.key.interface_index.get())
             .map(ToString::to_string),
@@ -1614,9 +1710,20 @@ fn associate_observations(
     domains
 }
 
-fn flow_matches(record: &FlowRecord, filter: &FlowFilter, cutoff: Option<SystemTime>) -> bool {
+fn flow_matches(
+    record: &FlowRecord,
+    filter: &FlowFilter,
+    cutoff: Option<SystemTime>,
+    query: Option<&str>,
+    interfaces: &HashMap<u32, Box<str>>,
+) -> bool {
     if let Some(cutoff) = cutoff {
         if record.last_seen < cutoff {
+            return false;
+        }
+    }
+    if let Some(query) = query {
+        if !flow_search_text(record, interfaces).contains(query) {
             return false;
         }
     }
@@ -1704,6 +1811,41 @@ fn flow_matches(record: &FlowRecord, filter: &FlowFilter, cutoff: Option<SystemT
     }
 
     true
+}
+
+/// Lowercase searchable text of a Flow, matching the fields used by the
+/// generic `q` filter on lists, exports and the SSE stream.
+fn flow_search_text(record: &FlowRecord, interfaces: &HashMap<u32, Box<str>>) -> String {
+    use std::fmt::Write as _;
+
+    let mut text = String::with_capacity(160);
+    let _ = write!(
+        text,
+        "{:016x} {} {} {} ",
+        record.id,
+        direction_name(record.key.direction),
+        protocol_name(record.key.protocol),
+        state_name(record.state)
+    );
+    if let FlowState::Ended(reason) = record.state {
+        let _ = write!(text, "{} ", end_reason_name(reason));
+    }
+    let _ = write!(text, "{} ", record.key.source.address);
+    if let Some(port) = record.key.source.port {
+        let _ = write!(text, "{port} ");
+    }
+    let _ = write!(text, "{} ", record.key.destination.address);
+    if let Some(port) = record.key.destination.port {
+        let _ = write!(text, "{port} ");
+    }
+    if let Some(interface) = interfaces.get(&record.key.interface_index.get()) {
+        let _ = write!(text, "{interface} ");
+    }
+    for association in &record.domains {
+        let _ = write!(text, "{} ", association.domain);
+    }
+    text.make_ascii_lowercase();
+    text
 }
 
 fn page_limit(limit: Option<usize>) -> Result<usize, ApiError> {
