@@ -10,10 +10,13 @@ rust-version = "1.87"
 
 [workspace.dependencies]
 anyhow = "1"
+axum = "0.8"
 hashbrown = "0.16"
 maxminddb = "0.31"
 network-types = { version = "0.2", default-features = false }
-tokio = { version = "1", features = ["macros", "rt", "signal", "sync", "time"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "net", "rt", "signal", "sync", "time"] }
 
 [profile.release]
 lto = true

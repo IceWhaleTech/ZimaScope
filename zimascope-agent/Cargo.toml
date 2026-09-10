@@ -15,8 +15,11 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow.workspace = true
+axum.workspace = true
 hashbrown.workspace = true
 maxminddb.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 tokio.workspace = true
 zimascope-common = { path = "../zimascope-common" }
 
@@ -24,5 +27,6 @@ zimascope-common = { path = "../zimascope-common" }
 aya = "0.14"
 
 [dev-dependencies]
+http-body-util = "0.1"
 maxminddb-writer = "0.1"
-serde = { version = "1", features = ["derive"] }
+tower = { version = "0.5", features = ["util"] }

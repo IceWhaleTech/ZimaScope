@@ -3,7 +3,7 @@
 //! Collection never depends on this module: a missing or stale database only
 //! means profiles carry scope classification without geographic fields.
 
-mod database;
+pub(crate) mod database;
 
 use std::{
     collections::VecDeque, net::IpAddr, num::NonZeroUsize, path::Path, sync::Arc, time::SystemTime,
@@ -13,7 +13,7 @@ use anyhow::{Context, Result};
 use hashbrown::HashMap;
 use zimascope_common::model::{AddressScope, IpProfile};
 
-use database::GeoIpDatabase;
+pub(crate) use database::GeoIpDatabase;
 
 /// Default number of cached IP profiles.
 pub const DEFAULT_CACHE_CAPACITY: usize = 16_384;
