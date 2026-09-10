@@ -1,0 +1,22 @@
+[package]
+name = "zimascope-ebpf"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[features]
+default = []
+bpf = []
+
+[[bin]]
+name = "zimascope-ebpf"
+path = "src/main.rs"
+required-features = ["bpf"]
+
+[dependencies]
+network-types.workspace = true
+zimascope-common = { path = "../zimascope-common", default-features = false }
+
+[target.'cfg(target_arch = "bpf")'.dependencies]
+aya-ebpf = "0.2"

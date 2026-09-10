@@ -1,0 +1,28 @@
+[package]
+name = "zimascope-agent"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "zimascope_agent"
+path = "src/lib.rs"
+
+[[bin]]
+name = "zimascope-agent"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+hashbrown.workspace = true
+maxminddb.workspace = true
+tokio.workspace = true
+zimascope-common = { path = "../zimascope-common" }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+aya = "0.14"
+
+[dev-dependencies]
+maxminddb-writer = "0.1"
+serde = { version = "1", features = ["derive"] }

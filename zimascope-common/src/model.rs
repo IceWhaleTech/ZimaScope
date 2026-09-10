@@ -1,0 +1,360 @@
+//! User-space domain values.
+//!
+//! These types never cross the kernel boundary and may use normal Rust types.
+
+use std::{
+    net::IpAddr,
+    num::NonZeroU32,
+    time::{Duration, Instant, SystemTime},
+};
+
+use crate::kernel_abi;
+
+/// Identity of one direction of a Flow in user space.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct FlowKey {
+    pub source: Endpoint,
+    pub destination: Endpoint,
+    pub interface_index: NonZeroU32,
+    pub protocol: Protocol,
+    pub direction: FlowDirection,
+}
+
+/// A network peer identified by IP address and, when available, port.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct Endpoint {
+    pub address: IpAddr,
+    pub port: Option<u16>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum Protocol {
+    Tcp,
+    Udp,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum FlowDirection {
+    Inbound,
+    Outbound,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct TrafficCounters {
+    pub packets: u64,
+    pub bytes: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FlowState {
+    Active,
+    Ended(EndReason),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EndReason {
+    IdleTimeout,
+    TcpFin,
+    TcpReset,
+    EvictedOrUnknown,
+}
+
+/// One Flow as observed across a single collection interval.
+///
+/// `delta` is the traffic observed since the previous successful poll. `total`
+/// is the cumulative value currently represented by the kernel map.
+#[derive(Clone, Debug)]
+pub struct FlowUpdate {
+    pub key: FlowKey,
+    pub delta: TrafficCounters,
+    pub total: TrafficCounters,
+    pub first_seen: Instant,
+    pub last_seen: Instant,
+    pub state: FlowState,
+}
+
+/// An Association between a domain and an Endpoint.
+#[derive(Clone, Debug)]
+pub struct DomainObservation {
+    pub domain: Box<str>,
+    pub address: IpAddr,
+    pub evidence: DomainEvidence,
+    pub confidence: AssociationConfidence,
+    pub client_context: u64,
+    pub observed_at: Instant,
+    pub expires_at: Instant,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum DomainEvidence {
+    Dns,
+    TlsSni,
+    HttpHost,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AssociationConfidence {
+    Direct,
+    Inferred,
+}
+
+/// Classification of an address relative to the public internet. Only
+/// [`AddressScope::Public`] addresses are enriched with geographic data.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AddressScope {
+    Public,
+    Private,
+    Shared,
+    Loopback,
+    LinkLocal,
+    UniqueLocal,
+    Multicast,
+    Broadcast,
+    Documentation,
+    Reserved,
+    Unspecified,
+}
+
+/// Locally enriched information about an IP address (PRD 8.5 / 10.3).
+#[derive(Clone, Debug)]
+pub struct IpProfile {
+    pub address: IpAddr,
+    pub scope: AddressScope,
+    pub country: Option<Box<str>>,
+    pub region: Option<Box<str>>,
+    pub city_approximate: Option<Box<str>>,
+    pub asn: Option<u32>,
+    pub organization: Option<Box<str>>,
+    pub database_version: Option<Box<str>>,
+    pub enriched_at: SystemTime,
+}
+
+/// The complete result of one logical collection interval.
+#[derive(Clone, Debug)]
+pub struct CollectionBatch {
+    pub sequence: u64,
+    pub collected_at: SystemTime,
+    pub interval: Duration,
+    pub flows: Vec<FlowUpdate>,
+    pub domains: Vec<DomainObservation>,
+    pub health: CollectorHealth,
+}
+
+#[derive(Clone, Debug)]
+pub struct CollectorHealth {
+    pub state: CollectorState,
+    pub attached_interfaces: Vec<InterfaceHealth>,
+    pub map_entries: usize,
+    pub map_capacity: usize,
+    pub kernel: KernelCounters,
+    pub gaps: Vec<ObservationGap>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CollectorState {
+    Running,
+    Degraded,
+    Stopped,
+}
+
+#[derive(Clone, Debug)]
+pub struct InterfaceHealth {
+    pub ifindex: NonZeroU32,
+    pub name: Box<str>,
+    pub ingress_attached: bool,
+    pub egress_attached: bool,
+    pub last_error: Option<Box<str>>,
+}
+
+/// Kernel counters converted to the interval since the previous poll.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct KernelCounters {
+    pub packets_seen: u64,
+    pub packets_parsed: u64,
+    pub parse_failures: u64,
+    pub map_update_failures: u64,
+    pub flow_evictions: u64,
+    pub domain_events_emitted: u64,
+    pub domain_events_dropped: u64,
+}
+
+/// A known interval in which ZimaScope could not observe complete metadata.
+#[derive(Clone, Debug)]
+pub struct ObservationGap {
+    pub started_at: SystemTime,
+    pub ended_at: Option<SystemTime>,
+    pub reason: GapReason,
+}
+
+#[derive(Clone, Debug)]
+pub enum GapReason {
+    InterfaceDetached { ifindex: u32 },
+    MapReadFailed,
+}
+
+impl Protocol {
+    /// Converts a validated kernel ABI discriminant.
+    pub const fn from_abi(value: u8) -> Option<Self> {
+        match kernel_abi::TransportProtocol::from_abi(value) {
+            Some(kernel_abi::TransportProtocol::Tcp) => Some(Self::Tcp),
+            Some(kernel_abi::TransportProtocol::Udp) => Some(Self::Udp),
+            None => None,
+        }
+    }
+}
+
+impl FlowDirection {
+    /// Converts a validated kernel ABI discriminant.
+    pub const fn from_abi(value: u8) -> Option<Self> {
+        match kernel_abi::Direction::from_abi(value) {
+            Some(kernel_abi::Direction::Inbound) => Some(Self::Inbound),
+            Some(kernel_abi::Direction::Outbound) => Some(Self::Outbound),
+            None => None,
+        }
+    }
+}
+
+impl DomainEvidence {
+    /// Converts a validated kernel ABI discriminant.
+    pub const fn from_abi(value: u8) -> Option<Self> {
+        match kernel_abi::DomainEvidenceKind::from_abi(value) {
+            Some(kernel_abi::DomainEvidenceKind::Dns) => Some(Self::Dns),
+            Some(kernel_abi::DomainEvidenceKind::TlsSni) => Some(Self::TlsSni),
+            Some(kernel_abi::DomainEvidenceKind::HttpHost) => Some(Self::HttpHost),
+            None => None,
+        }
+    }
+}
+
+impl AddressScope {
+    /// Classifies an address without any external database.
+    pub fn classify(address: IpAddr) -> Self {
+        match address {
+            IpAddr::V4(address) => Self::classify_v4(address),
+            IpAddr::V6(address) => Self::classify_v6(address),
+        }
+    }
+
+    fn classify_v4(address: std::net::Ipv4Addr) -> Self {
+        let octets = address.octets();
+        let value = u32::from_be_bytes(octets);
+
+        if address.is_broadcast() {
+            return Self::Broadcast;
+        }
+        if address.is_loopback() {
+            return Self::Loopback;
+        }
+        if address.is_private() {
+            return Self::Private;
+        }
+        if address.is_link_local() {
+            return Self::LinkLocal;
+        }
+        if address.is_multicast() {
+            return Self::Multicast;
+        }
+        if address.is_documentation() {
+            return Self::Documentation;
+        }
+        if address.is_unspecified() {
+            return Self::Unspecified;
+        }
+        if value & 0xFFC0_0000 == 0x6440_0000 {
+            // 100.64.0.0/10, RFC 6598 carrier-grade NAT.
+            return Self::Shared;
+        }
+        if value & 0xFFFFFF00 == 0xC000_0000
+            || value & 0xFFFE_0000 == 0xC612_0000
+            || value & 0xF000_0000 == 0xF000_0000
+            || value & 0xFF00_0000 == 0x0000_0000
+        {
+            // 192.0.0.0/24, 198.18.0.0/15, 240.0.0.0/4, 0.0.0.0/8.
+            return Self::Reserved;
+        }
+
+        Self::Public
+    }
+
+    fn classify_v6(address: std::net::Ipv6Addr) -> Self {
+        if address.is_loopback() {
+            return Self::Loopback;
+        }
+        if address.is_unspecified() {
+            return Self::Unspecified;
+        }
+        if address.is_unique_local() {
+            return Self::UniqueLocal;
+        }
+        if address.is_unicast_link_local() {
+            return Self::LinkLocal;
+        }
+        if address.is_multicast() {
+            return Self::Multicast;
+        }
+        if address.segments()[0] == 0x2001 && address.segments()[1] == 0x0db8 {
+            return Self::Documentation;
+        }
+
+        Self::Public
+    }
+
+    pub const fn is_public(self) -> bool {
+        matches!(self, Self::Public)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::IpAddr;
+
+    use super::AddressScope;
+
+    fn classify(address: &str) -> AddressScope {
+        AddressScope::classify(address.parse::<IpAddr>().expect("valid address"))
+    }
+
+    #[test]
+    fn classifies_ipv4_scopes() {
+        assert_eq!(classify("8.8.8.8"), AddressScope::Public);
+        assert_eq!(classify("1.1.1.1"), AddressScope::Public);
+        assert_eq!(classify("10.0.0.1"), AddressScope::Private);
+        assert_eq!(classify("172.16.0.1"), AddressScope::Private);
+        assert_eq!(classify("172.31.255.255"), AddressScope::Private);
+        assert_eq!(classify("172.32.0.1"), AddressScope::Public);
+        assert_eq!(classify("172.15.255.255"), AddressScope::Public);
+        assert_eq!(classify("192.168.1.1"), AddressScope::Private);
+        assert_eq!(classify("127.0.0.1"), AddressScope::Loopback);
+        assert_eq!(classify("169.254.1.1"), AddressScope::LinkLocal);
+        assert_eq!(classify("100.64.0.1"), AddressScope::Shared);
+        assert_eq!(classify("100.63.255.255"), AddressScope::Public);
+        assert_eq!(classify("100.128.0.1"), AddressScope::Public);
+        assert_eq!(classify("224.0.0.1"), AddressScope::Multicast);
+        assert_eq!(classify("255.255.255.255"), AddressScope::Broadcast);
+        assert_eq!(classify("192.0.2.10"), AddressScope::Documentation);
+        assert_eq!(classify("198.51.100.10"), AddressScope::Documentation);
+        assert_eq!(classify("203.0.113.10"), AddressScope::Documentation);
+        assert_eq!(classify("198.18.0.1"), AddressScope::Reserved);
+        assert_eq!(classify("240.0.0.1"), AddressScope::Reserved);
+        assert_eq!(classify("0.0.0.0"), AddressScope::Unspecified);
+        assert_eq!(classify("0.1.2.3"), AddressScope::Reserved);
+    }
+
+    #[test]
+    fn classifies_ipv6_scopes() {
+        assert_eq!(classify("2606:4700:4700::1111"), AddressScope::Public);
+        assert_eq!(classify("::1"), AddressScope::Loopback);
+        assert_eq!(classify("::"), AddressScope::Unspecified);
+        assert_eq!(classify("fd00::1"), AddressScope::UniqueLocal);
+        assert_eq!(classify("fe80::1"), AddressScope::LinkLocal);
+        assert_eq!(classify("ff02::1"), AddressScope::Multicast);
+        assert_eq!(classify("2001:db8::1"), AddressScope::Documentation);
+    }
+
+    #[test]
+    fn only_public_is_enriched() {
+        assert!(classify("8.8.8.8").is_public());
+        assert!(!classify("192.168.1.1").is_public());
+        assert!(!classify("100.64.0.1").is_public());
+    }
+}

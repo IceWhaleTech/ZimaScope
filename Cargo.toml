@@ -1,0 +1,21 @@
+[workspace]
+resolver = "3"
+members = ["xtask", "zimascope-agent", "zimascope-common", "zimascope-ebpf"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+rust-version = "1.87"
+
+[workspace.dependencies]
+anyhow = "1"
+hashbrown = "0.16"
+maxminddb = "0.31"
+network-types = { version = "0.2", default-features = false }
+tokio = { version = "1", features = ["macros", "rt", "signal", "sync", "time"] }
+
+[profile.release]
+lto = true
+codegen-units = 1
+panic = "abort"
