@@ -15,6 +15,8 @@ ZimaScope will aggregate packet and byte counters in bounded per-CPU eBPF maps a
 
 ## Consequences
 
+- The supported kernel floor is Linux 6.6 with BTF; ZimaOS ships 6.18, so BTF and the modern TC attachment path are treated as guaranteed.
+- On Linux 6.6+ programs attach through the tcx interface: no `clsact` qdisc is added, links are process-scoped, and attach health is verified with `query_tcx`. Older kernels fall back to the legacy netlink classifier path, which still adds a `clsact` qdisc.
 - Flow data is snapshot-based and may be approximate when maps evict entries.
 - The external collection interface stays small: start a worker, consume its bounded Tokio channel, and shut it down.
 - Kernel ABI structs are fixed-size, versioned, `#[repr(C)]`, and separate from user-facing domain structs.

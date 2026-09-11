@@ -1,7 +1,12 @@
 //! Production Aya adapter for the [`KernelSource`] seam.
 //!
-//! Everything Linux-specific lives here: object loading, map shards, generic
-//! netlink/TC attachment, interface resolution and ring-buffer draining.
+//! Everything Linux-specific lives here: object loading, map shards, TC/tcx
+//! attachment, interface resolution and ring-buffer draining.
+//!
+//! On Linux 6.6+ programs attach through the kernel's tcx interface, which
+//! needs no `clsact` qdisc and cleans up with its link. Older kernels fall
+//! back to the legacy netlink classification path, where a `clsact` qdisc is
+//! still added.
 
 use std::{fs, num::NonZeroU32, ptr};
 
@@ -10,9 +15,10 @@ use aya::{
     Ebpf,
     maps::{Array, IterableMap, MapData, PerCpuArray, PerCpuHashMap, RingBuf},
     programs::{
-        Link, SchedClassifier, TcAttachType,
+        Link, ProgramError, SchedClassifier, TcAttachType,
         tc::{self, SchedClassifierLink as TcLink},
     },
+    util::KernelVersion,
 };
 use zimascope_common::{
     kernel_abi::{
@@ -66,7 +72,9 @@ pub(crate) struct AyaKernelSource {
 }
 
 struct AttachedInterface {
-    health: InterfaceHealth,
+    ifindex: NonZeroU32,
+    name: Box<str>,
+    tcx: bool,
     ingress: Option<TcLink>,
     egress: Option<TcLink>,
 }
@@ -180,7 +188,46 @@ impl KernelSource for AyaKernelSource {
     fn attachment_health(&self) -> Vec<InterfaceHealth> {
         self.attached
             .iter()
-            .map(|attached| attached.health.clone())
+            .map(|attached| {
+                let mut health = InterfaceHealth {
+                    ifindex: attached.ifindex,
+                    name: attached.name.clone(),
+                    ingress_attached: false,
+                    egress_attached: false,
+                    last_error: None,
+                };
+
+                // The legacy netlink path cannot be queried portably; the
+                // stored link state is the best information available there.
+                if !attached.tcx {
+                    health.ingress_attached = attached.ingress.is_some();
+                    health.egress_attached = attached.egress.is_some();
+                    return health;
+                }
+
+                let mut errors = Vec::new();
+                match verify_tcx(
+                    &attached.name,
+                    TcAttachType::Ingress,
+                    kernel_abi::TC_INGRESS_PROGRAM,
+                ) {
+                    Ok(true) => health.ingress_attached = true,
+                    Ok(false) => errors.push("ingress program is no longer attached".to_owned()),
+                    Err(error) => errors.push(format!("query ingress tcx: {error}")),
+                }
+                match verify_tcx(
+                    &attached.name,
+                    TcAttachType::Egress,
+                    kernel_abi::TC_EGRESS_PROGRAM,
+                ) {
+                    Ok(true) => health.egress_attached = true,
+                    Ok(false) => errors.push("egress program is no longer attached".to_owned()),
+                    Err(error) => errors.push(format!("query egress tcx: {error}")),
+                }
+
+                health.last_error = errors.into_iter().next().map(Into::into);
+                health
+            })
             .collect()
     }
 
@@ -194,7 +241,7 @@ impl KernelSource for AyaKernelSource {
                         first_error = Some(anyhow::anyhow!(
                             "detach {} hook on {}: {error}",
                             direction,
-                            attached.health.name
+                            attached.name
                         ));
                     }
                 }
@@ -275,9 +322,10 @@ fn attach_interfaces(
     interfaces: &[(NonZeroU32, String)],
 ) -> Result<Vec<AttachedInterface>> {
     let mut attached = Vec::new();
+    let tcx = kernel_supports_tcx();
 
     for (ifindex, name) in interfaces {
-        let result = attach_one(ebpf, *ifindex, name);
+        let result = attach_one(ebpf, *ifindex, name, tcx);
         match result {
             Ok(interface) => attached.push(interface),
             Err(error) => {
@@ -290,10 +338,19 @@ fn attach_interfaces(
     Ok(attached)
 }
 
-fn attach_one(ebpf: &mut Ebpf, ifindex: NonZeroU32, name: &str) -> Result<AttachedInterface> {
-    if let Err(error) = tc::qdisc_add_clsact(name) {
-        if !matches!(error, tc::TcError::AlreadyAttached) {
-            return Err(anyhow::Error::new(error).context(format!("add clsact qdisc to {name}")));
+fn attach_one(
+    ebpf: &mut Ebpf,
+    ifindex: NonZeroU32,
+    name: &str,
+    tcx: bool,
+) -> Result<AttachedInterface> {
+    if !tcx {
+        if let Err(error) = tc::qdisc_add_clsact(name) {
+            if !matches!(error, tc::TcError::AlreadyAttached) {
+                return Err(
+                    anyhow::Error::new(error).context(format!("add clsact qdisc to {name}"))
+                );
+            }
         }
     }
 
@@ -317,13 +374,9 @@ fn attach_one(ebpf: &mut Ebpf, ifindex: NonZeroU32, name: &str) -> Result<Attach
     };
 
     Ok(AttachedInterface {
-        health: InterfaceHealth {
-            ifindex,
-            name: name.into(),
-            ingress_attached: true,
-            egress_attached: true,
-            last_error: None,
-        },
+        ifindex,
+        name: name.into(),
+        tcx,
         ingress: Some(ingress),
         egress: Some(egress),
     })
@@ -347,6 +400,23 @@ fn attach_hook(
     program
         .take_link(link_id)
         .with_context(|| format!("take link for {program:?} on {name}"))
+}
+
+fn verify_tcx(
+    name: &str,
+    attach_type: TcAttachType,
+    expected_program: &str,
+) -> Result<bool, ProgramError> {
+    let (_, programs) = SchedClassifier::query_tcx(name, attach_type)?;
+    Ok(programs
+        .iter()
+        .any(|program| program.name_as_str() == Some(expected_program)))
+}
+
+fn kernel_supports_tcx() -> bool {
+    KernelVersion::current()
+        .map(|current| current >= KernelVersion::new(6, 6, 0))
+        .unwrap_or(false)
 }
 
 fn detach_all(attached: &mut Vec<AttachedInterface>) {
