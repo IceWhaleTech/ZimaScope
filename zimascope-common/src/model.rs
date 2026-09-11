@@ -28,12 +28,16 @@ pub struct Endpoint {
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
 pub enum Protocol {
     Tcp,
     Udp,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
 pub enum FlowDirection {
     Inbound,
     Outbound,
@@ -52,6 +56,8 @@ pub enum FlowState {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
 pub enum EndReason {
     IdleTimeout,
     TcpFin,
@@ -86,6 +92,8 @@ pub struct DomainObservation {
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
 pub enum DomainEvidence {
     Dns,
     TlsSni,
@@ -93,6 +101,8 @@ pub enum DomainEvidence {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
 pub enum AssociationConfidence {
     Direct,
     Inferred,
@@ -101,6 +111,8 @@ pub enum AssociationConfidence {
 /// Classification of an address relative to the public internet. Only
 /// [`AddressScope::Public`] addresses are enriched with geographic data.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
 pub enum AddressScope {
     Public,
     Private,
@@ -151,6 +163,8 @@ pub struct CollectorHealth {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
 pub enum CollectorState {
     Running,
     Degraded,
@@ -187,6 +201,8 @@ pub struct ObservationGap {
 }
 
 #[derive(Clone, Debug)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
 pub enum GapReason {
     InterfaceDetached { ifindex: u32 },
     MapReadFailed,

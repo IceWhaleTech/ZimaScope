@@ -1,24 +1,25 @@
 //! Local REST API for the ZimaScope agent.
 //!
 //! The API is versioned under `/v1`, JSON-only, and served on a Unix socket.
-//! Collection is never blocked by API work: batches are ingested into bounded
-//! state and every read endpoint answers from that state.
+//! Collection is never blocked by API work: batches are ingested into SQLite
+//! (ADR-0002) and every read endpoint answers from that storage.
 //!
 //! Conventions:
 //!
 //! - Resources are plural nouns; item resources use the natural key
 //!   (`/v1/flows/{id}`, `/v1/endpoints/{ip}`, `/v1/domains/{domain}`).
-//! - Lists are cursor-paginated with `limit` and an opaque `cursor`.
+//! - Lists are offset-paginated with `limit` and `offset`, plus deterministic
+//!   tie-breaking in every sort order.
 //! - Failures use RFC 9457 `application/problem+json`.
-//! - Mutations are idempotent: `PUT /v1/settings` replaces settings,
-//!   `DELETE /v1/history` and `DELETE /v1/exports/{id}` are safe to repeat.
+//! - `GET /v1/stream` pushes one `tick` per collection interval over SSE.
 //! - Destructive operations require an explicit precondition
 //!   (`DELETE /v1/history?confirm=true` returns `428` otherwise).
 
 pub mod dto;
 mod error;
 mod settings;
-mod store;
+
+mod db;
 
 use std::{
     convert::Infallible,
@@ -45,19 +46,19 @@ use tokio_stream::{Stream, StreamExt, wrappers::BroadcastStream};
 use zimascope_common::model::CollectionBatch;
 
 use self::{
+    db::{Db, StreamEvent},
     dto::{
         API_VERSION, AuditEntryDto, ClearHistoryQuery, CollectorHealthDto, CreateExportRequest,
-        DomainDetailDto, DomainListQuery, DomainSummaryDto, EndpointDetailDto, EndpointListQuery,
-        EndpointSummaryDto, EnrichmentStatusDto, ExportTaskDto, FlowDto, FlowListQuery,
-        OverviewDto, Page, ServiceStatusDto, SettingsSummaryDto, StreamQuery, TimeRange,
+        DomainDetailDto, DomainSummaryDto, EndpointDetailDto, EndpointSummaryDto,
+        EnrichmentStatusDto, ExportTaskDto, FlowDto, FlowQuery, OverviewDto, Page,
+        ServiceStatusDto, SettingsSummaryDto, StreamQuery, TimeRange, collector_state_name,
         unix_millis,
     },
     error::ApiError,
     settings::{Settings, SettingsPatch},
-    store::{Store, StreamEvent},
 };
 
-pub use self::{dto::ExportFormat, error::PROBLEM_CONTENT_TYPE, store::ApiConfig};
+pub use self::{db::ApiConfig, dto::ExportFormat, error::PROBLEM_CONTENT_TYPE};
 
 /// Number of collection intervals buffered per SSE subscriber before lagging
 /// subscribers are asked to resync over REST.
@@ -71,7 +72,7 @@ pub struct ApiState {
 }
 
 struct Inner {
-    store: Store,
+    db: Db,
     settings: Settings,
     settings_version: u64,
     collector_error: Option<String>,
@@ -82,11 +83,26 @@ struct Inner {
 impl ApiState {
     pub fn new(config: ApiConfig) -> Self {
         let (events, _) = broadcast::channel(STREAM_CHANNEL_CAPACITY);
+        let db = match Db::open(&config) {
+            Ok(db) => db,
+            Err(error) => {
+                let fallback = ApiConfig {
+                    database: None,
+                    ..config.clone()
+                };
+                let mut db =
+                    Db::open(&fallback).expect("in-memory storage initializes without a database");
+                db.set_database_error(format!("{error:#}"));
+                db
+            }
+        };
+        let (settings, settings_version) = db.load_settings().ok().flatten().unwrap_or_default();
+
         Self {
             inner: Arc::new(Mutex::new(Inner {
-                store: Store::new(&config),
-                settings: Settings::default(),
-                settings_version: 0,
+                db,
+                settings,
+                settings_version,
                 collector_error: None,
                 started_at: SystemTime::now(),
                 version: config.version,
@@ -95,10 +111,14 @@ impl ApiState {
         }
     }
 
-    /// Feeds one collection interval into the read model and notifies SSE
+    /// Feeds one collection interval into storage and notifies SSE
     /// subscribers.
     pub fn ingest_batch(&self, batch: CollectionBatch) {
-        let event = self.lock().store.ingest(batch);
+        let event = {
+            let mut guard = self.lock();
+            let inner = &mut *guard;
+            inner.db.ingest(batch, &inner.settings)
+        };
         let _ = self.events.send(Arc::new(event));
     }
 
@@ -119,21 +139,17 @@ impl ApiState {
 }
 
 impl Inner {
-    fn etag(&self) -> String {
-        format!("\"v{}\"", self.settings_version)
-    }
-
     fn status(&self) -> ServiceStatusDto {
-        let health = self.store.health();
+        let health = self.db.health();
         let service = if self.collector_error.is_some() {
             "unavailable"
         } else {
             match health {
-                Some(health) => dto::collector_state_name(health.state),
+                Some(health) => collector_state_name(health.state),
                 None => "starting",
             }
         };
-        let (enrichment, enrichment_error) = self.store.enrichment_status();
+        let (enrichment, enrichment_error) = self.db.enrichment_status();
 
         ServiceStatusDto {
             service,
@@ -144,9 +160,10 @@ impl Inner {
                 .duration_since(self.started_at)
                 .map(|duration| duration.as_secs())
                 .unwrap_or(0),
-            last_batch_at: self.store.last_batch_at().map(unix_millis),
-            batch_sequence: self.store.batch_sequence(),
+            last_batch_at: self.db.last_batch_at().map(unix_millis),
+            batch_sequence: self.db.batch_sequence(),
             collector_error: self.collector_error.clone(),
+            database_error: self.db.database_error().map(ToOwned::to_owned),
             collector: health.map(CollectorHealthDto::from_health),
             enrichment: EnrichmentStatusDto {
                 database_version: enrichment
@@ -164,7 +181,7 @@ impl Inner {
                 retention_days: self.settings.history.retention_days,
             },
             recent_operations: self
-                .store
+                .db
                 .audit_entries()
                 .map(|(action, outcome, at)| AuditEntryDto {
                     at: unix_millis(at),
@@ -179,7 +196,6 @@ impl Inner {
 /// Builds the complete `/v1` router.
 pub fn router(state: ApiState) -> Router {
     Router::new()
-        .route("/v1", get(describe))
         .route("/v1/status", get(status))
         .route("/v1/overview", get(overview))
         .route("/v1/stream", get(stream))
@@ -239,64 +255,6 @@ pub async fn serve_unix(
 
 // ------------------------------------------------------------------ handlers
 
-#[derive(serde::Serialize)]
-struct ApiDescription {
-    name: &'static str,
-    api_version: &'static str,
-    resources: Vec<ResourceLink>,
-}
-
-#[derive(serde::Serialize)]
-struct ResourceLink {
-    name: &'static str,
-    href: &'static str,
-}
-
-async fn describe() -> Json<ApiDescription> {
-    Json(ApiDescription {
-        name: "ZimaScope local API",
-        api_version: API_VERSION,
-        resources: vec![
-            ResourceLink {
-                name: "status",
-                href: "/v1/status",
-            },
-            ResourceLink {
-                name: "overview",
-                href: "/v1/overview",
-            },
-            ResourceLink {
-                name: "stream",
-                href: "/v1/stream",
-            },
-            ResourceLink {
-                name: "flows",
-                href: "/v1/flows",
-            },
-            ResourceLink {
-                name: "endpoints",
-                href: "/v1/endpoints",
-            },
-            ResourceLink {
-                name: "domains",
-                href: "/v1/domains",
-            },
-            ResourceLink {
-                name: "settings",
-                href: "/v1/settings",
-            },
-            ResourceLink {
-                name: "exports",
-                href: "/v1/exports",
-            },
-            ResourceLink {
-                name: "history",
-                href: "/v1/history",
-            },
-        ],
-    })
-}
-
 async fn status(State(state): State<ApiState>) -> Json<ServiceStatusDto> {
     Json(state.lock().status())
 }
@@ -309,9 +267,9 @@ struct OverviewQuery {
 async fn overview(
     State(state): State<ApiState>,
     ApiQuery(query): ApiQuery<OverviewQuery>,
-) -> Json<OverviewDto> {
+) -> Result<Json<OverviewDto>, ApiError> {
     let range = query.range.unwrap_or_default();
-    Json(state.lock().store.overview(range, SystemTime::now()))
+    state.lock().db.overview(range, SystemTime::now()).map(Json)
 }
 
 /// Streams one `tick` per collection interval over Server-Sent Events.
@@ -363,122 +321,84 @@ fn resync_event(reason: &str) -> Event {
 
 async fn list_flows(
     State(state): State<ApiState>,
-    ApiQuery(query): ApiQuery<FlowListQuery>,
+    ApiQuery(query): ApiQuery<FlowQuery>,
 ) -> Result<Json<Page<FlowDto>>, ApiError> {
-    state.lock().store.list_flows(&query).map(Json)
+    state.lock().db.list_flows(&query).map(Json)
 }
 
 async fn get_flow(
     State(state): State<ApiState>,
     AxumPath(id): AxumPath<String>,
 ) -> Result<Json<FlowDto>, ApiError> {
-    state.lock().store.get_flow(&id).map(Json)
+    state.lock().db.get_flow(&id).map(Json)
 }
 
 async fn list_endpoints(
     State(state): State<ApiState>,
-    ApiQuery(query): ApiQuery<EndpointListQuery>,
+    ApiQuery(query): ApiQuery<FlowQuery>,
 ) -> Result<Json<Page<EndpointSummaryDto>>, ApiError> {
-    state.lock().store.list_endpoints(&query).map(Json)
+    state.lock().db.list_endpoints(&query).map(Json)
 }
 
 async fn get_endpoint(
     State(state): State<ApiState>,
     AxumPath(ip): AxumPath<String>,
 ) -> Result<Json<EndpointDetailDto>, ApiError> {
-    state.lock().store.get_endpoint(&ip).map(Json)
+    state.lock().db.get_endpoint(&ip).map(Json)
 }
 
 async fn list_domains(
     State(state): State<ApiState>,
-    ApiQuery(query): ApiQuery<DomainListQuery>,
+    ApiQuery(query): ApiQuery<FlowQuery>,
 ) -> Result<Json<Page<DomainSummaryDto>>, ApiError> {
-    state.lock().store.list_domains(&query).map(Json)
+    state.lock().db.list_domains(&query).map(Json)
 }
 
 async fn get_domain(
     State(state): State<ApiState>,
     AxumPath(domain): AxumPath<String>,
 ) -> Result<Json<DomainDetailDto>, ApiError> {
-    state.lock().store.get_domain(&domain).map(Json)
+    state.lock().db.get_domain(&domain).map(Json)
 }
 
-async fn get_settings(State(state): State<ApiState>, headers: HeaderMap) -> Response {
-    let inner = state.lock();
-    let etag = HeaderValue::from_str(&inner.etag()).expect("valid ETag");
-    if headers
-        .get(header::IF_NONE_MATCH)
-        .is_some_and(|value| value.as_bytes() == etag.as_bytes())
-    {
-        return StatusCode::NOT_MODIFIED.into_response();
-    }
-    ([(header::ETAG, etag)], Json(inner.settings.clone())).into_response()
+async fn get_settings(State(state): State<ApiState>) -> Json<Settings> {
+    Json(state.lock().settings.clone())
 }
 
 async fn put_settings(
     State(state): State<ApiState>,
-    headers: HeaderMap,
     ApiJson(body): ApiJson<Settings>,
-) -> Result<Response, ApiError> {
+) -> Result<Json<Settings>, ApiError> {
     let mut inner = state.lock();
-    check_if_match(&inner, &headers)?;
-
     let mut settings = body;
     settings.normalize();
     settings.validate()?;
-    apply_settings(&mut inner, settings);
-    Ok(settings_response(&inner))
+    apply_settings(&mut inner, settings)?;
+    Ok(Json(inner.settings.clone()))
 }
 
 async fn patch_settings(
     State(state): State<ApiState>,
-    headers: HeaderMap,
     ApiJson(patch): ApiJson<SettingsPatch>,
-) -> Result<Response, ApiError> {
+) -> Result<Json<Settings>, ApiError> {
     let mut inner = state.lock();
-    check_if_match(&inner, &headers)?;
-
     let mut settings = inner.settings.clone();
     patch.apply(&mut settings);
     settings.normalize();
     settings.validate()?;
-    apply_settings(&mut inner, settings);
-    Ok(settings_response(&inner))
+    apply_settings(&mut inner, settings)?;
+    Ok(Json(inner.settings.clone()))
 }
 
-fn check_if_match(inner: &Inner, headers: &HeaderMap) -> Result<(), ApiError> {
-    let Some(if_match) = headers.get(header::IF_MATCH) else {
-        return Ok(());
-    };
-    let etag = HeaderValue::from_str(&inner.etag()).expect("valid ETag");
-    if if_match.as_bytes() == etag.as_bytes() {
-        Ok(())
-    } else {
-        Err(ApiError::precondition_failed(
-            "settings were modified by another client",
-        ))
-    }
-}
-
-fn apply_settings(inner: &mut Inner, settings: Settings) {
-    inner.store.apply_settings(&settings);
-    inner.settings = settings;
+fn apply_settings(inner: &mut Inner, settings: Settings) -> Result<(), ApiError> {
     inner.settings_version += 1;
+    inner.db.save_settings(&settings, inner.settings_version)?;
+    inner.settings = settings;
+    Ok(())
 }
 
-fn settings_response(inner: &Inner) -> Response {
-    let etag = HeaderValue::from_str(&inner.etag()).expect("valid ETag");
-    ([(header::ETAG, etag)], Json(inner.settings.clone())).into_response()
-}
-
-async fn list_exports(State(state): State<ApiState>) -> Json<Page<ExportTaskDto>> {
-    let items = state.lock().store.list_exports();
-    let total = items.len();
-    Json(Page {
-        items,
-        total,
-        next_cursor: None,
-    })
+async fn list_exports(State(state): State<ApiState>) -> Result<Json<Vec<ExportTaskDto>>, ApiError> {
+    state.lock().db.list_exports().map(Json)
 }
 
 async fn create_export(
@@ -486,7 +406,7 @@ async fn create_export(
     ApiJson(body): ApiJson<CreateExportRequest>,
 ) -> Result<Response, ApiError> {
     let mut inner = state.lock();
-    let task = inner.store.create_export(&body)?;
+    let task = inner.db.create_export(&body)?;
     let location = HeaderValue::from_str(&format!("/v1/exports/{}", task.id))
         .map_err(|error| ApiError::internal(format!("invalid export location: {error}")))?;
     Ok((
@@ -501,15 +421,16 @@ async fn get_export(
     State(state): State<ApiState>,
     AxumPath(id): AxumPath<String>,
 ) -> Result<Json<ExportTaskDto>, ApiError> {
-    state.lock().store.get_export(&id).map(Json)
+    state.lock().db.get_export(&id).map(Json)
 }
 
 async fn get_export_content(
     State(state): State<ApiState>,
     AxumPath(id): AxumPath<String>,
 ) -> Result<Response, ApiError> {
-    let content = state.lock().store.export_content(&id)?;
-    let content_type = HeaderValue::from_static(content.content_type);
+    let content = state.lock().db.export_content(&id)?;
+    let content_type = HeaderValue::from_str(&content.content_type)
+        .map_err(|error| ApiError::internal(format!("invalid content type: {error}")))?;
     let disposition =
         HeaderValue::from_str(&format!("attachment; filename=\"{}\"", content.file_name))
             .map_err(|error| ApiError::internal(format!("invalid export file name: {error}")))?;
@@ -527,7 +448,7 @@ async fn delete_export(
     State(state): State<ApiState>,
     AxumPath(id): AxumPath<String>,
 ) -> Result<StatusCode, ApiError> {
-    state.lock().store.delete_export(&id)?;
+    state.lock().db.delete_export(&id)?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -540,7 +461,7 @@ async fn clear_history(
             "clearing history deletes Flows, domain evidence and exports; retry with confirm=true",
         ));
     }
-    state.lock().store.clear_history();
+    state.lock().db.clear_history();
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -615,6 +536,7 @@ mod tests {
             flow_capacity: 128,
             export_ttl: Duration::from_secs(3600),
             geoip_database: None,
+            database: None,
         })
     }
 
@@ -624,6 +546,7 @@ mod tests {
             flow_capacity: 128,
             export_ttl: ttl,
             geoip_database: None,
+            database: None,
         })
     }
 
@@ -786,21 +709,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn describes_itself_at_the_api_root() {
-        let response = call(&state(), get("/v1")).await;
-        assert_eq!(response.status(), StatusCode::OK);
-        let body = body_json(response).await;
-        assert_eq!(body["api_version"], "v1");
-        assert!(
-            body["resources"]
-                .as_array()
-                .expect("resources")
-                .iter()
-                .any(|resource| resource["href"] == "/v1/status")
-        );
-    }
-
-    #[tokio::test]
     async fn status_explains_unavailable_collection() {
         let state = state();
         state.set_collector_error("BTF unavailable");
@@ -850,10 +758,16 @@ mod tests {
     async fn invalid_query_parameters_return_problem_details() {
         let response = call(&state(), get("/v1/flows?direction=sideways")).await;
         assert_problem(&response, StatusCode::BAD_REQUEST);
+
+        let response = call(&state(), get("/v1/flows?sort=bogus")).await;
+        assert_problem(&response, StatusCode::BAD_REQUEST);
+
+        let response = call(&state(), get("/v1/flows?limit=0")).await;
+        assert_problem(&response, StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]
-    async fn flows_filter_and_paginate_with_cursors() {
+    async fn flows_filter_and_paginate_with_offsets() {
         let state = state();
         state.ingest_batch(batch(
             1,
@@ -871,25 +785,29 @@ mod tests {
             ],
         ));
 
-        let body = body_json(call(&state, get("/v1/flows?limit=2")).await).await;
+        let body = body_json(call(&state, get("/v1/flows?limit=2&offset=0")).await).await;
         assert_eq!(body["total"], 3);
+        assert_eq!(body["limit"], 2);
+        assert_eq!(body["offset"], 0);
         let items = body["items"].as_array().expect("items");
         assert_eq!(items.len(), 2);
         assert_eq!(items[0]["remote"]["address"], "1.1.1.1");
-        let cursor = body["next_cursor"].as_str().expect("next cursor");
 
-        let body =
-            body_json(call(&state, get(&format!("/v1/flows?limit=2&cursor={cursor}"))).await).await;
-        assert_eq!(body["items"].as_array().expect("items").len(), 1);
-        assert!(body["next_cursor"].is_null());
+        let body = body_json(call(&state, get("/v1/flows?limit=2&offset=2")).await).await;
+        assert_eq!(body["total"], 3);
+        let items = body["items"].as_array().expect("items");
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["direction"], "inbound");
 
         let body = body_json(call(&state, get("/v1/flows?direction=inbound")).await).await;
         assert_eq!(body["total"], 1);
-        assert_eq!(body["items"][0]["direction"], "inbound");
         assert_eq!(body["items"][0]["remote"]["address"], "9.9.9.9");
 
         let body = body_json(call(&state, get("/v1/flows?port=55000")).await).await;
-        assert_eq!(body["total"], 1, "unexpected body: {body}");
+        assert_eq!(body["total"], 1);
+
+        let body = body_json(call(&state, get("/v1/flows?state=active")).await).await;
+        assert_eq!(body["total"], 3);
     }
 
     #[tokio::test]
@@ -914,24 +832,6 @@ mod tests {
         assert_problem(&response, StatusCode::NOT_FOUND);
 
         let response = call(&state, get("/v1/flows/not-hex")).await;
-        assert_problem(&response, StatusCode::BAD_REQUEST);
-    }
-
-    #[tokio::test]
-    async fn cursor_must_match_the_sort_order() {
-        let state = state();
-        state.ingest_batch(batch(
-            1,
-            vec![outbound(("1.1.1.1", 443), 10, 1_000, Duration::ZERO)],
-        ));
-        let body = body_json(call(&state, get("/v1/flows?limit=1")).await).await;
-        let cursor = body["next_cursor"].as_str().unwrap_or("invalid");
-
-        let response = call(
-            &state,
-            get(&format!("/v1/flows?sort=bytes&cursor={cursor}")),
-        )
-        .await;
         assert_problem(&response, StatusCode::BAD_REQUEST);
     }
 
@@ -970,8 +870,6 @@ mod tests {
         assert_eq!(body["ports"][0]["port"], 443);
         assert_eq!(body["flows_url"], "/v1/flows?ip=93.184.216.34");
         assert_eq!(body["profile"]["scope"], "public");
-
-        let body = body_json(call(&state, get("/v1/endpoints/93.184.216.34")).await).await;
         assert_eq!(body["domains"][0]["domain"], "example.com");
     }
 
@@ -1005,18 +903,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn settings_validate_normalize_and_guard_with_etags() {
+    async fn settings_validate_normalize_and_persist() {
         let state = state();
 
         let response = call(&state, get("/v1/settings")).await;
         assert_eq!(response.status(), StatusCode::OK);
-        let etag = response
-            .headers()
-            .get(header::ETAG)
-            .and_then(|value| value.to_str().ok())
-            .expect("etag")
-            .to_owned();
-        assert_eq!(etag, "\"v0\"");
+        let body = body_json(response).await;
+        assert_eq!(body["history"]["retention_days"], 7);
 
         let response = call(
             &state,
@@ -1042,30 +935,22 @@ mod tests {
         )
         .await;
         assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(
-            response
-                .headers()
-                .get(header::ETAG)
-                .and_then(|value| value.to_str().ok()),
-            Some("\"v1\"")
-        );
         let body = body_json(response).await;
         assert_eq!(body["history"]["retention_days"], 30);
         assert_eq!(body["domains"]["enabled"], false);
         assert_eq!(body["domains"]["tls_sni"], false);
 
+        let body = body_json(call(&state, get("/v1/settings")).await).await;
+        assert_eq!(body["history"]["retention_days"], 30);
+
         let response = call(
             &state,
-            Request::builder()
-                .method(Method::PUT)
-                .uri("/v1/settings")
-                .header(header::CONTENT_TYPE, "application/json")
-                .header(header::IF_MATCH, "\"v0\"")
-                .body(Body::from(serde_json::json!({}).to_string()))
-                .expect("valid request"),
+            json_request(Method::PUT, "/v1/settings", serde_json::json!({})),
         )
         .await;
-        assert_problem(&response, StatusCode::PRECONDITION_FAILED);
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_json(response).await;
+        assert_eq!(body["history"]["retention_days"], 7);
     }
 
     #[tokio::test]
@@ -1095,13 +980,14 @@ mod tests {
         );
         let body = body_json(response).await;
         assert_eq!(body["record_count"], 1);
+        assert_eq!(body["range"], "15m");
         let download_url = body["download_url"]
             .as_str()
             .expect("download url")
             .to_owned();
 
         let body = body_json(call(&state, get("/v1/exports")).await).await;
-        assert_eq!(body["total"], 1);
+        assert_eq!(body.as_array().expect("exports").len(), 1);
 
         let response = call(&state, get(&download_url)).await;
         assert_eq!(response.status(), StatusCode::OK);
@@ -1187,6 +1073,8 @@ mod tests {
 
         let body = body_json(call(&state, get("/v1/flows")).await).await;
         assert_eq!(body["total"], 0);
+        let body = body_json(call(&state, get("/v1/domains")).await).await;
+        assert_eq!(body["total"], 0);
     }
 
     #[tokio::test]
@@ -1208,9 +1096,11 @@ mod tests {
         assert_eq!(body["total"], 2);
         assert_eq!(body["items"].as_array().expect("items").len(), 1);
 
-        let response = call(&state, get("/v1/endpoints?scope=loopback")).await;
-        let body = body_json(response).await;
+        let body = body_json(call(&state, get("/v1/endpoints?scope=loopback")).await).await;
         assert_eq!(body["total"], 0);
+
+        let response = call(&state, get("/v1/endpoints?sort=-mystery")).await;
+        assert_problem(&response, StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]
@@ -1218,7 +1108,7 @@ mod tests {
         let state = state();
         state
             .lock()
-            .store
+            .db
             .set_geoip_database(crate::enrichment::database::test_database());
         state.ingest_batch(batch(
             1,
@@ -1227,16 +1117,14 @@ mod tests {
 
         let body = body_json(call(&state, get("/v1/endpoints/8.8.8.8")).await).await;
         assert_eq!(body["profile"]["country"], "US");
+        assert_eq!(body["profile"]["region"], "California");
+        assert_eq!(body["profile"]["city_approximate"], "Mountain View");
         assert_eq!(body["profile"]["asn"], 15169);
         assert_eq!(body["profile"]["organization"], "Google LLC");
 
         let body = body_json(call(&state, get("/v1/flows")).await).await;
         assert_eq!(body["items"][0]["remote_profile"]["country"], "US");
         assert_eq!(body["items"][0]["remote_profile"]["asn"], 15169);
-        assert_eq!(
-            body["items"][0]["remote_profile"]["organization"],
-            "Google LLC"
-        );
 
         let body = body_json(call(&state, get("/v1/overview?range=15m")).await).await;
         assert_eq!(body["top_countries"][0]["country"], "US");
@@ -1422,6 +1310,44 @@ mod tests {
         .await;
         let body = body_json(response).await;
         assert_eq!(body["record_count"], 1);
+    }
+
+    #[tokio::test]
+    async fn domain_filters_apply_to_associations() {
+        let state = state();
+        let mut incoming = batch(
+            1,
+            vec![
+                outbound(("93.184.216.34", 443), 40, 4_000, Duration::ZERO),
+                outbound(("8.8.8.8", 53), 5, 500, Duration::ZERO),
+            ],
+        );
+        incoming.domains = vec![
+            observation(
+                "example.com",
+                "93.184.216.34",
+                DomainEvidence::Dns,
+                AssociationConfidence::Inferred,
+            ),
+            observation(
+                "cdn.example.net",
+                "8.8.8.8",
+                DomainEvidence::TlsSni,
+                AssociationConfidence::Direct,
+            ),
+        ];
+        state.ingest_batch(incoming);
+
+        let body = body_json(call(&state, get("/v1/domains?evidence=dns")).await).await;
+        assert_eq!(body["total"], 1);
+        assert_eq!(body["items"][0]["domain"], "example.com");
+
+        let body = body_json(call(&state, get("/v1/domains?confidence=direct")).await).await;
+        assert_eq!(body["total"], 1);
+        assert_eq!(body["items"][0]["domain"], "cdn.example.net");
+
+        let body = body_json(call(&state, get("/v1/domains?sort=domain")).await).await;
+        assert_eq!(body["items"][0]["domain"], "cdn.example.net");
     }
 
     #[tokio::test]

@@ -14,7 +14,10 @@ async fn main() {
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(DEFAULT_SOCKET));
 
-    let state = ApiState::new(ApiConfig::default());
+    let state = ApiState::new(ApiConfig {
+        database: std::env::var_os("ZIMASCOPE_DATABASE").map(PathBuf::from),
+        ..ApiConfig::default()
+    });
     let server = match api::bind_unix(&socket_path) {
         Ok(listener) => {
             let state = state.clone();
