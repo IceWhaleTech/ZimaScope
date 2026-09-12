@@ -9,6 +9,8 @@ use std::time::{Duration, SystemTime};
 
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
+use crate::query::Selector;
+
 use zimascope_common::model::{
     AddressScope, AssociationConfidence, CollectorHealth, CollectorState, DomainEvidence,
     EndReason, FlowDirection, FlowState, GapReason, Protocol,
@@ -713,8 +715,7 @@ pub struct TrafficRuleDto {
     pub id: u32,
     pub action: &'static str,
     pub direction: &'static str,
-    #[serde(rename = "match")]
-    pub matcher: TrafficRuleMatchDto,
+    pub selector: Selector,
     pub rate_bytes_per_s: u64,
     pub burst_bytes: u64,
     pub enabled: bool,
@@ -724,15 +725,6 @@ pub struct TrafficRuleDto {
     pub created_at: i64,
     pub updated_at: i64,
     pub counters: Option<TrafficRuleCountersDto>,
-}
-
-#[derive(Clone, Debug, Serialize)]
-pub struct TrafficRuleMatchDto {
-    pub kind: &'static str,
-    pub address: Option<String>,
-    pub prefix_len: Option<u8>,
-    pub port: Option<u16>,
-    pub application_id: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Serialize)]
@@ -749,8 +741,7 @@ pub struct TrafficRuleCountersDto {
 pub struct CreateTrafficRuleRequest {
     pub action: String,
     pub direction: String,
-    #[serde(rename = "match")]
-    pub matcher: TrafficRuleMatchRequest,
+    pub selector: Selector,
     pub rate_bytes_per_s: Option<u64>,
     pub enabled: Option<bool>,
 }
@@ -761,20 +752,40 @@ pub struct CreateTrafficRuleRequest {
 pub struct UpdateTrafficRuleRequest {
     pub action: Option<String>,
     pub direction: Option<String>,
-    #[serde(rename = "match")]
-    pub matcher: Option<TrafficRuleMatchRequest>,
+    pub selector: Option<Selector>,
     pub rate_bytes_per_s: Option<u64>,
     pub enabled: Option<bool>,
 }
 
+/// Request body for the Traffic Rule preflight.
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct TrafficRuleMatchRequest {
-    pub kind: String,
+pub struct ResolveTrafficRuleRequest {
+    pub direction: String,
+    pub selector: Selector,
+}
+
+/// One resolved kernel-matchable target.
+#[derive(Clone, Debug, Serialize)]
+pub struct ResolvedTargetDto {
+    pub kind: &'static str,
     pub address: Option<String>,
-    pub prefix_len: Option<u8>,
     pub port: Option<u16>,
-    pub application_id: Option<String>,
+    pub prefix_len: Option<u8>,
+    pub cgroup_id: Option<u64>,
+    pub comm: Option<String>,
+}
+
+/// What a selector would enforce, without persisting anything.
+#[derive(Clone, Debug, Serialize)]
+pub struct ResolveTrafficRuleDto {
+    /// `direct`, `resolved` or `unsupported`.
+    pub plan: &'static str,
+    pub targets: Vec<ResolvedTargetDto>,
+    /// `complete` or `unresolved`.
+    pub coverage: &'static str,
+    pub reason: Option<String>,
+    pub expires_at: Option<i64>,
 }
 
 #[derive(Clone, Debug, Serialize)]

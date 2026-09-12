@@ -7,7 +7,7 @@
 
 use std::{
     collections::VecDeque,
-    net::{IpAddr, Ipv4Addr},
+    net::IpAddr,
     num::NonZeroUsize,
     path::PathBuf,
     sync::{Arc, Mutex},
@@ -83,7 +83,7 @@ const MINUTE_BUCKET_RETENTION_MS: i64 = 2 * 60 * 60 * 1000;
 const HOUR_BUCKET_RETENTION_MS: i64 = 8 * 24 * 60 * 60 * 1000;
 const MS_PER_DAY: i64 = 24 * 60 * 60 * 1000;
 
-const SCHEMA_VERSION: i64 = 6;
+const SCHEMA_VERSION: i64 = 7;
 
 const SCHEMA_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS flows (
@@ -190,11 +190,7 @@ CREATE TABLE IF NOT EXISTS traffic_rules (
     id INTEGER PRIMARY KEY,
     action TEXT NOT NULL,
     direction TEXT NOT NULL,
-    match_kind TEXT NOT NULL,
-    address TEXT,
-    prefix_len INTEGER,
-    port INTEGER,
-    application_id TEXT,
+    selector_json TEXT NOT NULL,
     rate_bytes_per_s INTEGER,
     burst_bytes INTEGER,
     enabled INTEGER NOT NULL,
@@ -491,6 +487,12 @@ impl Db {
 
         let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
         if version < SCHEMA_VERSION {
+            // Pre-release shortcut: schema v7 replaces the per-kind rule
+            // columns with one `selector_json` column, so old rule rows are
+            // recreated instead of migrated (ADR-0005).
+            if version > 0 && version < 7 {
+                conn.execute_batch("DROP TABLE IF EXISTS traffic_rules")?;
+            }
             conn.execute_batch(SCHEMA_SQL)?;
             // Upgraded databases keep their rows: new columns are added in
             // place instead of recreating tables.
@@ -2592,9 +2594,8 @@ impl Db {
 
     pub(crate) fn list_traffic_rules(&self) -> Result<Vec<TrafficRuleRecord>, ApiError> {
         let mut statement = self.conn.prepare(
-            "SELECT id, action, direction, match_kind, address, prefix_len, port, \
-             application_id, rate_bytes_per_s, burst_bytes, enabled, created_at_ms, \
-             updated_at_ms FROM traffic_rules ORDER BY id",
+            "SELECT id, action, direction, selector_json, rate_bytes_per_s, burst_bytes, \
+             enabled, created_at_ms, updated_at_ms FROM traffic_rules ORDER BY id",
         )?;
         let rows = statement
             .query_map([], traffic_rule_row)?
@@ -2606,9 +2607,8 @@ impl Db {
         let row = self
             .conn
             .query_row(
-                "SELECT id, action, direction, match_kind, address, prefix_len, port, \
-                 application_id, rate_bytes_per_s, burst_bytes, enabled, created_at_ms, \
-                 updated_at_ms FROM traffic_rules WHERE id = ?1",
+                "SELECT id, action, direction, selector_json, rate_bytes_per_s, burst_bytes, \
+                 enabled, created_at_ms, updated_at_ms FROM traffic_rules WHERE id = ?1",
                 [id],
                 traffic_rule_row,
             )
@@ -2623,21 +2623,17 @@ impl Db {
         &mut self,
         draft: &TrafficRuleDraft,
     ) -> Result<TrafficRuleRecord, ApiError> {
-        let selector = SelectorColumns::from_selector(&draft.selector);
+        let selector = selector_json(&draft.selector)?;
         let (rate, burst) = draft.action.rates();
         let now = unix_millis(SystemTime::now());
         self.conn.execute(
-            "INSERT INTO traffic_rules (action, direction, match_kind, address, prefix_len, \
-             port, application_id, rate_bytes_per_s, burst_bytes, enabled, created_at_ms, \
-             updated_at_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?11)",
+            "INSERT INTO traffic_rules (action, direction, selector_json, rate_bytes_per_s, \
+             burst_bytes, enabled, created_at_ms, updated_at_ms) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)",
             params![
                 action_name(draft.action.action()),
                 draft.direction.as_str(),
-                selector.kind,
-                selector.address,
-                selector.prefix_len,
-                selector.port,
-                selector.application_id,
+                selector,
                 rate as i64,
                 burst as i64,
                 i64::from(draft.enabled),
@@ -2653,22 +2649,17 @@ impl Db {
         id: i64,
         draft: &TrafficRuleDraft,
     ) -> Result<TrafficRuleRecord, ApiError> {
-        let selector = SelectorColumns::from_selector(&draft.selector);
+        let selector = selector_json(&draft.selector)?;
         let (rate, burst) = draft.action.rates();
         let now = unix_millis(SystemTime::now());
         let changed = self.conn.execute(
-            "UPDATE traffic_rules SET action = ?1, direction = ?2, match_kind = ?3, \
-             address = ?4, prefix_len = ?5, port = ?6, application_id = ?7, \
-             rate_bytes_per_s = ?8, burst_bytes = ?9, enabled = ?10, updated_at_ms = ?11 \
-             WHERE id = ?12",
+            "UPDATE traffic_rules SET action = ?1, direction = ?2, selector_json = ?3, \
+             rate_bytes_per_s = ?4, burst_bytes = ?5, enabled = ?6, updated_at_ms = ?7 \
+             WHERE id = ?8",
             params![
                 action_name(draft.action.action()),
                 draft.direction.as_str(),
-                selector.kind,
-                selector.address,
-                selector.prefix_len,
-                selector.port,
-                selector.application_id,
+                selector,
                 rate as i64,
                 burst as i64,
                 i64::from(draft.enabled),
@@ -3622,11 +3613,7 @@ struct RawTrafficRule {
     id: i64,
     action: String,
     direction: String,
-    match_kind: String,
-    address: Option<String>,
-    prefix_len: Option<i64>,
-    port: Option<i64>,
-    application_id: Option<String>,
+    selector_json: String,
     rate_bytes_per_s: Option<i64>,
     burst_bytes: Option<i64>,
     enabled: i64,
@@ -3639,16 +3626,12 @@ fn traffic_rule_row(row: &Row<'_>) -> rusqlite::Result<RawTrafficRule> {
         id: row.get(0)?,
         action: row.get(1)?,
         direction: row.get(2)?,
-        match_kind: row.get(3)?,
-        address: row.get(4)?,
-        prefix_len: row.get(5)?,
-        port: row.get(6)?,
-        application_id: row.get(7)?,
-        rate_bytes_per_s: row.get(8)?,
-        burst_bytes: row.get(9)?,
-        enabled: row.get(10)?,
-        created_at_ms: row.get(11)?,
-        updated_at_ms: row.get(12)?,
+        selector_json: row.get(3)?,
+        rate_bytes_per_s: row.get(4)?,
+        burst_bytes: row.get(5)?,
+        enabled: row.get(6)?,
+        created_at_ms: row.get(7)?,
+        updated_at_ms: row.get(8)?,
     })
 }
 
@@ -3666,30 +3649,12 @@ impl RawTrafficRule {
                 self.id, self.direction
             ))
         })?;
-        let selector = match self.match_kind.as_str() {
-            "endpoint" => Selector::Endpoint {
-                address: parse_rule_address(self.id, self.address.as_deref())?.into(),
-                port: self.port.map(|port| port as u16),
-            },
-            "cidr" => Selector::Cidr {
-                address: parse_rule_address(self.id, self.address.as_deref())?.into(),
-                prefix_len: self.prefix_len.unwrap_or(0).clamp(0, 32) as u8,
-            },
-            "application" => Selector::Application {
-                id: self.application_id.clone().ok_or_else(|| {
-                    ApiError::internal(format!(
-                        "traffic rule {} has no application identity",
-                        self.id
-                    ))
-                })?,
-            },
-            other => {
-                return Err(ApiError::internal(format!(
-                    "traffic rule {} has unknown match kind {other:?}",
-                    self.id
-                )));
-            }
-        };
+        let selector: Selector = serde_json::from_str(&self.selector_json).map_err(|error| {
+            ApiError::internal(format!(
+                "traffic rule {} has an invalid selector: {error}",
+                self.id
+            ))
+        })?;
         let rate = self.rate_bytes_per_s.unwrap_or(0).max(0) as u64;
         let burst = self.burst_bytes.unwrap_or(0).max(0) as u64;
         let action = match action {
@@ -3714,10 +3679,9 @@ impl RawTrafficRule {
     }
 }
 
-fn parse_rule_address(id: i64, address: Option<&str>) -> Result<Ipv4Addr, ApiError> {
-    address
-        .and_then(|address| address.parse::<Ipv4Addr>().ok())
-        .ok_or_else(|| ApiError::internal(format!("traffic rule {id} has an invalid address")))
+fn selector_json(selector: &Selector) -> Result<String, ApiError> {
+    serde_json::to_string(selector)
+        .map_err(|error| ApiError::internal(format!("serialize selector: {error}")))
 }
 
 fn unix_millis_time(millis: i64) -> SystemTime {
@@ -3727,45 +3691,6 @@ fn unix_millis_time(millis: i64) -> SystemTime {
 impl ApplicationComms for Db {
     fn comm(&self, id: &str) -> Option<String> {
         self.application_comm(id)
-    }
-}
-
-struct SelectorColumns {
-    kind: &'static str,
-    address: Option<String>,
-    prefix_len: Option<i64>,
-    port: Option<i64>,
-    application_id: Option<String>,
-}
-
-impl SelectorColumns {
-    fn from_selector(selector: &Selector) -> Self {
-        match selector {
-            Selector::Endpoint { address, port } => Self {
-                kind: "endpoint",
-                address: Some(address.to_string()),
-                prefix_len: None,
-                port: port.map(i64::from),
-                application_id: None,
-            },
-            Selector::Cidr {
-                address,
-                prefix_len,
-            } => Self {
-                kind: "cidr",
-                address: Some(address.to_string()),
-                prefix_len: Some(i64::from(*prefix_len)),
-                port: None,
-                application_id: None,
-            },
-            Selector::Application { id } => Self {
-                kind: "application",
-                address: None,
-                prefix_len: None,
-                port: None,
-                application_id: Some(id.clone()),
-            },
-        }
     }
 }
 
@@ -4104,6 +4029,48 @@ mod tests {
 
         let record = db.insert_traffic_rule(&endpoint_draft()).expect("insert");
         assert_eq!(record.rule.id, 1);
+
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("db-wal"));
+        let _ = std::fs::remove_file(path.with_extension("db-shm"));
+    }
+
+    #[test]
+    fn schema_v7_recreates_pre_selector_rule_rows() {
+        let unique = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_nanos();
+        let path =
+            std::env::temp_dir().join(format!("zs-rules-{}-{unique}.db", std::process::id()));
+        {
+            let conn = Connection::open(&path).expect("open old database");
+            conn.execute_batch(
+                "CREATE TABLE traffic_rules ( \
+                 id INTEGER PRIMARY KEY, action TEXT NOT NULL, direction TEXT NOT NULL, \
+                 match_kind TEXT NOT NULL, address TEXT, prefix_len INTEGER, port INTEGER, \
+                 application_id TEXT, rate_bytes_per_s INTEGER, burst_bytes INTEGER, \
+                 enabled INTEGER NOT NULL, created_at_ms INTEGER NOT NULL, \
+                 updated_at_ms INTEGER NOT NULL); \
+                 INSERT INTO traffic_rules (action, direction, match_kind, address, port, \
+                 rate_bytes_per_s, burst_bytes, enabled, created_at_ms, updated_at_ms) \
+                 VALUES ('limit', 'outbound', 'endpoint', '203.0.113.9', 443, \
+                 1000000, 1000000, 1, 0, 0); \
+                 PRAGMA user_version = 6;",
+            )
+            .expect("seed v6 schema");
+        }
+
+        let mut db = Db::open(&ApiConfig {
+            database: Some(path.clone()),
+            ..ApiConfig::default()
+        })
+        .expect("open upgraded database");
+        assert!(db.list_traffic_rules().expect("list").is_empty());
+
+        let record = db.insert_traffic_rule(&endpoint_draft()).expect("insert");
+        assert_eq!(record.rule.selector, endpoint_draft().selector);
 
         drop(db);
         let _ = std::fs::remove_file(&path);

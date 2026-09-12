@@ -25,7 +25,6 @@ mod db;
 use std::{
     collections::HashMap,
     convert::Infallible,
-    net::IpAddr,
     path::Path,
     sync::{Arc, Mutex, MutexGuard},
     time::{Duration, SystemTime},
@@ -41,7 +40,7 @@ use axum::{
         IntoResponse, Response,
         sse::{Event, KeepAlive, Sse},
     },
-    routing::{any, delete, get},
+    routing::{any, delete, get, post},
 };
 use tokio::sync::broadcast;
 use tokio_stream::{Stream, StreamExt, wrappers::BroadcastStream};
@@ -60,7 +59,10 @@ use crate::{
         compile, validate_rule,
     },
     proxy::ProxyResolver,
-    query::{Selector, SystemEvidenceResolver},
+    query::{
+        Coverage, EvidenceResolver, KernelPlan, MatchTarget, Resolution, ResolveContext,
+        ResolveError, Selector, SystemEvidenceResolver,
+    },
 };
 
 use self::{
@@ -70,9 +72,10 @@ use self::{
         CollectorHealthDto, ConnectionDto, CreateExportRequest, CreateTrafficRuleRequest,
         DomainDetailDto, DomainSummaryDto, EndpointDetailDto, EndpointSummaryDto,
         EnforcementStatusDto, EnrichmentStatusDto, ExportTaskDto, FlowDto, FlowQuery, OverviewDto,
-        Page, ServiceStatusDto, SettingsSummaryDto, StreamQuery, TimeRange, TimelineDto,
-        TrafficRuleCountersDto, TrafficRuleDto, TrafficRuleMatchDto, TrafficRuleMatchRequest,
-        UpdateTrafficRuleRequest, collector_state_name, unix_millis,
+        Page, ResolveTrafficRuleDto, ResolveTrafficRuleRequest, ResolvedTargetDto,
+        ServiceStatusDto, SettingsSummaryDto, StreamQuery, TimeRange, TimelineDto,
+        TrafficRuleCountersDto, TrafficRuleDto, UpdateTrafficRuleRequest, collector_state_name,
+        unix_millis,
     },
     error::ApiError,
     settings::{Settings, SettingsPatch},
@@ -400,6 +403,7 @@ fn api_routes(state: ApiState) -> Router {
             "/v1/traffic-rules",
             get(list_traffic_rules).post(create_traffic_rule),
         )
+        .route("/v1/traffic-rules/resolve", post(resolve_traffic_rule))
         .route(
             "/v1/traffic-rules/{id}",
             get(get_traffic_rule)
@@ -673,6 +677,17 @@ fn apply_settings(inner: &mut Inner, settings: Settings) -> Result<(), ApiError>
 }
 
 impl Inner {
+    /// Resolves one selector through the host's evidence sources.
+    fn resolve_selector(&mut self, selector: &Selector) -> Result<Resolution, ResolveError> {
+        let mut resolver = SystemEvidenceResolver::new(&mut self.cgroups, &self.db);
+        resolver.resolve(
+            selector,
+            &ResolveContext {
+                now: SystemTime::now(),
+            },
+        )
+    }
+
     /// Derived enforcement state for one rule.
     fn traffic_rule_state(&self, rule: &TrafficRule) -> (&'static str, Option<String>) {
         if self.policy_handle.is_none() {
@@ -700,39 +715,13 @@ impl Inner {
     ) -> TrafficRuleDto {
         let rule = &record.rule;
         let (state, state_reason) = self.traffic_rule_state(rule);
-        let matcher = match &rule.selector {
-            Selector::Endpoint { address, port } => TrafficRuleMatchDto {
-                kind: "endpoint",
-                address: Some(address.to_string()),
-                prefix_len: None,
-                port: *port,
-                application_id: None,
-            },
-            Selector::Cidr {
-                address,
-                prefix_len,
-            } => TrafficRuleMatchDto {
-                kind: "cidr",
-                address: Some(address.to_string()),
-                prefix_len: Some(*prefix_len),
-                port: None,
-                application_id: None,
-            },
-            Selector::Application { id } => TrafficRuleMatchDto {
-                kind: "application",
-                address: None,
-                prefix_len: None,
-                port: None,
-                application_id: Some(id.clone()),
-            },
-        };
         let (rate_bytes_per_s, burst_bytes) = rule.action.rates();
 
         TrafficRuleDto {
             id: rule.id,
             action: action_name(rule.action.action()),
             direction: rule.direction.as_str(),
-            matcher,
+            selector: rule.selector.clone(),
             rate_bytes_per_s,
             burst_bytes,
             enabled: rule.enabled,
@@ -978,6 +967,90 @@ async fn delete_traffic_rule(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// Reports what a selector would enforce before a rule is created.
+///
+/// Resolution and the capacity bound run through the same seam as
+/// compilation, so a `complete` answer here matches what would be applied.
+async fn resolve_traffic_rule(
+    State(state): State<ApiState>,
+    ApiJson(request): ApiJson<ResolveTrafficRuleRequest>,
+) -> Result<Json<ResolveTrafficRuleDto>, ApiError> {
+    let direction = RuleDirection::from_name(&request.direction).ok_or_else(|| {
+        ApiError::unprocessable(format!("unknown direction {:?}", request.direction))
+    })?;
+    request
+        .selector
+        .validate()
+        .map_err(ApiError::unprocessable)?;
+    let plan = request.selector.kernel_plan();
+    if let KernelPlan::Unsupported { reason } = plan {
+        return Err(ApiError::unprocessable(reason));
+    }
+
+    let mut inner = state.lock();
+    let mut resolution = inner
+        .resolve_selector(&request.selector)
+        .map_err(|ResolveError::Unavailable { reason }| ApiError::internal(reason))?;
+    if matches!(&resolution.coverage, Coverage::Complete)
+        && let Err(reason) = crate::policy::check_target_capacity(&resolution.targets, direction)
+    {
+        resolution.targets.clear();
+        resolution.coverage = Coverage::Unresolved { reason };
+    }
+
+    let (coverage, reason) = match resolution.coverage {
+        Coverage::Complete => ("complete", None),
+        Coverage::Unresolved { reason } => ("unresolved", Some(reason)),
+    };
+    Ok(Json(ResolveTrafficRuleDto {
+        plan: plan.name(),
+        targets: resolution.targets.iter().map(resolved_target_dto).collect(),
+        coverage,
+        reason,
+        expires_at: resolution.expires_at.map(unix_millis),
+    }))
+}
+
+fn resolved_target_dto(target: &MatchTarget) -> ResolvedTargetDto {
+    match target {
+        MatchTarget::Endpoint { address, port } => ResolvedTargetDto {
+            kind: "endpoint",
+            address: Some(address.to_string()),
+            port: *port,
+            prefix_len: None,
+            cgroup_id: None,
+            comm: None,
+        },
+        MatchTarget::Cidr {
+            address,
+            prefix_len,
+        } => ResolvedTargetDto {
+            kind: "cidr",
+            address: Some(address.to_string()),
+            port: None,
+            prefix_len: Some(*prefix_len),
+            cgroup_id: None,
+            comm: None,
+        },
+        MatchTarget::AppCgroup { cgroup_id } => ResolvedTargetDto {
+            kind: "application_cgroup",
+            address: None,
+            port: None,
+            prefix_len: None,
+            cgroup_id: Some(*cgroup_id),
+            comm: None,
+        },
+        MatchTarget::AppComm { comm } => ResolvedTargetDto {
+            kind: "application_comm",
+            address: None,
+            port: None,
+            prefix_len: None,
+            cgroup_id: None,
+            comm: Some(zimascope_common::model::comm_text(comm).into()),
+        },
+    }
+}
+
 async fn rule_counters(state: &ApiState, rule: &TrafficRule) -> Option<RuleState> {
     let (handle, keys) = {
         let inner = state.lock();
@@ -1023,7 +1096,7 @@ fn draft_from_create(request: &CreateTrafficRuleRequest) -> Result<TrafficRuleDr
             ActionSpec::Block
         }
     };
-    let selector = selector_from_request(&request.matcher)?;
+    let selector = request.selector.clone();
     let draft = TrafficRuleDraft {
         action,
         direction,
@@ -1043,8 +1116,8 @@ fn draft_from_update(
             .ok_or_else(|| ApiError::unprocessable(format!("unknown direction {name:?}")))?,
         None => existing.direction,
     };
-    let selector = match &request.matcher {
-        Some(request) => selector_from_request(request)?,
+    let selector = match &request.selector {
+        Some(selector) => selector.clone(),
         None => existing.selector.clone(),
     };
     let action = match &request.action {
@@ -1092,53 +1165,6 @@ fn draft_from_update(
     };
     validate_draft(&draft)?;
     Ok(draft)
-}
-
-fn selector_from_request(request: &TrafficRuleMatchRequest) -> Result<Selector, ApiError> {
-    match request.kind.as_str() {
-        "endpoint" => {
-            let address = request
-                .address
-                .as_deref()
-                .ok_or_else(|| ApiError::unprocessable("endpoint match needs an address"))?;
-            let address = address.parse::<IpAddr>().map_err(|_| {
-                ApiError::unprocessable(format!("invalid endpoint address {address:?}"))
-            })?;
-            Ok(Selector::Endpoint {
-                address,
-                port: request.port,
-            })
-        }
-        "cidr" => {
-            let address = request
-                .address
-                .as_deref()
-                .ok_or_else(|| ApiError::unprocessable("cidr match needs an address"))?;
-            let address = address.parse::<IpAddr>().map_err(|_| {
-                ApiError::unprocessable(format!("invalid CIDR address {address:?}"))
-            })?;
-            let prefix_len = request
-                .prefix_len
-                .ok_or_else(|| ApiError::unprocessable("cidr match needs a prefix_len"))?;
-            Ok(Selector::Cidr {
-                address,
-                prefix_len,
-            })
-        }
-        "application" => {
-            let id = request
-                .application_id
-                .clone()
-                .filter(|id| !id.trim().is_empty())
-                .ok_or_else(|| {
-                    ApiError::unprocessable("application match needs an application_id")
-                })?;
-            Ok(Selector::Application { id })
-        }
-        other => Err(ApiError::unprocessable(format!(
-            "unknown match kind {other:?}"
-        ))),
-    }
 }
 
 fn validate_draft(draft: &TrafficRuleDraft) -> Result<(), ApiError> {
@@ -1229,7 +1255,7 @@ mod tests {
     };
 
     use super::*;
-    use std::net::Ipv4Addr;
+    use std::net::{IpAddr, Ipv4Addr};
 
     fn state() -> ApiState {
         ApiState::new(ApiConfig {
@@ -2975,7 +3001,7 @@ mod tests {
                 serde_json::json!({
                     "action": "limit",
                     "direction": "outbound",
-                    "match": { "kind": "endpoint", "address": "203.0.113.9", "port": 443 },
+                    "selector": { "kind": "endpoint", "address": "203.0.113.9", "port": 443 },
                     "rate_bytes_per_s": 12_500_000
                 }),
             ),
@@ -2986,9 +3012,9 @@ mod tests {
         assert_eq!(body["id"], 1);
         assert_eq!(body["action"], "limit");
         assert_eq!(body["direction"], "outbound");
-        assert_eq!(body["match"]["kind"], "endpoint");
-        assert_eq!(body["match"]["address"], "203.0.113.9");
-        assert_eq!(body["match"]["port"], 443);
+        assert_eq!(body["selector"]["kind"], "endpoint");
+        assert_eq!(body["selector"]["address"], "203.0.113.9");
+        assert_eq!(body["selector"]["port"], 443);
         assert_eq!(body["rate_bytes_per_s"], 12_500_000);
         assert_eq!(body["burst_bytes"], 12_500_000);
         assert_eq!(body["enabled"], true);
@@ -3047,36 +3073,60 @@ mod tests {
             serde_json::json!({
                 "action": "nope",
                 "direction": "outbound",
-                "match": { "kind": "endpoint", "address": "203.0.113.9" },
+                "selector": { "kind": "endpoint", "address": "203.0.113.9" },
                 "rate_bytes_per_s": 1_000_000
             }),
             serde_json::json!({
                 "action": "limit",
                 "direction": "outbound",
-                "match": { "kind": "endpoint", "address": "203.0.113.9" },
+                "selector": { "kind": "endpoint", "address": "203.0.113.9" },
                 "rate_bytes_per_s": 1
             }),
             serde_json::json!({
                 "action": "limit",
                 "direction": "outbound",
-                "match": { "kind": "cidr", "address": "192.0.2.0" },
+                "selector": { "kind": "cidr", "address": "192.0.2.0" },
                 "rate_bytes_per_s": 1_000_000
             }),
             serde_json::json!({
                 "action": "limit",
                 "direction": "outbound",
-                "match": { "kind": "application", "application_id": "  " },
+                "selector": { "kind": "application", "id": "  " },
                 "rate_bytes_per_s": 1_000_000
             }),
             serde_json::json!({
                 "action": "block",
                 "direction": "outbound",
-                "match": { "kind": "endpoint", "address": "203.0.113.9" },
+                "selector": { "kind": "endpoint", "address": "203.0.113.9" },
                 "rate_bytes_per_s": 1_000_000
             }),
             serde_json::json!({
                 "action": "limit",
                 "direction": "sideways",
+                "selector": { "kind": "endpoint", "address": "203.0.113.9" },
+                "rate_bytes_per_s": 1_000_000
+            }),
+            serde_json::json!({
+                "action": "limit",
+                "direction": "outbound",
+                "selector": { "kind": "domain", "domain": "example.com" },
+                "rate_bytes_per_s": 1_000_000
+            }),
+            serde_json::json!({
+                "action": "limit",
+                "direction": "outbound",
+                "selector": { "kind": "endpoint", "address": "2001:db8::1" },
+                "rate_bytes_per_s": 1_000_000
+            }),
+            serde_json::json!({
+                "action": "limit",
+                "direction": "outbound",
+                "selector": { "kind": "application", "id": "mystery:1" },
+                "rate_bytes_per_s": 1_000_000
+            }),
+            serde_json::json!({
+                "action": "limit",
+                "direction": "outbound",
                 "match": { "kind": "endpoint", "address": "203.0.113.9" },
                 "rate_bytes_per_s": 1_000_000
             }),
@@ -3093,6 +3143,55 @@ mod tests {
 
         let response = call(&state, get("/v1/traffic-rules/99")).await;
         assert_problem(&response, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn traffic_rule_preflight_reports_targets() {
+        let state = state();
+        let response = call(
+            &state,
+            json_request(
+                Method::POST,
+                "/v1/traffic-rules/resolve",
+                serde_json::json!({
+                    "direction": "outbound",
+                    "selector": { "kind": "endpoint", "address": "203.0.113.9", "port": 443 }
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_json(response).await;
+        assert_eq!(body["plan"], "direct");
+        assert_eq!(body["coverage"], "complete");
+        assert_eq!(body["targets"][0]["kind"], "endpoint");
+        assert_eq!(body["targets"][0]["address"], "203.0.113.9");
+        assert_eq!(body["targets"][0]["port"], 443);
+        assert!(body["targets"][0]["cgroup_id"].is_null());
+
+        let response = call(
+            &state,
+            json_request(
+                Method::POST,
+                "/v1/traffic-rules/resolve",
+                serde_json::json!({
+                    "direction": "outbound",
+                    "selector": { "kind": "application", "id": "cont:missing" }
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_json(response).await;
+        assert_eq!(body["plan"], "resolved");
+        assert_eq!(body["coverage"], "unresolved");
+        assert!(
+            body["reason"]
+                .as_str()
+                .expect("reason")
+                .contains("no cgroup directory")
+        );
+        assert_eq!(body["targets"].as_array().expect("targets").len(), 0);
     }
 
     #[tokio::test]
@@ -3124,7 +3223,7 @@ mod tests {
                 serde_json::json!({
                     "action": "block",
                     "direction": "outbound",
-                    "match": { "kind": "endpoint", "address": "198.51.100.1" }
+                    "selector": { "kind": "endpoint", "address": "198.51.100.1" }
                 }),
             ),
         )
@@ -3146,7 +3245,7 @@ mod tests {
                 serde_json::json!({
                     "action": "block",
                     "direction": "outbound",
-                    "match": { "kind": "endpoint", "address": "203.0.113.9", "port": 443 }
+                    "selector": { "kind": "endpoint", "address": "203.0.113.9", "port": 443 }
                 }),
             ),
         )
@@ -3177,7 +3276,7 @@ mod tests {
                 serde_json::json!({
                     "action": "limit",
                     "direction": "inbound",
-                    "match": { "kind": "cidr", "address": "192.0.2.0", "prefix_len": 24 },
+                    "selector": { "kind": "cidr", "address": "192.0.2.0", "prefix_len": 24 },
                     "rate_bytes_per_s": 1_000_000
                 }),
             ),

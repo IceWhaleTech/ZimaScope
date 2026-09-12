@@ -500,47 +500,69 @@ fn matches_from_targets(targets: &[MatchTarget], direction: RuleDirection) -> Ve
     entries
 }
 
+/// Checks that targets fit the kernel match map capacities.
+///
+/// The preflight uses this so a selector the packet path could not represent
+/// is reported before a rule is created.
+pub fn check_target_capacity(
+    targets: &[MatchTarget],
+    direction: RuleDirection,
+) -> Result<(), String> {
+    let mut unique: [std::collections::HashSet<MatchEntry>; 8] = Default::default();
+    for entry in matches_from_targets(targets, direction) {
+        unique[tier_index(&entry)].insert(entry);
+    }
+    check_capacity_tiers(&unique)
+}
+
 fn check_capacity(rules: &[CompiledRule]) -> Result<(), String> {
     let mut unique: [std::collections::HashSet<MatchEntry>; 8] = Default::default();
     for rule in rules {
         for entry in &rule.matches {
-            let index = match entry {
-                MatchEntry::AppCgroup {
-                    direction: Direction::Inbound,
-                    ..
-                } => 0,
-                MatchEntry::AppCgroup {
-                    direction: Direction::Outbound,
-                    ..
-                } => 1,
-                MatchEntry::AppComm {
-                    direction: Direction::Inbound,
-                    ..
-                } => 2,
-                MatchEntry::AppComm {
-                    direction: Direction::Outbound,
-                    ..
-                } => 3,
-                MatchEntry::EndpointExact {
-                    direction: Direction::Inbound,
-                    ..
-                } => 4,
-                MatchEntry::EndpointExact {
-                    direction: Direction::Outbound,
-                    ..
-                } => 5,
-                MatchEntry::EndpointCidr {
-                    direction: Direction::Inbound,
-                    ..
-                } => 6,
-                MatchEntry::EndpointCidr {
-                    direction: Direction::Outbound,
-                    ..
-                } => 7,
-            };
-            unique[index].insert(*entry);
+            unique[tier_index(entry)].insert(*entry);
         }
     }
+    check_capacity_tiers(&unique)
+}
+
+fn tier_index(entry: &MatchEntry) -> usize {
+    match entry {
+        MatchEntry::AppCgroup {
+            direction: Direction::Inbound,
+            ..
+        } => 0,
+        MatchEntry::AppCgroup {
+            direction: Direction::Outbound,
+            ..
+        } => 1,
+        MatchEntry::AppComm {
+            direction: Direction::Inbound,
+            ..
+        } => 2,
+        MatchEntry::AppComm {
+            direction: Direction::Outbound,
+            ..
+        } => 3,
+        MatchEntry::EndpointExact {
+            direction: Direction::Inbound,
+            ..
+        } => 4,
+        MatchEntry::EndpointExact {
+            direction: Direction::Outbound,
+            ..
+        } => 5,
+        MatchEntry::EndpointCidr {
+            direction: Direction::Inbound,
+            ..
+        } => 6,
+        MatchEntry::EndpointCidr {
+            direction: Direction::Outbound,
+            ..
+        } => 7,
+    }
+}
+
+fn check_capacity_tiers(unique: &[std::collections::HashSet<MatchEntry>; 8]) -> Result<(), String> {
     if let Some(overflow) = unique
         .iter()
         .position(|entries| entries.len() > MAX_TRAFFIC_RULES)
