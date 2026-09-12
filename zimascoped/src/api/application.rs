@@ -6,24 +6,14 @@
 //! best-effort and cached; a process that exited in the meantime still keeps
 //! its `comm` from the kernel observation.
 
-use std::{
-    collections::HashMap,
-    fs,
-    os::unix::fs::MetadataExt,
-    path::Path,
-    time::{Duration, Instant},
-};
+use std::{collections::HashMap, fs, time::Instant};
 
 use zimascope_common::model::ApplicationRef;
 
+use crate::cgroup;
+
 /// How many `(tgid, comm)` resolutions are cached before the cache is dropped.
 const RESOLUTION_CACHE_CAPACITY: usize = 4_096;
-
-/// Minimum age of the cgroup-id index before a miss walks the tree again.
-const CGROUP_INDEX_REFRESH: Duration = Duration::from_secs(5);
-
-/// Bound on the cgroup tree walk, so a symlink loop cannot recurse forever.
-const CGROUP_WALK_DEPTH: usize = 12;
 
 /// A stable Application record ready for storage.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -131,7 +121,7 @@ impl ApplicationResolver {
 
         let due = self
             .cgroup_index_at
-            .map(|at| at.elapsed() >= CGROUP_INDEX_REFRESH)
+            .map(|at| at.elapsed() >= cgroup::INDEX_REFRESH)
             .unwrap_or(true);
         if due {
             self.cgroup_index = index_cgroups();
@@ -151,7 +141,7 @@ fn read_process_facts(tgid: u32) -> ProcessFacts {
     let container_id = fs::read_to_string(format!("/proc/{tgid}/cgroup"))
         .ok()
         .as_deref()
-        .and_then(container_id_from_cgroup);
+        .and_then(cgroup::container_id);
 
     ProcessFacts { exe, container_id }
 }
@@ -159,32 +149,8 @@ fn read_process_facts(tgid: u32) -> ProcessFacts {
 /// Walks the cgroup v2 tree and records every directory inode.
 fn index_cgroups() -> HashMap<u64, Option<Box<str>>> {
     let mut index = HashMap::new();
-    walk_cgroups(Path::new("/sys/fs/cgroup"), 0, &mut index);
+    cgroup::walk_tree(std::path::Path::new("/sys/fs/cgroup"), &mut index);
     index
-}
-
-fn walk_cgroups(directory: &Path, depth: usize, index: &mut HashMap<u64, Option<Box<str>>>) {
-    if depth >= CGROUP_WALK_DEPTH {
-        return;
-    }
-    let Ok(entries) = fs::read_dir(directory) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let Ok(metadata) = entry.metadata() else {
-            continue;
-        };
-        if !metadata.is_dir() {
-            continue;
-        }
-        let path = entry.path();
-        let container = path
-            .to_str()
-            .and_then(container_id_from_cgroup)
-            .map(Into::into);
-        index.insert(metadata.ino(), container);
-        walk_cgroups(&path, depth + 1, index);
-    }
 }
 
 fn normalize_exe(path: &str) -> Option<String> {
@@ -196,135 +162,9 @@ fn normalize_exe(path: &str) -> Option<String> {
     }
 }
 
-/// Extracts a container id from a `/proc/<pid>/cgroup` document.
-///
-/// Handles the cgroup v2 and v1 path conventions used by Docker (systemd
-/// scopes and the cgroupfs driver), containerd, CRI-O and Podman.
-fn container_id_from_cgroup(contents: &str) -> Option<String> {
-    for line in contents.lines() {
-        let Some(path) = line.rsplit(':').next() else {
-            continue;
-        };
-        let Some(component) = path.rsplit('/').next() else {
-            continue;
-        };
-
-        for (prefix, suffix) in [
-            ("docker-", ".scope"),
-            ("cri-containerd-", ".scope"),
-            ("crio-", ".scope"),
-            ("libpod-", ".scope"),
-        ] {
-            if let Some(id) = component
-                .strip_prefix(prefix)
-                .and_then(|rest| rest.strip_suffix(suffix))
-                .filter(|id| !id.is_empty())
-            {
-                return Some(id.to_owned());
-            }
-        }
-
-        // cgroupfs driver: `.../docker/<id>` (Docker and ZimaOS images).
-        let mut components = path.split('/').rev();
-        if let Some(id) = components.next() {
-            if is_container_hex(id) && components.next() == Some("docker") {
-                return Some(id.to_owned());
-            }
-        }
-    }
-    None
-}
-
-/// Container runtime ids are hex; requiring hex avoids latching onto an
-/// arbitrary directory called `docker`.
-fn is_container_hex(value: &str) -> bool {
-    value.len() >= 32 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn parses_cgroup_v2_docker_scope() {
-        let contents = "0::/system.slice/docker-3f2a9c1d4b5e6f708a9b0c1d2e3f4a5b6c7d8e9f0a1b2c3d4e5f60718293a4b5.scope";
-        assert_eq!(
-            container_id_from_cgroup(contents).as_deref(),
-            Some("3f2a9c1d4b5e6f708a9b0c1d2e3f4a5b6c7d8e9f0a1b2c3d4e5f60718293a4b5")
-        );
-    }
-    #[test]
-    fn parses_cgroup_v1_containerd_scope() {
-        let contents = "11:memory:/kubepods.slice/cri-containerd-abcdef0123456789.scope\n\
-             10:cpu:/kubepods.slice/cri-containerd-abcdef0123456789.scope";
-        assert_eq!(
-            container_id_from_cgroup(contents).as_deref(),
-            Some("abcdef0123456789")
-        );
-    }
-
-    #[test]
-    fn parses_cgroupfs_docker_id() {
-        let id = "3f2a9c1d4b5e6f708a9b0c1d2e3f4a5b6c7d8e9f0a1b2c3d4e5f60718293a4b5";
-        let contents = format!("0::/docker/{id}");
-        assert_eq!(container_id_from_cgroup(&contents).as_deref(), Some(id));
-
-        let contents = format!("11:memory:/docker/{id}\n10:cpu:/docker/{id}");
-        assert_eq!(container_id_from_cgroup(&contents).as_deref(), Some(id));
-    }
-
-    #[test]
-    fn parses_libpod_scope() {
-        assert_eq!(
-            container_id_from_cgroup("0::/machine.slice/libpod-abcdef0123456789.scope").as_deref(),
-            Some("abcdef0123456789")
-        );
-    }
-
-    #[test]
-    fn short_lookalike_directories_are_not_containers() {
-        assert_eq!(container_id_from_cgroup("0::/docker/not-an-id"), None);
-    }
-
-    #[test]
-    fn host_processes_have_no_container_id() {
-        assert_eq!(container_id_from_cgroup("0::/init.scope"), None);
-        assert_eq!(
-            container_id_from_cgroup("0::/user.slice/user-1000.slice"),
-            None
-        );
-    }
-
-    #[test]
-    fn cgroup_index_maps_directories_to_containers() {
-        let unique = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock after epoch")
-            .as_nanos();
-        let root = std::env::temp_dir().join(format!("zs-cgroup-{}-{unique}", std::process::id()));
-        let id = "3f2a9c1d4b5e6f708a9b0c1d2e3f4a5b6c7d8e9f0a1b2c3d4e5f60718293a4b5";
-        let container = root.join("system.slice").join(format!("docker-{id}.scope"));
-        let host = root.join("user.slice");
-        std::fs::create_dir_all(&container).expect("create container cgroup");
-        std::fs::create_dir_all(&host).expect("create host cgroup");
-
-        let mut index = HashMap::new();
-        walk_cgroups(&root, 0, &mut index);
-
-        let container_inode = std::fs::metadata(&container)
-            .expect("container metadata")
-            .ino();
-        assert_eq!(
-            index
-                .get(&container_inode)
-                .and_then(|value| value.as_deref()),
-            Some(id)
-        );
-        let host_inode = std::fs::metadata(&host).expect("host metadata").ino();
-        assert!(index.get(&host_inode).is_some_and(|value| value.is_none()));
-
-        let _ = std::fs::remove_dir_all(&root);
-    }
 
     #[test]
     fn resolves_comm_identity_when_the_process_is_gone() {

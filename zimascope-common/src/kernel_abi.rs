@@ -90,7 +90,7 @@ pub enum IpFamily {
 }
 
 #[repr(u8)]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum Direction {
     Inbound = 1,
     Outbound = 2,

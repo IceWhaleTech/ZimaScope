@@ -2,6 +2,8 @@
 
 pub mod api;
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+mod cgroup;
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 mod collector;
 #[allow(dead_code)]
 mod enrichment;
