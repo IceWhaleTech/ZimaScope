@@ -16,6 +16,7 @@ use zimascope_common::{
 };
 
 use super::KernelSource;
+use crate::policy::PolicyOp;
 
 #[derive(Default)]
 struct State {
@@ -33,6 +34,8 @@ struct State {
     fail_domain_read: bool,
     fail_service_read: bool,
     fail_stats_read: bool,
+    fail_policy_apply: bool,
+    policy_ops: Vec<PolicyOp>,
 }
 
 /// Deterministic in-memory adapter behind the private [`KernelSource`] seam.
@@ -164,6 +167,14 @@ impl InMemoryHandle {
         self.state.lock().expect("test state").fail_stats_read = fail;
     }
 
+    pub fn set_policy_apply_failing(&self, fail: bool) {
+        self.state.lock().expect("test state").fail_policy_apply = fail;
+    }
+
+    pub fn policy_ops(&self) -> Vec<PolicyOp> {
+        self.state.lock().expect("test state").policy_ops.clone()
+    }
+
     pub fn set_interface_attached(&self, ifindex: u32, attached: bool) {
         let mut state = self.state.lock().expect("test state");
         if let Some(interface) = state
@@ -263,6 +274,15 @@ impl KernelSource for InMemoryKernelSource {
             udp_attached: state.udp_attached,
             last_error: state.application_error.clone(),
         }
+    }
+
+    fn apply_policy(&mut self, operations: &[PolicyOp]) -> Result<()> {
+        let mut state = self.state.lock().expect("test state");
+        if state.fail_policy_apply {
+            bail!("injected policy apply failure");
+        }
+        state.policy_ops.extend_from_slice(operations);
+        Ok(())
     }
 
     fn detach(&mut self) -> Result<()> {

@@ -14,6 +14,7 @@ mod listeners;
 mod tracker;
 
 #[cfg(test)]
+#[allow(dead_code)]
 mod test_source;
 
 use std::{
@@ -31,6 +32,8 @@ use zimascope_common::{
     kernel_abi,
     model::{ApplicationHealth, CollectionBatch, CollectorHealth, CollectorState, InterfaceHealth},
 };
+
+use crate::policy::{ApplySummary, CompiledPolicy, PolicyOp, diff};
 
 use domain::DomainDecoder;
 use fingerprint::SharedFingerprints;
@@ -69,6 +72,9 @@ pub type BatchReceiver = mpsc::Receiver<CollectionBatch>;
 
 const BATCH_CHANNEL_CAPACITY: usize = 4;
 
+/// Bounded control-plane channel between the API and the worker.
+const POLICY_CHANNEL_CAPACITY: usize = 4;
+
 /// How often the startup listener sweep is repeated.
 ///
 /// Owner entries expire after `max(2 * idle_timeout, 30s)`; a pre-existing
@@ -101,6 +107,7 @@ pub(crate) trait KernelSource: Send {
     fn read_stats(&mut self) -> Result<kernel_abi::KernelStats>;
     fn attachment_health(&self) -> Vec<InterfaceHealth>;
     fn application_health(&self) -> ApplicationHealth;
+    fn apply_policy(&mut self, operations: &[PolicyOp]) -> Result<()>;
     fn detach(&mut self) -> Result<()>;
 }
 
@@ -108,6 +115,34 @@ pub(crate) trait KernelSource: Send {
 pub struct Collector {
     shutdown: Option<oneshot::Sender<()>>,
     worker: Option<JoinHandle<Result<CollectorHealth>>>,
+    policy: mpsc::Sender<PolicyCommand>,
+}
+
+/// Control-plane handle for applying compiled Traffic Rule programs.
+pub struct PolicyHandle {
+    commands: mpsc::Sender<PolicyCommand>,
+}
+
+enum PolicyCommand {
+    Apply {
+        program: CompiledPolicy,
+        reply: oneshot::Sender<Result<ApplySummary, String>>,
+    },
+}
+
+impl PolicyHandle {
+    /// Applies one compiled program through the worker and reports the result.
+    pub async fn apply(&self, program: CompiledPolicy) -> Result<ApplySummary> {
+        let (reply, response) = oneshot::channel();
+        self.commands
+            .send(PolicyCommand::Apply { program, reply })
+            .await
+            .map_err(|_| anyhow::anyhow!("collector worker is not running"))?;
+        response
+            .await
+            .map_err(|_| anyhow::anyhow!("collector worker dropped the policy request"))?
+            .map_err(|error| anyhow::anyhow!(error))
+    }
 }
 
 impl Collector {
@@ -126,6 +161,7 @@ impl Collector {
     fn run_worker(mut core: CollectorCore, collection_interval: Duration) -> (Self, BatchReceiver) {
         let (batch_tx, batch_rx) = mpsc::channel(BATCH_CHANNEL_CAPACITY);
         let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
+        let (policy_tx, mut policy_rx) = mpsc::channel(POLICY_CHANNEL_CAPACITY);
         let worker = tokio::spawn(async move {
             let mut ticker = time::interval(collection_interval);
             ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -134,6 +170,15 @@ impl Collector {
                 tokio::select! {
                     biased;
                     _ = &mut shutdown_rx => break,
+                    command = policy_rx.recv() => match command {
+                        Some(PolicyCommand::Apply { program, reply }) => {
+                            let result = core
+                                .apply_policy(program)
+                                .map_err(|error| format!("{error:#}"));
+                            let _ = reply.send(result);
+                        }
+                        None => break,
+                    },
                     _ = ticker.tick() => {}
                 }
 
@@ -157,9 +202,17 @@ impl Collector {
             Self {
                 shutdown: Some(shutdown_tx),
                 worker: Some(worker),
+                policy: policy_tx,
             },
             batch_rx,
         )
+    }
+
+    /// Returns the control-plane handle for Traffic Rule programs.
+    pub fn policy_handle(&self) -> PolicyHandle {
+        PolicyHandle {
+            commands: self.policy.clone(),
+        }
     }
 
     /// Stops collection, detaches hooks and returns the final health snapshot.
@@ -197,6 +250,8 @@ struct CollectorCore {
     map_entries: usize,
     map_capacity: usize,
     owner_entries: usize,
+    /// Last program successfully applied to the kernel maps.
+    applied_policy: CompiledPolicy,
     /// `Some` once listener seeding is enabled (Linux collection start);
     /// `None` keeps tests deterministic.
     listener_seed: Option<Instant>,
@@ -237,6 +292,7 @@ impl CollectorCore {
             map_entries: 0,
             map_capacity: kernel_abi::DEFAULT_FLOW_CAPACITY as usize,
             owner_entries: 0,
+            applied_policy: CompiledPolicy::default(),
             listener_seed: None,
             shutdown_complete: false,
         }
@@ -416,6 +472,19 @@ impl CollectorCore {
             domains,
             health,
         }
+    }
+
+    /// Applies a compiled Traffic Rule program through the kernel seam.
+    fn apply_policy(&mut self, program: CompiledPolicy) -> Result<ApplySummary> {
+        let operations = diff(&self.applied_policy, &program);
+        let operation_count = operations.len();
+        self.source.apply_policy(&operations)?;
+        self.applied_policy = program;
+        Ok(ApplySummary {
+            revision: self.applied_policy.revision,
+            operations: operation_count,
+            rules: self.applied_policy.rules.len(),
+        })
     }
 
     /// Detaches hooks and returns a final health snapshot.
@@ -947,5 +1016,80 @@ mod tests {
         );
         // Attribution is advisory: collection is still running.
         assert_eq!(batch.health.state, CollectorState::Running);
+    }
+
+    fn compiled_program(revision: u64) -> crate::policy::CompiledPolicy {
+        use crate::policy::{CompiledPolicy, CompiledRule, CompiledState, MatchEntry};
+        use zimascope_common::kernel_abi::{BucketKey, EndpointMatchKey, RuleAction};
+
+        CompiledPolicy {
+            revision,
+            enabled: true,
+            rules: vec![CompiledRule {
+                id: 1,
+                action: RuleAction::Limit,
+                matches: vec![MatchEntry::EndpointExact {
+                    direction: Direction::Outbound,
+                    key: EndpointMatchKey {
+                        addr: [0; 16],
+                        port_be: 443u16.to_be(),
+                        reserved: [0; 6],
+                    },
+                }],
+                states: vec![CompiledState {
+                    key: BucketKey {
+                        rule_id: 1,
+                        direction: Direction::Outbound as u8,
+                        reserved: [0; 3],
+                    },
+                    rate_bytes_per_s: 1_000,
+                    burst_bytes: 1_000,
+                }],
+            }],
+        }
+    }
+
+    #[tokio::test]
+    async fn policy_handle_applies_and_diffs_programs() {
+        let source = InMemoryKernelSource::new();
+        let handle = source.handle();
+        let core = open_collector(source, Duration::from_secs(30));
+        let (collector, _batches) = Collector::run_worker(core, Duration::from_secs(3_600));
+        let policy = collector.policy_handle();
+
+        let summary = policy
+            .apply(compiled_program(1))
+            .await
+            .expect("first apply succeeds");
+        assert_eq!(summary.revision, 1);
+        assert_eq!(summary.rules, 1);
+        assert_eq!(summary.operations, 3);
+
+        let summary = policy
+            .apply(compiled_program(2))
+            .await
+            .expect("second apply succeeds");
+        assert_eq!(summary.revision, 2);
+        assert_eq!(summary.operations, 1);
+        assert_eq!(handle.policy_ops().len(), 4);
+
+        let health = collector.shutdown().await.expect("shutdown succeeds");
+        assert_eq!(health.state, CollectorState::Stopped);
+    }
+
+    #[tokio::test]
+    async fn policy_handle_reports_apply_failures() {
+        let source = InMemoryKernelSource::new();
+        source.handle().set_policy_apply_failing(true);
+        let core = open_collector(source, Duration::from_secs(30));
+        let (collector, _batches) = Collector::run_worker(core, Duration::from_secs(3_600));
+
+        let error = collector
+            .policy_handle()
+            .apply(compiled_program(1))
+            .await
+            .expect_err("apply failure surfaces");
+
+        assert!(error.to_string().contains("injected policy apply failure"));
     }
 }

@@ -14,8 +14,8 @@ use anyhow::{Context, Result, bail};
 use aya::{
     Ebpf,
     maps::{
-        Array, HashMap as AyaHashMap, IterableMap, Map as AyaMap, MapData, PerCpuArray,
-        PerCpuHashMap, RingBuf,
+        Array, HashMap as AyaHashMap, IterableMap, LpmTrie, MapData, PerCpuArray, PerCpuHashMap,
+        RingBuf, lpm_trie::Key as LpmKey,
     },
     programs::{
         CgroupAttachMode, CgroupSockAddr, Link, ProgramError, SchedClassifier, SockOps,
@@ -28,14 +28,19 @@ use aya::{
 };
 use zimascope_common::{
     kernel_abi::{
-        self, ABI_METADATA_MAP, AbiMetadata, DOMAIN_EVENTS_MAP, DomainSample, FLOW_MAP, FlowKey,
-        FlowValue, KERNEL_STATS_MAP, KernelStats, LISTENER_MAP, OWNER_MAP, OwnerKey, OwnerValue,
-        SERVICE_EVENTS_MAP, SOCK_OWNER_PROGRAM, ServiceSample, UDP_OWNER_PROGRAM,
+        self, ABI_METADATA_MAP, APP_CGROUP_EGRESS_MAP, APP_CGROUP_INGRESS_MAP, APP_COMM_EGRESS_MAP,
+        APP_COMM_INGRESS_MAP, AbiMetadata, BucketKey, DOMAIN_EVENTS_MAP, Direction, DomainSample,
+        ENDPOINT_CIDR_EGRESS_MAP, ENDPOINT_CIDR_INGRESS_MAP, ENDPOINT_EXACT_EGRESS_MAP,
+        ENDPOINT_EXACT_INGRESS_MAP, EndpointMatchKey, FLOW_MAP, FlowKey, FlowValue,
+        KERNEL_STATS_MAP, KernelStats, LISTENER_MAP, OWNER_MAP, OwnerKey, OwnerValue,
+        POLICY_CONFIG_MAP, PolicyConfig, RULE_STATES_MAP, RuleRef, RuleState, SERVICE_EVENTS_MAP,
+        SOCK_OWNER_PROGRAM, ServiceSample, UDP_OWNER_PROGRAM,
     },
     model::{ApplicationHealth, InterfaceHealth},
 };
 
 use super::{CollectorConfig, InterfaceSelector, KernelSource};
+use crate::policy::{MatchEntry, PolicyOp, config_value};
 
 mod object {
     include!(concat!(env!("OUT_DIR"), "/ebpf_object.rs"));
@@ -43,6 +48,10 @@ mod object {
 
 /// The cgroup v2 root every process belongs to.
 const CGROUP_ROOT: &str = "/sys/fs/cgroup";
+
+/// `BPF_F_LOCK` takes the map value's spin lock while copying; the rule state
+/// map requires it for every user-space read and update.
+const BPF_F_LOCK: u64 = 1 << 3;
 
 #[repr(transparent)]
 #[derive(Clone, Copy)]
@@ -86,6 +95,55 @@ struct PodOwnerValue(OwnerValue);
 // Safety: `#[repr(transparent)]` over a `#[repr(C)]` POD type with no padding.
 unsafe impl aya::Pod for PodOwnerValue {}
 
+#[repr(transparent)]
+#[derive(Clone, Copy)]
+struct PodPolicyConfig(PolicyConfig);
+
+// Safety: `#[repr(transparent)]` over a `#[repr(C)]` POD type with no padding.
+unsafe impl aya::Pod for PodPolicyConfig {}
+
+#[repr(transparent)]
+#[derive(Clone, Copy)]
+struct PodBucketKey(BucketKey);
+
+// Safety: `#[repr(transparent)]` over a `#[repr(C)]` POD type with no padding.
+unsafe impl aya::Pod for PodBucketKey {}
+
+#[repr(transparent)]
+#[derive(Clone, Copy)]
+struct PodRuleState(RuleState);
+
+// Safety: `#[repr(transparent)]` over a `#[repr(C)]` POD type with no padding.
+unsafe impl aya::Pod for PodRuleState {}
+
+#[repr(transparent)]
+#[derive(Clone, Copy)]
+struct PodRuleRef(RuleRef);
+
+// Safety: `#[repr(transparent)]` over a `#[repr(C)]` POD type with no padding.
+unsafe impl aya::Pod for PodRuleRef {}
+
+#[repr(transparent)]
+#[derive(Clone, Copy)]
+struct PodEndpointMatchKey(EndpointMatchKey);
+
+// Safety: `#[repr(transparent)]` over a `#[repr(C)]` POD type with no padding.
+unsafe impl aya::Pod for PodEndpointMatchKey {}
+
+/// Typed handles for every Traffic Rule map.
+struct PolicyMaps {
+    config: Array<MapData, PodPolicyConfig>,
+    states: AyaHashMap<MapData, PodBucketKey, PodRuleState>,
+    app_cgroup_ingress: AyaHashMap<MapData, u64, PodRuleRef>,
+    app_cgroup_egress: AyaHashMap<MapData, u64, PodRuleRef>,
+    app_comm_ingress: AyaHashMap<MapData, [u8; 16], PodRuleRef>,
+    app_comm_egress: AyaHashMap<MapData, [u8; 16], PodRuleRef>,
+    endpoint_exact_ingress: AyaHashMap<MapData, PodEndpointMatchKey, PodRuleRef>,
+    endpoint_exact_egress: AyaHashMap<MapData, PodEndpointMatchKey, PodRuleRef>,
+    endpoint_cidr_ingress: LpmTrie<MapData, [u8; 4], PodRuleRef>,
+    endpoint_cidr_egress: LpmTrie<MapData, [u8; 4], PodRuleRef>,
+}
+
 /// Owns every Aya object required for one collection session.
 pub(crate) struct AyaKernelSource {
     ebpf: Ebpf,
@@ -95,6 +153,7 @@ pub(crate) struct AyaKernelSource {
     services: RingBuf<MapData>,
     owners: AyaHashMap<MapData, PodOwnerKey, PodOwnerValue>,
     listeners: AyaHashMap<MapData, PodOwnerKey, PodOwnerValue>,
+    policy: PolicyMaps,
     owner_link: Option<SockOpsLink>,
     owner_error: Option<Box<str>>,
     udp_link: Option<CgroupSockAddrLink>,
@@ -160,7 +219,7 @@ impl AyaKernelSource {
         let listeners = take_owner_map(&mut ebpf, LISTENER_MAP)?;
 
         load_programs(&mut ebpf)?;
-        verify_policy_maps(&mut ebpf)?;
+        let policy = take_policy_maps(&mut ebpf)?;
 
         // Application Identity is advisory: TC collection starts even when the
         // cgroup attach is unavailable, and health explains why.
@@ -185,6 +244,7 @@ impl AyaKernelSource {
             services,
             owners,
             listeners,
+            policy,
             owner_link,
             owner_error,
             udp_link,
@@ -325,6 +385,14 @@ impl KernelSource for AyaKernelSource {
         }
     }
 
+    fn apply_policy(&mut self, operations: &[PolicyOp]) -> Result<()> {
+        for operation in operations {
+            self.apply_policy_op(operation)
+                .with_context(|| format!("apply policy operation {operation:?}"))?;
+        }
+        Ok(())
+    }
+
     fn detach(&mut self) -> Result<()> {
         let mut first_error = None;
         if let Some(link) = self.owner_link.take() {
@@ -356,6 +424,145 @@ impl KernelSource for AyaKernelSource {
         match first_error {
             Some(error) => Err(error),
             None => Ok(()),
+        }
+    }
+}
+
+impl AyaKernelSource {
+    fn apply_policy_op(&mut self, operation: &PolicyOp) -> Result<()> {
+        match operation {
+            PolicyOp::SetEnabled {
+                enabled,
+                app_rules,
+                endpoint_rules,
+                revision,
+            } => {
+                let value = config_value(*enabled, *app_rules, *endpoint_rules, *revision);
+                self.policy
+                    .config
+                    .set(0, PodPolicyConfig(value), 0)
+                    .context("write policy config")?;
+            }
+            PolicyOp::UpsertState {
+                key,
+                rate_bytes_per_s,
+                burst_bytes,
+            } => {
+                let pod_key = PodBucketKey(*key);
+                let existing = self
+                    .policy
+                    .states
+                    .get(&pod_key, BPF_F_LOCK)
+                    .ok()
+                    .map(|value| value.0);
+                let mut state = existing.unwrap_or_default();
+                state.rate_bytes_per_s = *rate_bytes_per_s;
+                state.burst_bytes = *burst_bytes;
+                if existing.is_none() {
+                    state.tokens = *burst_bytes;
+                }
+                self.policy
+                    .states
+                    .insert(pod_key, PodRuleState(state), BPF_F_LOCK)
+                    .context("write rule state")?;
+            }
+            PolicyOp::RemoveState { key } => {
+                self.policy
+                    .states
+                    .remove(&PodBucketKey(*key))
+                    .context("remove rule state")?;
+            }
+            PolicyOp::UpsertMatch { entry, rule } => {
+                let value = PodRuleRef(*rule);
+                match entry {
+                    MatchEntry::AppCgroup {
+                        direction,
+                        cgroup_id,
+                    } => self
+                        .cgroup_map_mut(*direction)
+                        .insert(*cgroup_id, value, 0)
+                        .context("insert application cgroup match")?,
+                    MatchEntry::AppComm { direction, comm } => self
+                        .comm_map_mut(*direction)
+                        .insert(*comm, value, 0)
+                        .context("insert application comm match")?,
+                    MatchEntry::EndpointExact { direction, key } => self
+                        .exact_map_mut(*direction)
+                        .insert(PodEndpointMatchKey(*key), value, 0)
+                        .context("insert endpoint match")?,
+                    MatchEntry::EndpointCidr {
+                        direction,
+                        prefix_len,
+                        addr,
+                    } => self
+                        .cidr_map_mut(*direction)
+                        .insert(&LpmKey::new(*prefix_len, *addr), value, 0)
+                        .context("insert CIDR match")?,
+                }
+            }
+            PolicyOp::RemoveMatch { entry } => match entry {
+                MatchEntry::AppCgroup {
+                    direction,
+                    cgroup_id,
+                } => self
+                    .cgroup_map_mut(*direction)
+                    .remove(cgroup_id)
+                    .context("remove application cgroup match")?,
+                MatchEntry::AppComm { direction, comm } => self
+                    .comm_map_mut(*direction)
+                    .remove(comm)
+                    .context("remove application comm match")?,
+                MatchEntry::EndpointExact { direction, key } => self
+                    .exact_map_mut(*direction)
+                    .remove(&PodEndpointMatchKey(*key))
+                    .context("remove endpoint match")?,
+                MatchEntry::EndpointCidr {
+                    direction,
+                    prefix_len,
+                    addr,
+                } => self
+                    .cidr_map_mut(*direction)
+                    .remove(&LpmKey::new(*prefix_len, *addr))
+                    .context("remove CIDR match")?,
+            },
+        }
+        Ok(())
+    }
+
+    fn cgroup_map_mut(
+        &mut self,
+        direction: Direction,
+    ) -> &mut AyaHashMap<MapData, u64, PodRuleRef> {
+        match direction {
+            Direction::Inbound => &mut self.policy.app_cgroup_ingress,
+            Direction::Outbound => &mut self.policy.app_cgroup_egress,
+        }
+    }
+
+    fn comm_map_mut(
+        &mut self,
+        direction: Direction,
+    ) -> &mut AyaHashMap<MapData, [u8; 16], PodRuleRef> {
+        match direction {
+            Direction::Inbound => &mut self.policy.app_comm_ingress,
+            Direction::Outbound => &mut self.policy.app_comm_egress,
+        }
+    }
+
+    fn exact_map_mut(
+        &mut self,
+        direction: Direction,
+    ) -> &mut AyaHashMap<MapData, PodEndpointMatchKey, PodRuleRef> {
+        match direction {
+            Direction::Inbound => &mut self.policy.endpoint_exact_ingress,
+            Direction::Outbound => &mut self.policy.endpoint_exact_egress,
+        }
+    }
+
+    fn cidr_map_mut(&mut self, direction: Direction) -> &mut LpmTrie<MapData, [u8; 4], PodRuleRef> {
+        match direction {
+            Direction::Inbound => &mut self.policy.endpoint_cidr_ingress,
+            Direction::Outbound => &mut self.policy.endpoint_cidr_egress,
         }
     }
 }
@@ -403,79 +610,78 @@ fn verify_abi(ebpf: &mut Ebpf) -> Result<()> {
     Ok(())
 }
 
-/// Verifies the fixed capacities of every Traffic Rule map before attachment.
-///
-/// Called after program loading so the kernel already holds the map
-/// references; the temporary handles can be dropped.
-fn verify_policy_maps(ebpf: &mut Ebpf) -> Result<()> {
+/// Takes and validates every Traffic Rule map before attachment.
+fn take_policy_maps(ebpf: &mut Ebpf) -> Result<PolicyMaps> {
     let rules = kernel_abi::DEFAULT_TRAFFIC_RULE_CAPACITY as usize;
-    let expected: [(&str, usize); 10] = [
-        (kernel_abi::POLICY_CONFIG_MAP, 1),
-        (kernel_abi::RULE_STATES_MAP, rules * 2),
-        (kernel_abi::APP_CGROUP_INGRESS_MAP, rules),
-        (kernel_abi::APP_CGROUP_EGRESS_MAP, rules),
-        (kernel_abi::APP_COMM_INGRESS_MAP, rules),
-        (kernel_abi::APP_COMM_EGRESS_MAP, rules),
-        (kernel_abi::ENDPOINT_EXACT_INGRESS_MAP, rules),
-        (kernel_abi::ENDPOINT_EXACT_EGRESS_MAP, rules),
-        (kernel_abi::ENDPOINT_CIDR_INGRESS_MAP, rules),
-        (kernel_abi::ENDPOINT_CIDR_EGRESS_MAP, rules),
-    ];
-
-    for (name, capacity) in expected {
-        let map = ebpf
-            .take_map(name)
-            .with_context(|| format!("eBPF map {name:?} is missing"))?;
-        let actual = read_map_capacity(map, name)?;
-        if actual != capacity {
-            bail!(
-                "policy map {name:?} capacity mismatch: expected {capacity}, \
-                 eBPF object provides {actual}; rebuild the object"
-            );
-        }
-    }
-
-    Ok(())
+    Ok(PolicyMaps {
+        config: take_policy_array(ebpf, POLICY_CONFIG_MAP, 1)?,
+        states: take_policy_map(ebpf, RULE_STATES_MAP, rules * 2)?,
+        app_cgroup_ingress: take_policy_map(ebpf, APP_CGROUP_INGRESS_MAP, rules)?,
+        app_cgroup_egress: take_policy_map(ebpf, APP_CGROUP_EGRESS_MAP, rules)?,
+        app_comm_ingress: take_policy_map(ebpf, APP_COMM_INGRESS_MAP, rules)?,
+        app_comm_egress: take_policy_map(ebpf, APP_COMM_EGRESS_MAP, rules)?,
+        endpoint_exact_ingress: take_policy_map(ebpf, ENDPOINT_EXACT_INGRESS_MAP, rules)?,
+        endpoint_exact_egress: take_policy_map(ebpf, ENDPOINT_EXACT_EGRESS_MAP, rules)?,
+        endpoint_cidr_ingress: take_policy_trie(ebpf, ENDPOINT_CIDR_INGRESS_MAP, rules)?,
+        endpoint_cidr_egress: take_policy_trie(ebpf, ENDPOINT_CIDR_EGRESS_MAP, rules)?,
+    })
 }
 
-/// Extracts the shared [`MapData`] handle from a taken map of any type.
-fn read_map_capacity(map: AyaMap, name: &str) -> Result<usize> {
-    let data = match map {
-        AyaMap::Array(data)
-        | AyaMap::ArrayOfMaps(data)
-        | AyaMap::BloomFilter(data)
-        | AyaMap::CgroupArray(data)
-        | AyaMap::CgroupStorage(data)
-        | AyaMap::CgrpStorage(data)
-        | AyaMap::CpuMap(data)
-        | AyaMap::DevMap(data)
-        | AyaMap::DevMapHash(data)
-        | AyaMap::HashMap(data)
-        | AyaMap::HashOfMaps(data)
-        | AyaMap::InodeStorage(data)
-        | AyaMap::LpmTrie(data)
-        | AyaMap::LruHashMap(data)
-        | AyaMap::PerCpuArray(data)
-        | AyaMap::PerCpuCgroupStorage(data)
-        | AyaMap::PerCpuHashMap(data)
-        | AyaMap::PerCpuLruHashMap(data)
-        | AyaMap::PerfEventArray(data)
-        | AyaMap::ProgramArray(data)
-        | AyaMap::Queue(data)
-        | AyaMap::ReusePortSockArray(data)
-        | AyaMap::RingBuf(data)
-        | AyaMap::SockHash(data)
-        | AyaMap::SockMap(data)
-        | AyaMap::SkStorage(data)
-        | AyaMap::Stack(data)
-        | AyaMap::StackTraceMap(data)
-        | AyaMap::Unsupported(data)
-        | AyaMap::XskMap(data) => data,
-    };
-    Ok(data
+fn take_policy_array(
+    ebpf: &mut Ebpf,
+    name: &str,
+    capacity: usize,
+) -> Result<Array<MapData, PodPolicyConfig>> {
+    let map = ebpf
+        .take_map(name)
+        .with_context(|| format!("eBPF map {name:?} is missing"))?;
+    let typed = Array::try_from(map).with_context(|| format!("convert {name:?} map"))?;
+    check_capacity(typed.map(), name, capacity)?;
+    Ok(typed)
+}
+
+fn take_policy_map<K, V>(
+    ebpf: &mut Ebpf,
+    name: &str,
+    capacity: usize,
+) -> Result<AyaHashMap<MapData, K, V>>
+where
+    K: aya::Pod,
+    V: aya::Pod,
+{
+    let map = ebpf
+        .take_map(name)
+        .with_context(|| format!("eBPF map {name:?} is missing"))?;
+    let typed = AyaHashMap::try_from(map).with_context(|| format!("convert {name:?} map"))?;
+    check_capacity(typed.map(), name, capacity)?;
+    Ok(typed)
+}
+
+fn take_policy_trie(
+    ebpf: &mut Ebpf,
+    name: &str,
+    capacity: usize,
+) -> Result<LpmTrie<MapData, [u8; 4], PodRuleRef>> {
+    let map = ebpf
+        .take_map(name)
+        .with_context(|| format!("eBPF map {name:?} is missing"))?;
+    let typed = LpmTrie::try_from(map).with_context(|| format!("convert {name:?} map"))?;
+    check_capacity(typed.map(), name, capacity)?;
+    Ok(typed)
+}
+
+fn check_capacity(map: &MapData, name: &str, capacity: usize) -> Result<()> {
+    let actual = map
         .info()
         .with_context(|| format!("read {name:?} map info"))?
-        .max_entries() as usize)
+        .max_entries() as usize;
+    if actual != capacity {
+        bail!(
+            "policy map {name:?} capacity mismatch: expected {capacity}, \
+             eBPF object provides {actual}; rebuild the object"
+        );
+    }
+    Ok(())
 }
 
 fn take_flow_map(ebpf: &mut Ebpf) -> Result<PerCpuHashMap<MapData, PodFlowKey, PodFlowValue>> {

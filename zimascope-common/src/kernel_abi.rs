@@ -278,7 +278,7 @@ pub struct OwnerValue {
 
 /// Value stored in every Traffic Rule match map.
 #[repr(C)]
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct RuleRef {
     pub rule_id: u32,
     pub action: u8,

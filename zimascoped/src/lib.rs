@@ -5,7 +5,9 @@ pub mod api;
 mod collector;
 #[allow(dead_code)]
 mod enrichment;
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub mod policy;
 pub mod proxy;
 
 pub use collector::fingerprint::{FingerprintLibrary, SharedFingerprints, shared_default};
-pub use collector::{BatchReceiver, Collector, CollectorConfig, InterfaceSelector};
+pub use collector::{BatchReceiver, Collector, CollectorConfig, InterfaceSelector, PolicyHandle};
