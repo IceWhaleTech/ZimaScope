@@ -23,8 +23,10 @@ import {
   useApplicationTimeline,
   useDomain,
   useDomainTimeline,
+  useDomains,
   useEndpoint,
   useEndpointTimeline,
+  useEndpoints,
   useFlow,
 } from "@/hooks/use-data";
 import {
@@ -644,6 +646,16 @@ function ApplicationDetailBody({ detail }: { detail: ApplicationDetail }) {
   const { close, open } = useDetails();
   const navigate = useNavigate();
   const Icon = detail.kind === "container" ? Boxes : Terminal;
+  const destinations = useEndpoints({
+    application_id: detail.id,
+    sort: "-bytes",
+    limit: 8,
+  });
+  const domains = useDomains({
+    application_id: detail.id,
+    sort: "-bytes",
+    limit: 8,
+  });
   return (
     <ScrollArea className="min-h-0 min-w-0 max-w-full flex-1 overflow-hidden">
       <motion.div {...enter} className="flex w-full min-w-0 max-w-full flex-col gap-5 p-4">
@@ -698,23 +710,79 @@ function ApplicationDetailBody({ detail }: { detail: ApplicationDetail }) {
           </p>
         </PanelSection>
 
-        <PanelSection title="Associated domains" subtitle="Names contacted by this Application">
-          {detail.domains.length ? (
+        <PanelSection
+          title="Destinations"
+          subtitle="Peer addresses this Application talked to, by traffic"
+        >
+          {destinations.data?.items.length ? (
             <ul className="flex flex-col">
-              {detail.domains.slice(0, 8).map((ref) => (
-                <li key={ref.domain}>
+              {destinations.data.items.map((endpoint) => (
+                <li key={endpoint.address}>
                   <button
                     type="button"
-                    onClick={() => open({ kind: "domain", name: ref.domain })}
+                    onClick={() => open({ kind: "endpoint", address: endpoint.address })}
                     className="flex w-full items-center gap-2 rounded-md px-1 py-2 text-left transition-colors hover:bg-accent"
                   >
-                    <span className="min-w-0 flex-1 truncate text-xs font-medium">{ref.domain}</span>
-                    <EvidenceChip evidence={ref.evidence} confidence={ref.confidence} />
+                    <span className="flex min-w-0 flex-1 flex-col">
+                      <span className="truncate font-mono text-xs font-medium">
+                        {endpoint.address}
+                      </span>
+                      <span className="truncate text-2xs text-muted-foreground">
+                        {endpoint.country ? <CountryLabel country={endpoint.country} /> : null}
+                        {endpoint.country ? " · " : ""}
+                        {endpoint.organization ?? "Not enriched"}
+                      </span>
+                    </span>
+                    <span className="shrink-0 text-2xs tabular-nums text-muted-foreground">
+                      ↓{formatBytes(endpoint.traffic.inbound.bytes)} ↑
+                      {formatBytes(endpoint.traffic.outbound.bytes)}
+                    </span>
                     <ChevronRight className="size-3.5 shrink-0 text-muted-foreground" />
                   </button>
                 </li>
               ))}
             </ul>
+          ) : destinations.isLoading ? (
+            <Skeleton className="h-16 w-full" />
+          ) : (
+            <p className="text-xs text-muted-foreground">
+              No destination was observed for this Application yet.
+            </p>
+          )}
+        </PanelSection>
+
+        <PanelSection title="Domains" subtitle="Names contacted by this Application, by traffic">
+          {domains.data?.items.length ? (
+            <ul className="flex flex-col">
+              {domains.data.items.map((summary) => (
+                <li key={summary.domain}>
+                  <button
+                    type="button"
+                    onClick={() => open({ kind: "domain", name: summary.domain })}
+                    className="flex w-full items-center gap-2 rounded-md px-1 py-2 text-left transition-colors hover:bg-accent"
+                  >
+                    <span className="min-w-0 flex-1 truncate text-xs font-medium">
+                      {summary.domain}
+                    </span>
+                    <span className="flex shrink-0 items-center gap-1">
+                      {summary.evidence.map((evidence) => (
+                        <EvidenceChip
+                          key={evidence}
+                          evidence={evidence}
+                          confidence={evidence === "dns" ? "inferred" : "direct"}
+                        />
+                      ))}
+                    </span>
+                    <span className="shrink-0 text-2xs tabular-nums text-muted-foreground">
+                      ↑{formatBytes(summary.traffic.outbound.bytes)}
+                    </span>
+                    <ChevronRight className="size-3.5 shrink-0 text-muted-foreground" />
+                  </button>
+                </li>
+              ))}
+            </ul>
+          ) : domains.isLoading ? (
+            <Skeleton className="h-16 w-full" />
           ) : (
             <p className="text-xs text-muted-foreground">
               No Associated Domain was observed for this Application yet.
