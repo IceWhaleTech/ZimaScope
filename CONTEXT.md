@@ -59,3 +59,19 @@ _Avoid_: No traffic
 **Fingerprint**:
 A byte-pattern rule that identifies an application protocol from the first payload of a Flow. Matches are observed evidence; unmatched Flows stay TCP/UDP.
 _Avoid_: Port inference, service guess
+
+**Traffic Rule**:
+A user-confirmed policy that limits or blocks Flows matching an Endpoint, a CIDR, or an Application Identity. Rules are directional and evaluated at the Device Boundary.
+_Avoid_: Firewall rule, QoS rule
+
+**Limit**:
+A Traffic Rule action that drops over-limit packets so matching traffic settles at or below the configured rate. This is policing; ZimaScope never queues or delays packets.
+_Avoid_: Shaping, throttling, bandwidth guarantee
+
+**Block**:
+A Traffic Rule action that drops every matching packet. Blocked traffic is not counted as boundary traffic and never appears as a Flow.
+_Avoid_: Reject, reset
+
+**Policing**:
+The enforcement method for Traffic Rules: over-limit packets are dropped at the Device Boundary instead of queued. Enforcement is fail-open — any missing evidence passes the packet.
+_Avoid_: Shaping, traffic control

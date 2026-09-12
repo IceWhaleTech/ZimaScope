@@ -455,7 +455,7 @@ impl CollectorCore {
 }
 ```
 
-Do not erase useful context with bare `?` at Aya, netlink, interface, map, or filesystem calls. Runtime collection failures are normally represented through `CollectorHealth`; collection continues wherever safe. No error path may drop, reject, delay, or modify a network packet.
+Do not erase useful context with bare `?` at Aya, netlink, interface, map, or filesystem calls. Runtime collection failures are normally represented through `CollectorHealth`; collection continues wherever safe. No error path may drop, reject, delay, or modify a network packet, except a packet matched by an enabled Traffic Rule, which is dropped by design (ADR-0004, `traffic-rules.md`).
 
 ## Packet-path rules
 
@@ -464,7 +464,7 @@ Do not erase useful context with bare `?` at Aya, netlink, interface, map, or fi
 - Map polling is one sequential pass per interval; do not query the same map separately for overview, persistence, and UI.
 - Reuse buffers across polls. The eBPF object's fixed map capacity is reported through collector health.
 - Keep enrichment, persistence, rollups, and serialization off the collector path.
-- Prefer the simplest correct implementation, then benchmark before adding kernel-side caches or rate controls.
+- Prefer the simplest correct implementation, then benchmark before adding kernel-side caches. Traffic Rule evaluation is specified separately in `traffic-rules.md`: it runs only when a rule is enabled and otherwise adds a single configuration lookup per packet.
 
 ## Required tests
 
