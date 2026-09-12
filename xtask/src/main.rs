@@ -32,25 +32,30 @@ fn main() -> Result<()> {
 
 fn build_ebpf() -> Result<()> {
     let root = workspace_root()?;
-    let status = Command::new("cargo")
-        .current_dir(&root)
-        .args([
-            "+nightly",
-            "build",
-            "--package",
-            "zimascope-ebpf",
-            "--bin",
-            "zimascope-ebpf",
-            "--release",
-            "--target",
-            "bpfel-unknown-none",
-            "-Z",
-            "build-std=core",
-            "-Z",
-            "build-std-features=compiler-builtins-mem",
-            "--features",
-            "bpf",
-        ])
+    let mut command = Command::new("cargo");
+    command.current_dir(&root).args([
+        "+nightly",
+        "build",
+        "--package",
+        "zimascope-ebpf",
+        "--bin",
+        "zimascope-ebpf",
+        "--release",
+        "--target",
+        "bpfel-unknown-none",
+        "-Z",
+        "build-std=core",
+        "-Z",
+        "build-std-features=compiler-builtins-mem",
+        "--features",
+        "bpf",
+    ]);
+    command.env(
+        "CARGO_ENCODED_RUSTFLAGS",
+        ["-Cdebuginfo=2", "-Clink-arg=--btf"].join("\u{1f}"),
+    );
+
+    let status = command
         .status()
         .context("run cargo build for the eBPF object")?;
 
