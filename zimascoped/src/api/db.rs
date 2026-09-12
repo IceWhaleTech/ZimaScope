@@ -33,14 +33,14 @@ use crate::proxy::{ProxyKey, ProxyResolver};
 
 use super::application::{ApplicationResolver, ResolvedApplication};
 use super::dto::{
-    ApplicationDetailDto, ApplicationRefDto, ApplicationSummaryDto, AsnCountDto,
-    CollectorHealthDto, ConnectionDto, CountersDto, CountryCountDto, CreateExportRequest,
-    DirectionTotalsDto, DomainAddressDto, DomainDetailDto, DomainObservationDto, DomainRefDto,
-    DomainSummaryDto, DomainVisibilityDto, EndpointDetailDto, EndpointDto, EndpointSummaryDto,
-    EvidenceCountDto, ExportFormat, ExportTaskDto, FlowDto, FlowQuery, FlowStateParam,
-    IpProfileDto, OverviewDto, Page, PortUsageDto, ProxiedTrafficDto, RateDto, TickDto,
-    TickOverviewDto, TickTrafficDto, TimeRange, TimelineDto, TimelinePointDto, enum_from_value,
-    enum_value, flow_state_name, unix_millis,
+    ApplicationDestinationDto, ApplicationDetailDto, ApplicationRefDto, ApplicationSummaryDto,
+    AsnCountDto, CollectorHealthDto, ConnectionDto, CountersDto, CountryCountDto,
+    CreateExportRequest, DirectionTotalsDto, DomainAddressDto, DomainDetailDto,
+    DomainObservationDto, DomainRefDto, DomainSummaryDto, DomainVisibilityDto, EndpointDetailDto,
+    EndpointDto, EndpointSummaryDto, EvidenceCountDto, ExportFormat, ExportTaskDto, FlowDto,
+    FlowQuery, FlowStateParam, IpProfileDto, OverviewDto, Page, PortUsageDto, ProxiedTrafficDto,
+    RateDto, TickDto, TickOverviewDto, TickTrafficDto, TimeRange, TimelineDto, TimelinePointDto,
+    enum_from_value, enum_value, flow_state_name, unix_millis,
 };
 use super::error::ApiError;
 use super::settings::Settings;
@@ -53,6 +53,8 @@ impl From<rusqlite::Error> for ApiError {
 
 const EXPORT_MAX_RECORDS: usize = 10_000;
 const MAX_DOMAIN_CANDIDATES: usize = 8;
+/// Peer addresses embedded in one Application detail response.
+const MAX_APPLICATION_DESTINATIONS: usize = 12;
 const TOP_LIST_LIMIT: usize = 10;
 /// Upper bound on aggregate rows embedded in one SSE tick. Overflow is
 /// recovered by the client's periodic full refresh.
@@ -795,6 +797,7 @@ impl Db {
             }
         }
         domains.sort_by(|left, right| left.domain.cmp(&right.domain));
+        let destinations = self.application_destinations(id)?;
 
         Ok(ApplicationDetailDto {
             id: summary.id.clone(),
@@ -811,8 +814,96 @@ impl Db {
             first_seen: summary.first_seen,
             last_seen: summary.last_seen,
             domains,
+            destinations,
             flows_url: format!("/v1/flows?application_id={}", encode_uri_component(id)),
         })
+    }
+
+    /// Aggregates one Application's Flows by peer address and attaches the
+    /// Associated Domains observed for that address inside this Application.
+    fn application_destinations(
+        &self,
+        id: &str,
+    ) -> Result<Vec<ApplicationDestinationDto>, ApiError> {
+        let mut domains_by_address: HashMap<String, Vec<DomainRefDto>> = HashMap::new();
+        {
+            let mut statement = self.conn.prepare(
+                "SELECT flows.remote_addr, je.value->>'domain', je.value->>'evidence', \
+                 je.value->>'confidence' FROM flows, json_each(flows.domains_json) je \
+                 WHERE flows.app_id = ?1 AND je.value->>'domain' IS NOT NULL",
+            )?;
+            let rows = statement.query_map([id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            })?;
+            for row in rows {
+                let (address, domain, evidence, confidence) = row?;
+                let Some(evidence) = enum_from_value::<DomainEvidence>(&evidence) else {
+                    continue;
+                };
+                let Some(confidence) = enum_from_value::<AssociationConfidence>(&confidence) else {
+                    continue;
+                };
+                push_domain(
+                    domains_by_address.entry(address).or_default(),
+                    &DomainRefDto {
+                        domain,
+                        evidence,
+                        confidence,
+                    },
+                );
+            }
+        }
+
+        let mut statement = self.conn.prepare(
+            "SELECT remote_addr, MAX(remote_scope), MAX(remote_country), MAX(remote_asn), \
+             MAX(remote_org), SUM(packets), SUM(bytes), \
+             COALESCE(SUM(CASE WHEN direction = 'inbound' THEN packets ELSE 0 END), 0), \
+             COALESCE(SUM(CASE WHEN direction = 'inbound' THEN bytes ELSE 0 END), 0), \
+             COALESCE(SUM(CASE WHEN direction = 'outbound' THEN packets ELSE 0 END), 0), \
+             COALESCE(SUM(CASE WHEN direction = 'outbound' THEN bytes ELSE 0 END), 0), \
+             COUNT(*) FROM flows WHERE app_id = ?1 GROUP BY remote_addr \
+             ORDER BY SUM(bytes) DESC, remote_addr LIMIT ?2",
+        )?;
+        let mut destinations = statement
+            .query_map(params![id, MAX_APPLICATION_DESTINATIONS as i64], |row| {
+                let scope: String = row.get(1)?;
+                Ok(ApplicationDestinationDto {
+                    address: row.get(0)?,
+                    scope: enum_from_value(&scope).unwrap_or(AddressScope::Reserved),
+                    country: row.get(2)?,
+                    asn: row.get(3)?,
+                    organization: row.get(4)?,
+                    packets: row.get::<_, i64>(5)? as u64,
+                    bytes: row.get::<_, i64>(6)? as u64,
+                    traffic: DirectionTotalsDto {
+                        inbound: CountersDto {
+                            packets: row.get::<_, i64>(7)? as u64,
+                            bytes: row.get::<_, i64>(8)? as u64,
+                        },
+                        outbound: CountersDto {
+                            packets: row.get::<_, i64>(9)? as u64,
+                            bytes: row.get::<_, i64>(10)? as u64,
+                        },
+                    },
+                    flow_count: row.get::<_, i64>(11)? as u64,
+                    domains: Vec::new(),
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+
+        for destination in &mut destinations {
+            if let Some(mut domains) = domains_by_address.remove(&destination.address) {
+                domains.sort_by(|left, right| left.domain.cmp(&right.domain));
+                destination.domains = domains;
+            }
+        }
+
+        Ok(destinations)
     }
 
     pub(crate) fn application_timeline(

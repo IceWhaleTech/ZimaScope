@@ -26,7 +26,6 @@ import {
   useDomains,
   useEndpoint,
   useEndpointTimeline,
-  useEndpoints,
   useFlow,
 } from "@/hooks/use-data";
 import {
@@ -646,11 +645,6 @@ function ApplicationDetailBody({ detail }: { detail: ApplicationDetail }) {
   const { close, open } = useDetails();
   const navigate = useNavigate();
   const Icon = detail.kind === "container" ? Boxes : Terminal;
-  const destinations = useEndpoints({
-    application_id: detail.id,
-    sort: "-bytes",
-    limit: 8,
-  });
   const domains = useDomains({
     application_id: detail.id,
     sort: "-bytes",
@@ -714,36 +708,42 @@ function ApplicationDetailBody({ detail }: { detail: ApplicationDetail }) {
           title="Destinations"
           subtitle="Peer addresses this Application talked to, by traffic"
         >
-          {destinations.data?.items.length ? (
+          {detail.destinations.length ? (
             <ul className="flex flex-col">
-              {destinations.data.items.map((endpoint) => (
-                <li key={endpoint.address}>
+              {detail.destinations.map((destination) => (
+                <li key={destination.address}>
                   <button
                     type="button"
-                    onClick={() => open({ kind: "endpoint", address: endpoint.address })}
+                    onClick={() => open({ kind: "endpoint", address: destination.address })}
                     className="flex w-full items-center gap-2 rounded-md px-1 py-2 text-left transition-colors hover:bg-accent"
                   >
                     <span className="flex min-w-0 flex-1 flex-col">
                       <span className="truncate font-mono text-xs font-medium">
-                        {endpoint.address}
+                        {destination.address}
                       </span>
                       <span className="truncate text-2xs text-muted-foreground">
-                        {endpoint.country ? <CountryLabel country={endpoint.country} /> : null}
-                        {endpoint.country ? " · " : ""}
-                        {endpoint.organization ?? "Not enriched"}
+                        {destination.country ? (
+                          <CountryLabel country={destination.country} />
+                        ) : (
+                          (destination.organization ?? "Not enriched")
+                        )}
+                        {destination.domains.length
+                          ? ` · ${destination.domains
+                              .slice(0, 3)
+                              .map((domain) => domain.domain)
+                              .join(" · ")}${destination.domains.length > 3 ? ` +${destination.domains.length - 3}` : ""}`
+                          : " · No domain evidence"}
                       </span>
                     </span>
                     <span className="shrink-0 text-2xs tabular-nums text-muted-foreground">
-                      ↓{formatBytes(endpoint.traffic.inbound.bytes)} ↑
-                      {formatBytes(endpoint.traffic.outbound.bytes)}
+                      ↓{formatBytes(destination.traffic.inbound.bytes)} ↑
+                      {formatBytes(destination.traffic.outbound.bytes)}
                     </span>
                     <ChevronRight className="size-3.5 shrink-0 text-muted-foreground" />
                   </button>
                 </li>
               ))}
             </ul>
-          ) : destinations.isLoading ? (
-            <Skeleton className="h-16 w-full" />
           ) : (
             <p className="text-xs text-muted-foreground">
               No destination was observed for this Application yet.

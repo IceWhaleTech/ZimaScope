@@ -1238,6 +1238,16 @@ mod tests {
 
         let body = body_json(call(&state, get("/v1/applications/proc:comm:curl")).await).await;
         assert_eq!(body["domains"][0]["domain"], "example.com");
+        assert_eq!(body["destinations"][0]["address"], "93.184.216.34");
+        assert_eq!(
+            body["destinations"][0]["domains"][0]["domain"],
+            "example.com"
+        );
+        assert_eq!(
+            body["destinations"][0]["traffic"]["outbound"]["bytes"],
+            4_000
+        );
+        assert_eq!(body["destinations"][0]["flow_count"], 1);
         assert_eq!(
             body["flows_url"],
             "/v1/flows?application_id=proc%3Acomm%3Acurl"

@@ -178,7 +178,22 @@ export interface ApplicationDetail {
   first_seen: number;
   last_seen: number;
   domains: DomainRef[];
+  /** Peer addresses with the Associated Domains observed for each. */
+  destinations: ApplicationDestination[];
   flows_url: string;
+}
+
+export interface ApplicationDestination {
+  address: string;
+  scope: Scope;
+  country: string | null;
+  asn: number | null;
+  organization: string | null;
+  packets: number;
+  bytes: number;
+  traffic: DirectionTotals;
+  flow_count: number;
+  domains: DomainRef[];
 }
 
 export interface EvidenceCount {

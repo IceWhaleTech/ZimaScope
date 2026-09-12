@@ -243,7 +243,26 @@ pub struct ApplicationDetailDto {
     pub first_seen: i64,
     pub last_seen: i64,
     pub domains: Vec<DomainRefDto>,
+    /// Peer addresses this Application talked to, each with the Associated
+    /// Domains observed for it and its boundary traffic.
+    pub destinations: Vec<ApplicationDestinationDto>,
     pub flows_url: String,
+}
+
+/// One peer address of an Application.
+#[derive(Clone, Debug, Serialize)]
+pub struct ApplicationDestinationDto {
+    pub address: String,
+    pub scope: AddressScope,
+    pub country: Option<String>,
+    pub asn: Option<u32>,
+    pub organization: Option<String>,
+    pub packets: u64,
+    pub bytes: u64,
+    /// Directional split relative to the Device Boundary.
+    pub traffic: DirectionTotalsDto,
+    pub flow_count: u64,
+    pub domains: Vec<DomainRefDto>,
 }
 
 #[derive(Clone, Debug, Serialize)]
