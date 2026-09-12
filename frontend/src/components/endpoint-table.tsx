@@ -20,6 +20,8 @@ export const EndpointRow = memo(function EndpointRow({
     <TableRow
       tabIndex={0}
       className="cursor-pointer"
+      data-menu="endpoint"
+      data-address={endpoint.address}
       onClick={() => onOpen(endpoint.address)}
       onKeyDown={(event) => {
         if (event.key === "Enter" || event.key === " ") {

@@ -20,6 +20,8 @@ export const DomainRow = memo(function DomainRow({
     <TableRow
       tabIndex={0}
       className="cursor-pointer"
+      data-menu="domain"
+      data-domain={domain.domain}
       onClick={() => onOpen(domain.domain)}
       onKeyDown={(event) => {
         if (event.key === "Enter" || event.key === " ") {

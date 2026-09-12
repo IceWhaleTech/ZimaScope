@@ -40,6 +40,7 @@ import { DomainRow, DOMAIN_COLUMNS } from "@/components/domain-table";
 import { EmptyState } from "@/components/empty-state";
 import { EndpointRow, ENDPOINT_COLUMNS } from "@/components/endpoint-table";
 import { ApplicationRow, APPLICATION_COLUMNS } from "@/components/application-table";
+import { RowContextMenu } from "@/components/row-context-menu";
 import { Segmented } from "@/components/segmented";
 import { TableSkeleton } from "@/components/skeletons";
 import { FOCUS_SEARCH_EVENT } from "@/components/app-layout";
@@ -948,41 +949,43 @@ export function ExplorerView() {
         )}
       </div>
 
-      <motion.div
-        className="layered-surface overflow-hidden rounded-xl"
-        style={{ viewTransitionName: "flows-surface" }}
-        initial={false}
-        animate={{ height: lockedHeight ?? "auto" }}
-        transition={{ duration: 0.28, ease: EASE }}
-      >
-        <Table className="table-fixed">
-          <colgroup>
-            {columns.map((column) => (
-              <col key={column.sort} style={{ width: column.width }} />
-            ))}
-          </colgroup>
-          <TableHeader>
-            <TableRow>
+      <RowContextMenu>
+        <motion.div
+          className="layered-surface overflow-hidden rounded-xl"
+          style={{ viewTransitionName: "flows-surface" }}
+          initial={false}
+          animate={{ height: lockedHeight ?? "auto" }}
+          transition={{ duration: 0.28, ease: EASE }}
+        >
+          <Table className="table-fixed">
+            <colgroup>
               {columns.map((column) => (
-                <SortableHead key={column.label} column={column} sort={sort} onSort={toggleSort} />
+                <col key={column.sort} style={{ width: column.width }} />
               ))}
-            </TableRow>
-          </TableHeader>
-          <motion.tbody
-            ref={bodyRef}
-            data-slot="table-body"
-            className="explorer-table-body [&_tr:last-child]:border-0"
-            initial={false}
-            animate={phase === "out" ? { opacity: 0, y: -4 } : { opacity: 1, y: 0 }}
-            transition={{ duration: phase === "out" ? 0.13 : 0.2, ease: EASE }}
-            onAnimationComplete={() => {
-              if (phase === "in") setLockedHeight(null);
-            }}
-          >
-            {bodyContent}
-          </motion.tbody>
-        </Table>
-      </motion.div>
+            </colgroup>
+            <TableHeader>
+              <TableRow>
+                {columns.map((column) => (
+                  <SortableHead key={column.label} column={column} sort={sort} onSort={toggleSort} />
+                ))}
+              </TableRow>
+            </TableHeader>
+            <motion.tbody
+              ref={bodyRef}
+              data-slot="table-body"
+              className="explorer-table-body [&_tr:last-child]:border-0"
+              initial={false}
+              animate={phase === "out" ? { opacity: 0, y: -4 } : { opacity: 1, y: 0 }}
+              transition={{ duration: phase === "out" ? 0.13 : 0.2, ease: EASE }}
+              onAnimationComplete={() => {
+                if (phase === "in") setLockedHeight(null);
+              }}
+            >
+              {bodyContent}
+            </motion.tbody>
+          </Table>
+        </motion.div>
+      </RowContextMenu>
 
       <div ref={loadMoreRef} aria-hidden className="h-px" />
       <div className="flex items-center justify-between gap-3 py-2.5 text-2xs text-muted-foreground">

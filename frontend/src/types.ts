@@ -317,6 +317,9 @@ export interface KernelCounters {
   service_events_dropped: number;
   owner_events_inserted: number;
   owner_events_dropped: number;
+  policy_dropped_packets: number;
+  policy_dropped_bytes: number;
+  policy_missing_state: number;
 }
 
 export interface ObservationGap {
@@ -404,8 +407,80 @@ export interface ServiceStatus {
   enrichment: EnrichmentStatus;
   fingerprints: FingerprintStatus;
   proxy: ProxyStatus;
+  enforcement: EnforcementStatus;
   settings: SettingsSummary;
   recent_operations: AuditEntry[];
+}
+
+export type RuleAction = "limit" | "block";
+export type RuleDirection = "inbound" | "outbound" | "both";
+/** Derived enforcement state of one rule. */
+export type RuleState = "active" | "unresolved" | "bypassed" | "unavailable";
+
+export interface EnforcementStatus {
+  enabled: boolean;
+  available: boolean;
+  revision: number;
+  rules_total: number;
+  rules_active: number;
+  rules_unresolved: number;
+  dropped_packets: number;
+  dropped_bytes: number;
+  last_error: string | null;
+}
+
+export interface TrafficRuleMatch {
+  kind: "endpoint" | "cidr" | "application";
+  address: string | null;
+  prefix_len: number | null;
+  port: number | null;
+  application_id: string | null;
+}
+
+export interface TrafficRuleCounters {
+  matched_packets: number;
+  matched_bytes: number;
+  dropped_packets: number;
+  dropped_bytes: number;
+}
+
+export interface TrafficRule {
+  id: number;
+  action: RuleAction;
+  direction: RuleDirection;
+  match: TrafficRuleMatch;
+  rate_bytes_per_s: number;
+  burst_bytes: number;
+  enabled: boolean;
+  state: RuleState;
+  state_reason: string | null;
+  created_at: number;
+  updated_at: number;
+  counters: TrafficRuleCounters | null;
+}
+
+export interface TrafficRuleMatchInput {
+  kind: "endpoint" | "cidr" | "application";
+  address?: string;
+  prefix_len?: number;
+  port?: number;
+  application_id?: string;
+}
+
+export interface CreateTrafficRuleRequest {
+  action: RuleAction;
+  direction: RuleDirection;
+  match: TrafficRuleMatchInput;
+  rate_bytes_per_s?: number;
+  enabled?: boolean;
+}
+
+export interface UpdateTrafficRuleRequest {
+  action?: RuleAction;
+  direction?: RuleDirection;
+  match?: TrafficRuleMatchInput;
+  rate_bytes_per_s?: number;
+  enabled?: boolean;
 }
 
 export interface BoundarySettings {
@@ -444,6 +519,11 @@ export interface Settings {
   history: HistorySettings;
   resources: ResourceSettings;
   proxy: ProxySettings;
+  traffic_rules: TrafficRuleSettings;
+}
+
+export interface TrafficRuleSettings {
+  enabled: boolean;
 }
 
 export interface SettingsPatch {
@@ -453,6 +533,7 @@ export interface SettingsPatch {
   history?: Partial<HistorySettings>;
   resources?: Partial<ResourceSettings>;
   proxy?: Partial<ProxySettings>;
+  traffic_rules?: Partial<TrafficRuleSettings>;
 }
 
 export interface ExportTask {

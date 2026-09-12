@@ -16,11 +16,14 @@ import type {
   Flow,
   Overview,
   Page,
+  CreateTrafficRuleRequest,
   ServiceStatus,
   Settings,
   SettingsPatch,
   Timeline,
   TimeRange,
+  TrafficRule,
+  UpdateTrafficRuleRequest,
 } from "./types";
 
 /** RFC 9457 problem details raised by the API. */
@@ -212,6 +215,22 @@ export function deleteExport(id: string): Promise<void> {
 
 export function clearHistory(): Promise<void> {
   return request("/v1/history?confirm=true", { method: "DELETE" });
+}
+
+export function fetchTrafficRules(): Promise<TrafficRule[]> {
+  return request("/v1/traffic-rules");
+}
+
+export function createTrafficRule(rule: CreateTrafficRuleRequest): Promise<TrafficRule> {
+  return request("/v1/traffic-rules", json("POST", rule));
+}
+
+export function updateTrafficRule(id: number, rule: UpdateTrafficRuleRequest): Promise<TrafficRule> {
+  return request(`/v1/traffic-rules/${id}`, json("PATCH", rule));
+}
+
+export function deleteTrafficRule(id: number): Promise<void> {
+  return request(`/v1/traffic-rules/${id}`, { method: "DELETE" });
 }
 
 export interface StreamQuery {

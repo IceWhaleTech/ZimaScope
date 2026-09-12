@@ -8,7 +8,12 @@ import { keepPreviousData, useInfiniteQuery, useMutation, useQuery, useQueryClie
 import { useEffect } from "react";
 import { data, onResync } from "@/store";
 import type { FlowQuery } from "@/api";
-import type { SettingsPatch, TimeRange } from "@/types";
+import type {
+  CreateTrafficRuleRequest,
+  SettingsPatch,
+  TimeRange,
+  UpdateTrafficRuleRequest,
+} from "@/types";
 
 export const queryKeys = {
   overview: (range: TimeRange, excludeScope?: string) => ["overview", range, excludeScope ?? ""] as const,
@@ -29,6 +34,7 @@ export const queryKeys = {
   applicationTimeline: (id: string, range: TimeRange) => ["application-timeline", id, range] as const,
   status: () => ["status"] as const,
   settings: () => ["settings"] as const,
+  trafficRules: () => ["traffic-rules"] as const,
   exports: () => ["exports"] as const,
 };
 
@@ -211,6 +217,45 @@ export function useSaveSettings() {
       queryClient.setQueryData(queryKeys.settings(), settings);
       queryClient.invalidateQueries({ queryKey: queryKeys.status() });
     },
+  });
+}
+
+export function useTrafficRules() {
+  return useQuery({
+    queryKey: queryKeys.trafficRules(),
+    queryFn: () => data.trafficRules(),
+    staleTime: 5_000,
+  });
+}
+
+/** Rule mutations also move `/v1/status`, so both caches are refreshed. */
+function invalidateTrafficRules(queryClient: ReturnType<typeof useQueryClient>) {
+  void queryClient.invalidateQueries({ queryKey: queryKeys.trafficRules() });
+  void queryClient.invalidateQueries({ queryKey: queryKeys.status() });
+}
+
+export function useCreateTrafficRule() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (rule: CreateTrafficRuleRequest) => data.createTrafficRule(rule),
+    onSuccess: () => invalidateTrafficRules(queryClient),
+  });
+}
+
+export function useUpdateTrafficRule() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: ({ id, rule }: { id: number; rule: UpdateTrafficRuleRequest }) =>
+      data.updateTrafficRule(id, rule),
+    onSuccess: () => invalidateTrafficRules(queryClient),
+  });
+}
+
+export function useDeleteTrafficRule() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (id: number) => data.deleteTrafficRule(id),
+    onSuccess: () => invalidateTrafficRules(queryClient),
   });
 }
 

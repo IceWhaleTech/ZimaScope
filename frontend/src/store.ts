@@ -12,6 +12,7 @@ import type {
   ApplicationDetail,
   ApplicationSummary,
   Connection,
+  CreateTrafficRuleRequest,
   DomainDetail,
   DomainSummary,
   EndpointDetail,
@@ -26,6 +27,8 @@ import type {
   Tick,
   Timeline,
   TimeRange,
+  TrafficRule,
+  UpdateTrafficRuleRequest,
 } from "./types";
 
 const listeners = new Set<(tick: Tick) => void>();
@@ -106,6 +109,12 @@ export const data = {
   status: (): Promise<ServiceStatus> => api.fetchStatus(),
   settings: (): Promise<Settings> => api.fetchSettings(),
   saveSettings: (patch: SettingsPatch): Promise<Settings> => api.patchSettings(patch),
+  trafficRules: (): Promise<TrafficRule[]> => api.fetchTrafficRules(),
+  createTrafficRule: (rule: CreateTrafficRuleRequest): Promise<TrafficRule> =>
+    api.createTrafficRule(rule),
+  updateTrafficRule: (id: number, rule: UpdateTrafficRuleRequest): Promise<TrafficRule> =>
+    api.updateTrafficRule(id, rule),
+  deleteTrafficRule: (id: number): Promise<void> => api.deleteTrafficRule(id),
   clearHistory: (): Promise<void> => api.clearHistory(),
   exports: (): Promise<ExportTask[]> => api.fetchExports(),
   deleteExport: (id: string): Promise<void> => api.deleteExport(id),

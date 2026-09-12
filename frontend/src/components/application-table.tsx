@@ -21,6 +21,9 @@ export const ApplicationRow = memo(function ApplicationRow({
     <TableRow
       tabIndex={0}
       className="cursor-pointer"
+      data-menu="application"
+      data-id={application.id}
+      data-name={application.name}
       onClick={() => onOpen(application.id)}
       onKeyDown={(event) => {
         if (event.key === "Enter" || event.key === " ") {

@@ -242,6 +242,10 @@ const ConnectionRow = memo(function ConnectionRow({
   return (
     <TableRow
       data-connection-id={connection.id}
+      data-menu="connection"
+      data-address={connection.remote.address}
+      data-port={connection.remote.port ?? undefined}
+      data-domain={connection.domains[0]?.domain}
       tabIndex={0}
       className="cursor-pointer"
       onClick={() => onOpen?.(connection.remote.address)}
@@ -310,6 +314,9 @@ function GroupRow({
       tabIndex={0}
       className="cursor-pointer bg-muted/40 hover:bg-accent"
       aria-expanded={expanded}
+      data-menu={domainGroup ? "domain" : "endpoint"}
+      data-domain={domainGroup ? (group.domains[0]?.domain ?? group.label) : undefined}
+      data-address={domainGroup ? undefined : group.remote.address}
       onClick={onToggle}
       onKeyDown={(event) => {
         if (event.key === "Enter" || event.key === " ") {
@@ -389,6 +396,10 @@ const ChildRow = memo(function ChildRow({
   return (
     <TableRow
       data-connection-id={connection.id}
+      data-menu="connection"
+      data-address={connection.remote.address}
+      data-port={connection.remote.port ?? undefined}
+      data-domain={connection.domains[0]?.domain}
       tabIndex={0}
       className="cursor-pointer bg-muted/10 hover:bg-accent"
       onClick={() => onOpen?.(connection.remote.address)}

@@ -29,15 +29,25 @@ import {
 import { Skeleton } from "@/components/ui/skeleton";
 import { Switch } from "@/components/ui/switch";
 import { Input } from "@/components/ui/input";
+import { Badge } from "@/components/ui/badge";
 import { ExportTasks } from "@/components/export-tasks";
 import { Segmented } from "@/components/segmented";
 import { DefList } from "@/components/stat-tiles";
-import { useClearHistory, useCreateExport, useSaveSettings, useSettings, useStatus } from "@/hooks/use-data";
+import {
+  useClearHistory,
+  useCreateExport,
+  useDeleteTrafficRule,
+  useSaveSettings,
+  useSettings,
+  useStatus,
+  useTrafficRules,
+  useUpdateTrafficRule,
+} from "@/hooks/use-data";
 import { useSetTopbar } from "@/hooks/use-topbar";
 import { downloadExport } from "@/lib/download";
-import { formatDuration, formatNumber, relativeTime } from "@/lib/format";
+import { formatDuration, formatNumber, formatRateText, relativeTime } from "@/lib/format";
 import { cn } from "@/lib/utils";
-import type { ProxySettings, SettingsPatch } from "@/types";
+import type { ProxySettings, SettingsPatch, TrafficRule } from "@/types";
 
 function errorText(error: unknown): string {
   return error instanceof Error ? error.message : "The local agent did not respond.";
@@ -119,6 +129,18 @@ export function SettingsView() {
         status={status}
         saving={saveSettings.isPending}
         onPatch={(patch) => persist({ proxy: patch })}
+      />
+
+      <TrafficRulesCard
+        settings={settings}
+        status={status}
+        saving={saveSettings.isPending}
+        onMasterEnabled={(checked) =>
+          persist(
+            { traffic_rules: { enabled: checked } },
+            checked ? "Enforcement on" : "Enforcement paused",
+          )
+        }
       />
 
       <DataCard
@@ -567,6 +589,142 @@ function ProxyCard({
       />
     </SettingsCard>
   );
+}
+
+function TrafficRulesCard({
+  settings,
+  status,
+  saving,
+  onMasterEnabled,
+}: {
+  settings: SettingsData | undefined;
+  status: StatusData | undefined;
+  saving: boolean;
+  onMasterEnabled: (checked: boolean) => void;
+}) {
+  const rulesQuery = useTrafficRules();
+  const updateRule = useUpdateTrafficRule();
+  const deleteRule = useDeleteTrafficRule();
+  const enforcement = status?.enforcement;
+  const rules = rulesQuery.data ?? [];
+  const notEnforced = enforcement?.available === false || settings?.traffic_rules.enabled === false;
+
+  return (
+    <SettingsCard
+      title="Traffic rules"
+      description="User-confirmed limits and blocks enforced at the device boundary."
+      className="lg:col-span-2"
+    >
+      <div className="rounded-xl border bg-card/60 px-4">
+        <SettingRow
+          title="Enforcement"
+          detail="One switch pauses every rule without deleting it."
+          control={
+            <Switch
+              checked={settings?.traffic_rules.enabled ?? true}
+              disabled={!settings || saving}
+              onCheckedChange={onMasterEnabled}
+            />
+          }
+          last
+        />
+      </div>
+
+      {notEnforced && (
+        <div className="mt-3 flex items-start gap-2.5 rounded-lg border border-amber-500/30 bg-amber-500/8 px-3.5 py-2.5">
+          <TriangleAlert className="mt-px size-4 shrink-0 text-amber-500" />
+          <div className="min-w-0">
+            <strong className="block text-xs font-medium">Rules are not enforced</strong>
+            <p className="mt-0.5 text-2xs leading-relaxed break-words text-muted-foreground">
+              {enforcement?.available === false
+                ? (enforcement.last_error ?? "The collector is not running.")
+                : "The enforcement master switch is off."}
+            </p>
+          </div>
+        </div>
+      )}
+
+      <div className="mt-3 rounded-xl border bg-card/60">
+        {rulesQuery.isLoading ? (
+          <div className="px-4 py-3">
+            <Skeleton className="h-6 w-full" />
+          </div>
+        ) : rules.length === 0 ? (
+          <p className="px-4 py-3 text-2xs text-muted-foreground">
+            No rules yet. Right-click a connection, endpoint or application in the Explorer to add
+            one.
+          </p>
+        ) : (
+          <ul className="divide-y divide-border/60">
+            {rules.map((rule) => (
+              <li key={rule.id} className="flex items-center gap-3 px-4 py-2.5">
+                <Badge variant={rule.action === "block" ? "destructive" : "secondary"}>
+                  {rule.action === "block" ? "Block" : "Limit"}
+                </Badge>
+                <div className="min-w-0 flex-1">
+                  <div className="flex items-center gap-2">
+                    <span className="truncate font-mono text-xs">{ruleTarget(rule)}</span>
+                    <span className="shrink-0 text-2xs text-muted-foreground">{rule.direction}</span>
+                  </div>
+                  <p className="mt-0.5 text-2xs text-muted-foreground">
+                    {rule.action === "limit"
+                      ? formatRateText(rule.rate_bytes_per_s * 8)
+                      : "all matching packets"}
+                    {rule.counters && rule.counters.dropped_packets > 0
+                      ? ` · ${formatNumber(rule.counters.dropped_packets)} dropped`
+                      : ""}
+                    {rule.state !== "active" ? ` · ${stateLabel(rule.state)}` : ""}
+                  </p>
+                </div>
+                <Switch
+                  checked={rule.enabled}
+                  disabled={updateRule.isPending}
+                  onCheckedChange={(checked) =>
+                    updateRule.mutate({ id: rule.id, rule: { enabled: checked } })
+                  }
+                  aria-label="Rule enabled"
+                />
+                <Button
+                  variant="ghost"
+                  size="icon-sm"
+                  disabled={deleteRule.isPending}
+                  onClick={() =>
+                    deleteRule.mutate(rule.id, {
+                      onSuccess: () => toast.success("Rule deleted"),
+                    })
+                  }
+                  aria-label="Delete rule"
+                >
+                  <Trash2 />
+                </Button>
+              </li>
+            ))}
+          </ul>
+        )}
+      </div>
+    </SettingsCard>
+  );
+}
+
+function ruleTarget(rule: TrafficRule): string {
+  if (rule.match.kind === "application") return rule.match.application_id ?? "application";
+  if (rule.match.kind === "cidr") return `${rule.match.address}/${rule.match.prefix_len}`;
+  return rule.match.port
+    ? `${rule.match.address}:${rule.match.port}`
+    : (rule.match.address ?? "endpoint");
+}
+
+function stateLabel(state: TrafficRule["state"]): string {
+  switch (state) {
+    case "unresolved":
+      return "unresolved";
+    case "bypassed":
+      return "not enforced";
+    case "unavailable":
+      return "agent unavailable";
+    default:
+      return "active";
+  }
 }
 
 function DataCard({
