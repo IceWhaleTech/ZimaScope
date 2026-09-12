@@ -50,10 +50,10 @@ echo "==> installing ${SERVICE_NAME}"
 install -m 0644 -o root -g root "${UNIT_SRC}" "/etc/systemd/system/${SERVICE_NAME}"
 install -d -m 0755 /var/lib/zimascope
 
-if systemctl list-unit-files "${LEGACY_UI_SERVICE}" >/dev/null 2>&1; then
-  echo "==> retiring ${LEGACY_UI_SERVICE} (the agent serves the UI now)"
-  systemctl disable --now "${LEGACY_UI_SERVICE}" >/dev/null 2>&1 || true
-fi
+# Older releases served the SPA with `vite preview` on :8080; the agent owns
+# that port now, so the legacy unit must be stopped before the restart.
+echo "==> retiring ${LEGACY_UI_SERVICE} (the agent serves the UI now)"
+systemctl disable --now "${LEGACY_UI_SERVICE}" >/dev/null 2>&1 || true
 
 systemctl daemon-reload
 systemctl enable "${SERVICE_NAME}" >/dev/null
@@ -69,6 +69,6 @@ done
 
 curl -fsS --max-time 3 "http://127.0.0.1:8080/v1/status" | head -c 200
 echo
-curl -fsS --max-time 3 "http://127.0.0.1:8080/" | grep -q "<div id=\"root\"" \
+curl -fsS --max-time 3 "http://127.0.0.1:8080/" | grep -qi "<!doctype html>" \
   && echo "==> UI is being served by the agent"
 echo "==> ZimaScope installed: http://<host>:8080/  (API: /v1)"
