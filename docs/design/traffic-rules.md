@@ -273,14 +273,14 @@ unavailable, rules stay persisted and CRUD still works; their state reads
 `mpsc<PolicyCommand>` channel. The worker's `select!` loop (shutdown, command,
 tick) processes commands between polls, so rule changes take effect within one
 round trip and never touch the packet path from user space. `KernelSource`
-gains `apply_policy(Vec<PolicyOp>)`, `read_config()` and
-`read_rule_states(&[BucketKey])`; the deterministic test source records
-operations for assertions.
+gains `apply_policy(Vec<PolicyOp>)` and `read_rule_states(&[BucketKey])`; the
+collector worker tracks the applied revision, and the deterministic test
+source records operations for assertions.
 
-`ApiState` owns the `PolicyEngine` (rule snapshots, compilation, the
-background cgroup refresh) and the `PolicyHandle`, injected after the
-Collector starts. Rule mutations run under a dedicated apply lock so two
-concurrent edits cannot interleave compile and apply.
+`ApiState` owns the rule snapshots, the `SystemApplicationKeys` resolver and
+the `PolicyHandle`, injected after the Collector starts. Rule mutations and
+settings changes recompile and reapply through the handle; failures are
+reported through `/v1/status` instead of blocking the request.
 
 ## Storage
 
