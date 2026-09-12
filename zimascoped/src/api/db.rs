@@ -56,6 +56,19 @@ const EXPORT_MAX_RECORDS: usize = 10_000;
 const MAX_DOMAIN_CANDIDATES: usize = 8;
 /// Peer addresses embedded in one Application detail response.
 const MAX_APPLICATION_DESTINATIONS: usize = 12;
+
+/// How often retention and capacity enforcement runs. The flow table is
+/// capped; a few seconds of slack is invisible, the full-table scans are not.
+const POLICY_INTERVAL: Duration = Duration::from_secs(5);
+
+/// How long the whole-history overview counters are reused.
+const OVERVIEW_CACHE_TTL: Duration = Duration::from_secs(5);
+
+/// How many collection intervals pass between SSE aggregate refreshes.
+/// Flows still ride every tick; the endpoint/domain/application summaries are
+/// whole-history scans, and the lists that consume them refresh on their own
+/// cadence anyway.
+const AGGREGATE_TICKS: u64 = 3;
 const TOP_LIST_LIMIT: usize = 10;
 /// Upper bound on aggregate rows embedded in one SSE tick. Overflow is
 /// recovered by the client's periodic full refresh.
@@ -385,6 +398,13 @@ pub(crate) struct Db {
     export_counter: u64,
     export_ttl: Duration,
     flow_capacity: usize,
+    /// Retention and capacity deletes run on this cadence instead of once per
+    /// collection interval; the table is capped, so a few seconds of slack is
+    /// invisible while the full-table scans are not.
+    last_policy_at: Option<Instant>,
+    /// `tick_overview` counters change slowly and scan the whole table; cache
+    /// them for a few intervals.
+    overview_cache: Option<(Instant, TickOverviewDto)>,
 }
 
 impl Db {
@@ -446,6 +466,8 @@ impl Db {
             export_counter: 0,
             export_ttl: config.export_ttl,
             flow_capacity: config.flow_capacity.max(1),
+            last_policy_at: None,
+            overview_cache: None,
         })
     }
 
@@ -674,9 +696,11 @@ impl Db {
             }
         }
 
-        // Aggregates only matter to live subscribers; skip the whole-history
-        // scans when nobody is watching.
-        let (endpoints, domain_summaries, applications, overview) = if publish {
+        // Aggregates only matter to live subscribers and only every few
+        // intervals: the whole-history scans are the most expensive part of
+        // the pipeline, while Flows themselves still ride every tick.
+        let aggregate = publish && sequence.saturating_sub(1) % AGGREGATE_TICKS == 0;
+        let (endpoints, domain_summaries, applications, overview) = if aggregate {
             (
                 self.endpoint_summaries_for(&touched_addresses)?,
                 self.domain_summaries_for(&touched_domains)?,
@@ -713,6 +737,13 @@ impl Db {
 
     fn enforce_policy(&mut self, settings: &Settings, now: SystemTime) -> Result<(), ApiError> {
         self.flow_capacity = settings.resources.max_flow_entries as usize;
+        let now_instant = Instant::now();
+        if let Some(last) = self.last_policy_at {
+            if now_instant.saturating_duration_since(last) < POLICY_INTERVAL {
+                return Ok(());
+            }
+        }
+        self.last_policy_at = Some(now_instant);
         let count: i64 = self
             .conn
             .query_row("SELECT COUNT(*) FROM flows", [], |row| row.get(0))?;
@@ -1805,7 +1836,14 @@ impl Db {
     }
 
     /// Live counters over the whole retained history.
-    fn tick_overview(&self) -> Result<TickOverviewDto, ApiError> {
+    fn tick_overview(&mut self) -> Result<TickOverviewDto, ApiError> {
+        let now = Instant::now();
+        if let Some((cached_at, cached)) = self.overview_cache {
+            if now.saturating_duration_since(cached_at) < OVERVIEW_CACHE_TTL {
+                return Ok(cached);
+            }
+        }
+
         let (flows_total, flows_with_domain, active_flows): (i64, i64, i64) = self.conn.query_row(
             "SELECT COUNT(*), COALESCE(SUM(domains_json <> '[]'), 0), \
                  COALESCE(SUM(state = 'active'), 0) FROM flows",
@@ -1817,12 +1855,14 @@ impl Db {
         } else {
             flows_with_domain as f64 / flows_total as f64
         };
-        Ok(TickOverviewDto {
+        let overview = TickOverviewDto {
             active_flows: active_flows as u64,
             flows_total: flows_total as u64,
             flows_with_domain: flows_with_domain as u64,
             ratio,
-        })
+        };
+        self.overview_cache = Some((now, overview));
+        Ok(overview)
     }
 
     // --------------------------------------------------------------- overview

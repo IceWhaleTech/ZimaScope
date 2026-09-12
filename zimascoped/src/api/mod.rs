@@ -2144,8 +2144,9 @@ mod tests {
         assert_event_stream(&response);
         let mut body = response.into_body();
 
+        // Aggregates ride every third interval; sequence 4 is one of them.
         let mut incoming = batch(
-            3,
+            4,
             vec![
                 outbound(("93.184.216.34", 443), 40, 4_000, Duration::ZERO),
                 outbound(("8.8.8.8", 53), 5, 500, Duration::ZERO),

@@ -1133,21 +1133,21 @@ dependencies = [
 
 [[package]]
 name = "xtask"
-version = "0.2.4"
+version = "0.2.5"
 dependencies = [
  "anyhow",
 ]
 
 [[package]]
 name = "zimascope-common"
-version = "0.2.4"
+version = "0.2.5"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "zimascope-ebpf"
-version = "0.2.4"
+version = "0.2.5"
 dependencies = [
  "aya-ebpf",
  "network-types",
@@ -1156,7 +1156,7 @@ dependencies = [
 
 [[package]]
 name = "zimascoped"
-version = "0.2.4"
+version = "0.2.5"
 dependencies = [
  "anyhow",
  "axum",
