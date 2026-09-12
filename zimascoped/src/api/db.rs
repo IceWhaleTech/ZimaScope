@@ -1469,55 +1469,61 @@ impl Db {
             })
             .collect();
 
-        let quoted = format!("\"{domain}\"");
         let mut addresses_statement = self.conn.prepare(
-            "SELECT o.address, MAX(o.confidence), GROUP_CONCAT(DISTINCT o.evidence), \
-             MAX(f.remote_country), MAX(f.remote_asn), MAX(f.remote_org), \
+            "SELECT f.remote_addr, MAX(f.remote_country), MAX(f.remote_asn), MAX(f.remote_org), \
              COALESCE(SUM(f.bytes), 0), COALESCE(MIN(f.first_seen_ms), 0), \
-             COALESCE(MAX(f.last_seen_ms), 0) \
-             FROM observations o \
-             LEFT JOIN flows f ON f.remote_addr = o.address AND instr(f.domains_json, ?2) > 0 \
-             WHERE o.domain = ?1 GROUP BY o.address ORDER BY 7 DESC, o.address",
+             COALESCE(MAX(f.last_seen_ms), 0), \
+             GROUP_CONCAT(DISTINCT je.value->>'evidence'), \
+             MAX(CASE WHEN je.value->>'confidence' = 'direct' THEN 1 ELSE 0 END) \
+             FROM flows f, json_each(f.domains_json) je WHERE je.value->>'domain' = ?1 \
+             GROUP BY f.remote_addr ORDER BY 5 DESC, f.remote_addr",
         )?;
         let addresses = addresses_statement
-            .query_map(params![domain, quoted], |row| {
+            .query_map([&domain], |row| {
                 Ok((
                     row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, Option<u32>>(2)?,
                     row.get::<_, Option<String>>(3)?,
-                    row.get::<_, Option<u32>>(4)?,
-                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, i64>(5)?,
                     row.get::<_, i64>(6)?,
-                    row.get::<_, i64>(7)?,
+                    row.get::<_, Option<String>>(7)?,
                     row.get::<_, i64>(8)?,
                 ))
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?
             .into_iter()
-            .filter_map(
+            .map(
                 |(
                     address,
-                    confidence,
-                    evidence,
                     country,
                     asn,
                     organization,
                     bytes,
                     first_seen,
                     last_seen,
+                    evidence,
+                    direct,
                 )| {
-                    Some(DomainAddressDto {
+                    // Addresses come from the persisted Flow association, not
+                    // from the expiring observation table, so a domain keeps
+                    // its address history after the observation rows age out.
+                    DomainAddressDto {
                         address,
-                        evidence: split_enum_list(&evidence),
-                        confidence: enum_from_value(&confidence)?,
+                        evidence: split_enum_list(evidence.as_deref().unwrap_or("")),
+                        confidence: if direct != 0 {
+                            AssociationConfidence::Direct
+                        } else {
+                            AssociationConfidence::Inferred
+                        },
                         country,
                         asn,
                         organization,
                         bytes: bytes as u64,
                         first_seen,
                         last_seen,
-                    })
+                    }
                 },
             )
             .collect();
