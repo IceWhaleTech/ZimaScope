@@ -31,7 +31,8 @@ use zimascope_common::{
 #[cfg(test)]
 use crate::enrichment::GeoIpDatabase;
 use crate::enrichment::{DEFAULT_CACHE_CAPACITY, Enricher, EnrichmentStats};
-use crate::policy::{RuleDirection, RuleMatch, TrafficRule, action_from_name, action_name};
+use crate::policy::{ActionSpec, RuleDirection, TrafficRule, action_from_name, action_name};
+use crate::query::{ApplicationComms, Selector};
 
 use crate::SharedFingerprints;
 use crate::proxy::{ProxyKey, ProxyResolver};
@@ -422,11 +423,9 @@ pub(crate) struct TrafficRuleRecord {
 /// A rule about to be persisted; storage assigns the id.
 #[derive(Clone, Debug)]
 pub(crate) struct TrafficRuleDraft {
-    pub action: RuleAction,
+    pub action: ActionSpec,
     pub direction: RuleDirection,
-    pub matcher: RuleMatch,
-    pub rate_bytes_per_s: u64,
-    pub burst_bytes: u64,
+    pub selector: Selector,
     pub enabled: bool,
 }
 
@@ -2624,22 +2623,23 @@ impl Db {
         &mut self,
         draft: &TrafficRuleDraft,
     ) -> Result<TrafficRuleRecord, ApiError> {
-        let matcher = MatcherColumns::from_matcher(&draft.matcher);
+        let selector = SelectorColumns::from_selector(&draft.selector);
+        let (rate, burst) = draft.action.rates();
         let now = unix_millis(SystemTime::now());
         self.conn.execute(
             "INSERT INTO traffic_rules (action, direction, match_kind, address, prefix_len, \
              port, application_id, rate_bytes_per_s, burst_bytes, enabled, created_at_ms, \
              updated_at_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?11)",
             params![
-                action_name(draft.action),
+                action_name(draft.action.action()),
                 draft.direction.as_str(),
-                matcher.kind,
-                matcher.address,
-                matcher.prefix_len,
-                matcher.port,
-                matcher.application_id,
-                draft.rate_bytes_per_s as i64,
-                draft.burst_bytes as i64,
+                selector.kind,
+                selector.address,
+                selector.prefix_len,
+                selector.port,
+                selector.application_id,
+                rate as i64,
+                burst as i64,
                 i64::from(draft.enabled),
                 now,
             ],
@@ -2653,7 +2653,8 @@ impl Db {
         id: i64,
         draft: &TrafficRuleDraft,
     ) -> Result<TrafficRuleRecord, ApiError> {
-        let matcher = MatcherColumns::from_matcher(&draft.matcher);
+        let selector = SelectorColumns::from_selector(&draft.selector);
+        let (rate, burst) = draft.action.rates();
         let now = unix_millis(SystemTime::now());
         let changed = self.conn.execute(
             "UPDATE traffic_rules SET action = ?1, direction = ?2, match_kind = ?3, \
@@ -2661,15 +2662,15 @@ impl Db {
              rate_bytes_per_s = ?8, burst_bytes = ?9, enabled = ?10, updated_at_ms = ?11 \
              WHERE id = ?12",
             params![
-                action_name(draft.action),
+                action_name(draft.action.action()),
                 draft.direction.as_str(),
-                matcher.kind,
-                matcher.address,
-                matcher.prefix_len,
-                matcher.port,
-                matcher.application_id,
-                draft.rate_bytes_per_s as i64,
-                draft.burst_bytes as i64,
+                selector.kind,
+                selector.address,
+                selector.prefix_len,
+                selector.port,
+                selector.application_id,
+                rate as i64,
+                burst as i64,
                 i64::from(draft.enabled),
                 now,
                 id,
@@ -3665,17 +3666,17 @@ impl RawTrafficRule {
                 self.id, self.direction
             ))
         })?;
-        let matcher = match self.match_kind.as_str() {
-            "endpoint" => RuleMatch::Endpoint {
-                address: parse_rule_address(self.id, self.address.as_deref())?,
+        let selector = match self.match_kind.as_str() {
+            "endpoint" => Selector::Endpoint {
+                address: parse_rule_address(self.id, self.address.as_deref())?.into(),
                 port: self.port.map(|port| port as u16),
             },
-            "cidr" => RuleMatch::Cidr {
-                address: parse_rule_address(self.id, self.address.as_deref())?,
+            "cidr" => Selector::Cidr {
+                address: parse_rule_address(self.id, self.address.as_deref())?.into(),
                 prefix_len: self.prefix_len.unwrap_or(0).clamp(0, 32) as u8,
             },
-            "application" => RuleMatch::Application {
-                identity: self.application_id.clone().ok_or_else(|| {
+            "application" => Selector::Application {
+                id: self.application_id.clone().ok_or_else(|| {
                     ApiError::internal(format!(
                         "traffic rule {} has no application identity",
                         self.id
@@ -3689,15 +3690,22 @@ impl RawTrafficRule {
                 )));
             }
         };
+        let rate = self.rate_bytes_per_s.unwrap_or(0).max(0) as u64;
+        let burst = self.burst_bytes.unwrap_or(0).max(0) as u64;
+        let action = match action {
+            RuleAction::Limit => ActionSpec::Limit {
+                rate_bytes_per_s: rate,
+                burst_bytes: burst,
+            },
+            RuleAction::Block => ActionSpec::Block,
+        };
 
         Ok(TrafficRuleRecord {
             rule: TrafficRule {
                 id: self.id as u32,
                 action,
                 direction,
-                matcher,
-                rate_bytes_per_s: self.rate_bytes_per_s.unwrap_or(0).max(0) as u64,
-                burst_bytes: self.burst_bytes.unwrap_or(0).max(0) as u64,
+                selector,
                 enabled: self.enabled != 0,
             },
             created_at: unix_millis_time(self.created_at_ms),
@@ -3716,7 +3724,13 @@ fn unix_millis_time(millis: i64) -> SystemTime {
     SystemTime::UNIX_EPOCH + Duration::from_millis(millis.max(0) as u64)
 }
 
-struct MatcherColumns {
+impl ApplicationComms for Db {
+    fn comm(&self, id: &str) -> Option<String> {
+        self.application_comm(id)
+    }
+}
+
+struct SelectorColumns {
     kind: &'static str,
     address: Option<String>,
     prefix_len: Option<i64>,
@@ -3724,17 +3738,17 @@ struct MatcherColumns {
     application_id: Option<String>,
 }
 
-impl MatcherColumns {
-    fn from_matcher(matcher: &RuleMatch) -> Self {
-        match matcher {
-            RuleMatch::Endpoint { address, port } => Self {
+impl SelectorColumns {
+    fn from_selector(selector: &Selector) -> Self {
+        match selector {
+            Selector::Endpoint { address, port } => Self {
                 kind: "endpoint",
                 address: Some(address.to_string()),
                 prefix_len: None,
                 port: port.map(i64::from),
                 application_id: None,
             },
-            RuleMatch::Cidr {
+            Selector::Cidr {
                 address,
                 prefix_len,
             } => Self {
@@ -3744,12 +3758,12 @@ impl MatcherColumns {
                 port: None,
                 application_id: None,
             },
-            RuleMatch::Application { identity } => Self {
+            Selector::Application { id } => Self {
                 kind: "application",
                 address: None,
                 prefix_len: None,
                 port: None,
-                application_id: Some(identity.clone()),
+                application_id: Some(id.clone()),
             },
         }
     }
@@ -3971,14 +3985,15 @@ mod tests {
 
     fn endpoint_draft() -> TrafficRuleDraft {
         TrafficRuleDraft {
-            action: RuleAction::Limit,
+            action: ActionSpec::Limit {
+                rate_bytes_per_s: 1_000_000,
+                burst_bytes: 1_000_000,
+            },
             direction: RuleDirection::Outbound,
-            matcher: RuleMatch::Endpoint {
+            selector: Selector::Endpoint {
                 address: "203.0.113.9".parse().expect("address"),
                 port: Some(443),
             },
-            rate_bytes_per_s: 1_000_000,
-            burst_bytes: 1_000_000,
             enabled: true,
         }
     }
@@ -3992,8 +4007,8 @@ mod tests {
         assert_eq!(record.rule.id, 1);
         assert_eq!(db.rules_revision(), 1);
         assert_eq!(
-            record.rule.matcher,
-            RuleMatch::Endpoint {
+            record.rule.selector,
+            Selector::Endpoint {
                 address: "203.0.113.9".parse().expect("address"),
                 port: Some(443),
             }
@@ -4003,11 +4018,13 @@ mod tests {
 
         let mut updated = endpoint_draft();
         updated.enabled = false;
-        updated.rate_bytes_per_s = 5_000;
-        updated.burst_bytes = 5_000;
+        updated.action = ActionSpec::Limit {
+            rate_bytes_per_s: 5_000,
+            burst_bytes: 5_000,
+        };
         let record = db.update_traffic_rule(1, &updated).expect("update");
         assert!(!record.rule.enabled);
-        assert_eq!(record.rule.rate_bytes_per_s, 5_000);
+        assert_eq!(record.rule.action, updated.action);
         assert_eq!(db.rules_revision(), 2);
 
         db.delete_traffic_rule(1).expect("delete");
@@ -4018,12 +4035,12 @@ mod tests {
     }
 
     #[test]
-    fn traffic_rules_cover_every_match_kind() {
+    fn traffic_rules_cover_every_selector_kind() {
         let mut db = db();
 
         let cidr = db
             .insert_traffic_rule(&TrafficRuleDraft {
-                matcher: RuleMatch::Cidr {
+                selector: Selector::Cidr {
                     address: "192.0.2.0".parse().expect("address"),
                     prefix_len: 24,
                 },
@@ -4032,30 +4049,28 @@ mod tests {
             .expect("insert cidr");
         let application = db
             .insert_traffic_rule(&TrafficRuleDraft {
-                matcher: RuleMatch::Application {
-                    identity: "cont:abc".to_owned(),
+                selector: Selector::Application {
+                    id: "cont:abc".to_owned(),
                 },
-                action: RuleAction::Block,
-                rate_bytes_per_s: 0,
-                burst_bytes: 0,
+                action: ActionSpec::Block,
                 ..endpoint_draft()
             })
             .expect("insert application");
 
         assert_eq!(
-            cidr.rule.matcher,
-            RuleMatch::Cidr {
+            cidr.rule.selector,
+            Selector::Cidr {
                 address: "192.0.2.0".parse().expect("address"),
                 prefix_len: 24,
             }
         );
         assert_eq!(
-            application.rule.matcher,
-            RuleMatch::Application {
-                identity: "cont:abc".to_owned(),
+            application.rule.selector,
+            Selector::Application {
+                id: "cont:abc".to_owned(),
             }
         );
-        assert_eq!(application.rule.action, RuleAction::Block);
+        assert_eq!(application.rule.action, ActionSpec::Block);
     }
 
     #[test]

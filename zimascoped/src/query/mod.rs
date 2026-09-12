@@ -10,6 +10,7 @@ mod resolver;
 mod selector;
 
 pub use lower::UnsupportedQuery;
+pub(crate) use resolver::{ApplicationComms, SystemEvidenceResolver};
 pub use resolver::{
     Coverage, EvidenceResolver, MatchTarget, Resolution, ResolveContext, ResolveError,
 };

@@ -5,16 +5,21 @@
 //! program and applies the resulting [`PolicyOp`] sequence through its private
 //! `KernelSource` seam. The diff order keeps every intermediate state
 //! fail-open (ADR-0004).
+//!
+//! Rules target a [`Selector`] and carry an [`ActionSpec`]. Identity and
+//! address resolution happens through the query seam (ADR-0005), so this
+//! module only maps resolved [`MatchTarget`]s onto kernel match entries.
 
-use std::net::Ipv4Addr;
+use std::time::SystemTime;
 
-use zimascope_common::kernel_abi::{
-    BucketKey, Direction, EndpointMatchKey, PolicyConfig, RuleAction, RuleRef,
+use zimascope_common::{
+    kernel_abi::{BucketKey, Direction, EndpointMatchKey, PolicyConfig, RuleAction, RuleRef},
+    model,
 };
 
-mod resolve;
-
-pub use resolve::SystemApplicationKeys;
+use crate::query::{
+    Coverage, EvidenceResolver, KernelPlan, MatchTarget, ResolveContext, ResolveError, Selector,
+};
 
 /// Number of rules the kernel maps are compiled with.
 pub const MAX_TRAFFIC_RULES: usize =
@@ -62,7 +67,7 @@ impl RuleDirection {
     }
 }
 
-/// Storage and wire name for a rule action.
+/// Storage and wire name for a kernel rule action.
 pub const fn action_name(action: RuleAction) -> &'static str {
     match action {
         RuleAction::Limit => "limit",
@@ -70,7 +75,7 @@ pub const fn action_name(action: RuleAction) -> &'static str {
     }
 }
 
-/// Parses a storage or wire action name.
+/// Parses a storage or wire action name into the kernel action.
 pub fn action_from_name(name: &str) -> Option<RuleAction> {
     match name {
         "limit" => Some(RuleAction::Limit),
@@ -79,31 +84,66 @@ pub fn action_from_name(name: &str) -> Option<RuleAction> {
     }
 }
 
-/// What a Traffic Rule matches.
+/// What a rule does to matching traffic.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum RuleMatch {
-    Endpoint {
-        address: Ipv4Addr,
-        port: Option<u16>,
+pub enum ActionSpec {
+    Limit {
+        rate_bytes_per_s: u64,
+        burst_bytes: u64,
     },
-    Cidr {
-        address: Ipv4Addr,
-        prefix_len: u8,
-    },
-    Application {
-        identity: String,
-    },
+    Block,
+}
+
+impl ActionSpec {
+    /// The kernel action this spec compiles to.
+    pub const fn action(&self) -> RuleAction {
+        match self {
+            Self::Limit { .. } => RuleAction::Limit,
+            Self::Block => RuleAction::Block,
+        }
+    }
+
+    /// The token bucket parameters, zero for actions that carry none.
+    pub const fn rates(&self) -> (u64, u64) {
+        match self {
+            Self::Limit {
+                rate_bytes_per_s,
+                burst_bytes,
+            } => (*rate_bytes_per_s, *burst_bytes),
+            Self::Block => (0, 0),
+        }
+    }
+
+    /// Validates the action parameters in product terms.
+    pub fn validate(&self) -> Result<(), String> {
+        match self {
+            Self::Limit {
+                rate_bytes_per_s,
+                burst_bytes,
+            } => {
+                if !(MIN_RATE_BYTES_PER_S..=MAX_RATE_BYTES_PER_S).contains(rate_bytes_per_s) {
+                    return Err(format!(
+                        "limit rate must be between {MIN_RATE_BYTES_PER_S} and \
+                         {MAX_RATE_BYTES_PER_S} bytes per second"
+                    ));
+                }
+                if *burst_bytes == 0 {
+                    return Err("limit burst must be greater than zero".to_owned());
+                }
+                Ok(())
+            }
+            Self::Block => Ok(()),
+        }
+    }
 }
 
 /// A persisted Traffic Rule in product terms.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TrafficRule {
     pub id: u32,
-    pub action: RuleAction,
+    pub action: ActionSpec,
     pub direction: RuleDirection,
-    pub matcher: RuleMatch,
-    pub rate_bytes_per_s: u64,
-    pub burst_bytes: u64,
+    pub selector: Selector,
     pub enabled: bool,
 }
 
@@ -119,18 +159,6 @@ pub struct UnresolvedRule {
 pub struct CompiledProgram {
     pub policy: CompiledPolicy,
     pub unresolved: Vec<UnresolvedRule>,
-}
-
-/// Kernel-matchable key for one Application Identity.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum AppKey {
-    Cgroup(u64),
-    Comm([u8; 16]),
-}
-
-/// Resolves an Application Identity into kernel match keys.
-pub trait ApplicationKeys {
-    fn keys(&mut self, identity: &str) -> Result<Vec<AppKey>, String>;
 }
 
 /// One compiled match entry.
@@ -347,55 +375,11 @@ pub(crate) fn config_value(
 
 /// Validates one rule in product terms.
 pub fn validate_rule(rule: &TrafficRule) -> Result<(), String> {
-    match &rule.matcher {
-        RuleMatch::Endpoint { address, port } => {
-            validate_address(*address)?;
-            if port == &Some(0) {
-                return Err("port 0 is not a valid match".to_owned());
-            }
-        }
-        RuleMatch::Cidr {
-            address,
-            prefix_len,
-        } => {
-            validate_address(*address)?;
-            if !(1..=32).contains(prefix_len) {
-                return Err("CIDR prefix length must be between 1 and 32".to_owned());
-            }
-        }
-        RuleMatch::Application { identity } => {
-            if identity.trim().is_empty() {
-                return Err("application identity is empty".to_owned());
-            }
-        }
+    rule.selector.validate()?;
+    if let KernelPlan::Unsupported { reason } = rule.selector.kernel_plan() {
+        return Err(reason.to_owned());
     }
-
-    match rule.action {
-        RuleAction::Limit => {
-            if !(MIN_RATE_BYTES_PER_S..=MAX_RATE_BYTES_PER_S).contains(&rule.rate_bytes_per_s) {
-                return Err(format!(
-                    "limit rate must be between {MIN_RATE_BYTES_PER_S} and \
-                     {MAX_RATE_BYTES_PER_S} bytes per second"
-                ));
-            }
-            if rule.burst_bytes == 0 {
-                return Err("limit burst must be greater than zero".to_owned());
-            }
-        }
-        RuleAction::Block => {
-            if rule.rate_bytes_per_s != 0 || rule.burst_bytes != 0 {
-                return Err("block rules carry no rate".to_owned());
-            }
-        }
-    }
-    Ok(())
-}
-
-fn validate_address(address: Ipv4Addr) -> Result<(), String> {
-    if address.is_unspecified() || address.is_multicast() || address.is_broadcast() {
-        return Err(format!("{address} is not a matchable endpoint address"));
-    }
-    Ok(())
+    rule.action.validate()
 }
 
 /// Compiles enabled rules into kernel state.
@@ -405,14 +389,17 @@ fn validate_address(address: Ipv4Addr) -> Result<(), String> {
 /// represent the result at all.
 pub fn compile(
     rules: &[TrafficRule],
-    keys: &mut dyn ApplicationKeys,
+    resolver: &mut dyn EvidenceResolver,
     revision: u64,
     enabled: bool,
 ) -> Result<CompiledProgram, String> {
+    let context = ResolveContext {
+        now: SystemTime::now(),
+    };
     let mut compiled = Vec::new();
     let mut unresolved = Vec::new();
     for rule in rules.iter().filter(|rule| rule.enabled) {
-        match compile_rule(rule, keys) {
+        match compile_rule(rule, resolver, &context) {
             Ok(rule) => compiled.push(rule),
             Err(reason) => unresolved.push(UnresolvedRule {
                 rule_id: rule.id,
@@ -441,65 +428,20 @@ pub fn compile(
 
 fn compile_rule(
     rule: &TrafficRule,
-    keys: &mut dyn ApplicationKeys,
+    resolver: &mut dyn EvidenceResolver,
+    context: &ResolveContext,
 ) -> Result<CompiledRule, String> {
     validate_rule(rule)?;
 
-    let matches = match &rule.matcher {
-        RuleMatch::Endpoint { address, port } => rule
-            .direction
-            .directions()
-            .iter()
-            .map(|direction| MatchEntry::EndpointExact {
-                direction: *direction,
-                key: EndpointMatchKey {
-                    addr: zimascope_common::model::ipv4_storage(*address),
-                    port_be: port.map(u16::to_be).unwrap_or(0),
-                    reserved: [0; 6],
-                },
-            })
-            .collect(),
-        RuleMatch::Cidr {
-            address,
-            prefix_len,
-        } => rule
-            .direction
-            .directions()
-            .iter()
-            .map(|direction| MatchEntry::EndpointCidr {
-                direction: *direction,
-                prefix_len: u32::from(*prefix_len),
-                addr: address.octets(),
-            })
-            .collect(),
-        RuleMatch::Application { identity } => {
-            let keys = keys.keys(identity)?;
-            if keys.is_empty() {
-                return Err(format!("no kernel match key for {identity}"));
-            }
-            let mut entries = Vec::new();
-            for direction in rule.direction.directions() {
-                for key in &keys {
-                    entries.push(match key {
-                        AppKey::Cgroup(cgroup_id) => MatchEntry::AppCgroup {
-                            direction: *direction,
-                            cgroup_id: *cgroup_id,
-                        },
-                        AppKey::Comm(comm) => MatchEntry::AppComm {
-                            direction: *direction,
-                            comm: *comm,
-                        },
-                    });
-                }
-            }
-            entries
-        }
-    };
+    let resolution = resolver
+        .resolve(&rule.selector, context)
+        .map_err(|ResolveError::Unavailable { reason }| reason)?;
+    if let Coverage::Unresolved { reason } = resolution.coverage {
+        return Err(reason);
+    }
 
-    let (rate, burst) = match rule.action {
-        RuleAction::Limit => (rule.rate_bytes_per_s, rule.burst_bytes),
-        RuleAction::Block => (0, 0),
-    };
+    let matches = matches_from_targets(&resolution.targets, rule.direction);
+    let (rate, burst) = rule.action.rates();
     let states = rule
         .direction
         .directions()
@@ -517,10 +459,45 @@ fn compile_rule(
 
     Ok(CompiledRule {
         id: rule.id,
-        action: rule.action,
+        action: rule.action.action(),
         matches,
         states,
     })
+}
+
+fn matches_from_targets(targets: &[MatchTarget], direction: RuleDirection) -> Vec<MatchEntry> {
+    let mut entries = Vec::new();
+    for direction in direction.directions() {
+        for target in targets {
+            entries.push(match target {
+                MatchTarget::Endpoint { address, port } => MatchEntry::EndpointExact {
+                    direction: *direction,
+                    key: EndpointMatchKey {
+                        addr: model::ipv4_storage(*address),
+                        port_be: port.map(u16::to_be).unwrap_or(0),
+                        reserved: [0; 6],
+                    },
+                },
+                MatchTarget::Cidr {
+                    address,
+                    prefix_len,
+                } => MatchEntry::EndpointCidr {
+                    direction: *direction,
+                    prefix_len: u32::from(*prefix_len),
+                    addr: address.octets(),
+                },
+                MatchTarget::AppCgroup { cgroup_id } => MatchEntry::AppCgroup {
+                    direction: *direction,
+                    cgroup_id: *cgroup_id,
+                },
+                MatchTarget::AppComm { comm } => MatchEntry::AppComm {
+                    direction: *direction,
+                    comm: *comm,
+                },
+            });
+        }
+    }
+    entries
 }
 
 fn check_capacity(rules: &[CompiledRule]) -> Result<(), String> {
@@ -581,6 +558,89 @@ fn check_capacity(rules: &[CompiledRule]) -> Result<(), String> {
 mod tests {
     use super::*;
     use zimascope_common::kernel_abi::RuleAction;
+
+    use crate::query::{Resolution, ResolveError};
+
+    struct FakeResolver {
+        targets: Option<Vec<MatchTarget>>,
+        coverage: Coverage,
+        error: Option<&'static str>,
+    }
+
+    impl Default for FakeResolver {
+        fn default() -> Self {
+            Self {
+                targets: None,
+                coverage: Coverage::Complete,
+                error: None,
+            }
+        }
+    }
+
+    impl FakeResolver {
+        fn targets(targets: Vec<MatchTarget>) -> Self {
+            Self {
+                targets: Some(targets),
+                ..Self::default()
+            }
+        }
+
+        fn unresolved(reason: &str) -> Self {
+            Self {
+                coverage: Coverage::Unresolved {
+                    reason: reason.to_owned(),
+                },
+                ..Self::default()
+            }
+        }
+    }
+
+    impl EvidenceResolver for FakeResolver {
+        fn resolve(
+            &mut self,
+            selector: &Selector,
+            _context: &ResolveContext,
+        ) -> Result<Resolution, ResolveError> {
+            if let Some(reason) = self.error {
+                return Err(ResolveError::Unavailable {
+                    reason: reason.to_owned(),
+                });
+            }
+            let targets = match (&self.targets, selector) {
+                (Some(targets), _) => targets.clone(),
+                (None, Selector::Endpoint { address, port }) => {
+                    let std::net::IpAddr::V4(address) = address else {
+                        panic!("tests use IPv4 selectors");
+                    };
+                    vec![MatchTarget::Endpoint {
+                        address: *address,
+                        port: *port,
+                    }]
+                }
+                (
+                    None,
+                    Selector::Cidr {
+                        address,
+                        prefix_len,
+                    },
+                ) => {
+                    let std::net::IpAddr::V4(address) = address else {
+                        panic!("tests use IPv4 selectors");
+                    };
+                    vec![MatchTarget::Cidr {
+                        address: *address,
+                        prefix_len: *prefix_len,
+                    }]
+                }
+                (None, Selector::Application { .. }) => Vec::new(),
+            };
+            Ok(Resolution {
+                targets,
+                coverage: self.coverage.clone(),
+                expires_at: None,
+            })
+        }
+    }
 
     fn state(rule_id: u32, direction: Direction, rate: u64) -> CompiledState {
         CompiledState {
@@ -817,29 +877,30 @@ mod tests {
         ));
     }
 
-    struct FakeKeys {
-        keys: Vec<AppKey>,
-        error: Option<&'static str>,
-    }
-
-    impl ApplicationKeys for FakeKeys {
-        fn keys(&mut self, _identity: &str) -> Result<Vec<AppKey>, String> {
-            match self.error {
-                Some(reason) => Err(reason.to_owned()),
-                None => Ok(self.keys.clone()),
-            }
+    fn traffic_rule(id: u32, selector: Selector, direction: RuleDirection) -> TrafficRule {
+        TrafficRule {
+            id,
+            action: ActionSpec::Limit {
+                rate_bytes_per_s: 1_000_000,
+                burst_bytes: 1_000_000,
+            },
+            direction,
+            selector,
+            enabled: true,
         }
     }
 
-    fn traffic_rule(id: u32, matcher: RuleMatch, direction: RuleDirection) -> TrafficRule {
-        TrafficRule {
-            id,
-            action: RuleAction::Limit,
-            direction,
-            matcher,
-            rate_bytes_per_s: 1_000_000,
-            burst_bytes: 1_000_000,
-            enabled: true,
+    fn endpoint(address: &str, port: Option<u16>) -> Selector {
+        Selector::Endpoint {
+            address: address.parse().expect("address"),
+            port,
+        }
+    }
+
+    fn endpoint_target(address: &str, port: Option<u16>) -> MatchTarget {
+        MatchTarget::Endpoint {
+            address: address.parse().expect("address"),
+            port,
         }
     }
 
@@ -847,17 +908,11 @@ mod tests {
     fn endpoint_rules_compile_one_entry_per_direction() {
         let rules = vec![traffic_rule(
             7,
-            RuleMatch::Endpoint {
-                address: "203.0.113.9".parse().expect("address"),
-                port: Some(443),
-            },
+            endpoint("203.0.113.9", Some(443)),
             RuleDirection::Both,
         )];
-        let mut keys = FakeKeys {
-            keys: Vec::new(),
-            error: None,
-        };
-        let program = compile(&rules, &mut keys, 3, true).expect("compiles");
+        let mut resolver = FakeResolver::targets(vec![endpoint_target("203.0.113.9", Some(443))]);
+        let program = compile(&rules, &mut resolver, 3, true).expect("compiles");
 
         assert_eq!(program.policy.revision, 3);
         assert!(program.policy.enabled);
@@ -868,9 +923,7 @@ mod tests {
         assert!(rule.matches.contains(&MatchEntry::EndpointExact {
             direction: Direction::Inbound,
             key: EndpointMatchKey {
-                addr: zimascope_common::model::ipv4_storage(
-                    "203.0.113.9".parse().expect("address")
-                ),
+                addr: model::ipv4_storage("203.0.113.9".parse().expect("address")),
                 port_be: 443u16.to_be(),
                 reserved: [0; 6],
             },
@@ -878,9 +931,7 @@ mod tests {
         assert!(rule.matches.contains(&MatchEntry::EndpointExact {
             direction: Direction::Outbound,
             key: EndpointMatchKey {
-                addr: zimascope_common::model::ipv4_storage(
-                    "203.0.113.9".parse().expect("address")
-                ),
+                addr: model::ipv4_storage("203.0.113.9".parse().expect("address")),
                 port_be: 443u16.to_be(),
                 reserved: [0; 6],
             },
@@ -891,17 +942,11 @@ mod tests {
     fn endpoint_rules_without_a_port_use_the_wildcard() {
         let rules = vec![traffic_rule(
             1,
-            RuleMatch::Endpoint {
-                address: "198.51.100.4".parse().expect("address"),
-                port: None,
-            },
+            endpoint("198.51.100.4", None),
             RuleDirection::Outbound,
         )];
-        let mut keys = FakeKeys {
-            keys: Vec::new(),
-            error: None,
-        };
-        let program = compile(&rules, &mut keys, 1, true).expect("compiles");
+        let mut resolver = FakeResolver::targets(vec![endpoint_target("198.51.100.4", None)]);
+        let program = compile(&rules, &mut resolver, 1, true).expect("compiles");
 
         assert!(matches!(
             program.policy.rules[0].matches[0],
@@ -913,17 +958,17 @@ mod tests {
     fn cidr_rules_compile_the_prefix() {
         let rules = vec![traffic_rule(
             1,
-            RuleMatch::Cidr {
+            Selector::Cidr {
                 address: "192.0.2.0".parse().expect("address"),
                 prefix_len: 24,
             },
             RuleDirection::Inbound,
         )];
-        let mut keys = FakeKeys {
-            keys: Vec::new(),
-            error: None,
-        };
-        let program = compile(&rules, &mut keys, 1, true).expect("compiles");
+        let mut resolver = FakeResolver::targets(vec![MatchTarget::Cidr {
+            address: "192.0.2.0".parse().expect("address"),
+            prefix_len: 24,
+        }]);
+        let program = compile(&rules, &mut resolver, 1, true).expect("compiles");
 
         assert_eq!(
             program.policy.rules[0].matches,
@@ -936,19 +981,19 @@ mod tests {
     }
 
     #[test]
-    fn application_rules_compile_every_resolved_key() {
+    fn application_rules_compile_every_resolved_target() {
         let rules = vec![traffic_rule(
             5,
-            RuleMatch::Application {
-                identity: "cont:abc".to_owned(),
+            Selector::Application {
+                id: "cont:abc".to_owned(),
             },
             RuleDirection::Outbound,
         )];
-        let mut keys = FakeKeys {
-            keys: vec![AppKey::Cgroup(41), AppKey::Cgroup(42)],
-            error: None,
-        };
-        let program = compile(&rules, &mut keys, 1, true).expect("compiles");
+        let mut resolver = FakeResolver::targets(vec![
+            MatchTarget::AppCgroup { cgroup_id: 41 },
+            MatchTarget::AppCgroup { cgroup_id: 42 },
+        ]);
+        let program = compile(&rules, &mut resolver, 1, true).expect("compiles");
 
         assert_eq!(
             program.policy.rules[0].matches,
@@ -966,48 +1011,51 @@ mod tests {
     }
 
     #[test]
-    fn unresolved_identities_leave_the_rule_inactive() {
+    fn unresolved_selectors_leave_the_rule_inactive() {
         let rules = vec![traffic_rule(
             9,
-            RuleMatch::Application {
-                identity: "proc:/usr/bin/curl".to_owned(),
+            Selector::Application {
+                id: "proc:/usr/bin/curl".to_owned(),
             },
             RuleDirection::Outbound,
         )];
-        let mut keys = FakeKeys {
-            keys: Vec::new(),
-            error: Some("no comm"),
-        };
-        let program = compile(&rules, &mut keys, 1, true).expect("compiles");
+        let mut resolver =
+            FakeResolver::unresolved("no stored process name for proc:/usr/bin/curl");
+        let program = compile(&rules, &mut resolver, 1, true).expect("compiles");
 
         assert!(program.policy.rules.is_empty());
         assert_eq!(
             program.unresolved,
             vec![UnresolvedRule {
                 rule_id: 9,
-                reason: "no comm".to_owned(),
+                reason: "no stored process name for proc:/usr/bin/curl".to_owned(),
             }]
         );
     }
 
     #[test]
-    fn block_rules_carry_no_rate() {
-        let mut rule = traffic_rule(
-            2,
-            RuleMatch::Endpoint {
-                address: "203.0.113.1".parse().expect("address"),
-                port: None,
-            },
+    fn resolver_failures_leave_the_rule_inactive() {
+        let rules = vec![traffic_rule(
+            9,
+            endpoint("203.0.113.9", None),
             RuleDirection::Outbound,
-        );
-        rule.action = RuleAction::Block;
-        rule.rate_bytes_per_s = 0;
-        rule.burst_bytes = 0;
-        let mut keys = FakeKeys {
-            keys: Vec::new(),
-            error: None,
+        )];
+        let mut resolver = FakeResolver {
+            error: Some("database is unavailable"),
+            ..FakeResolver::default()
         };
-        let program = compile(&[rule], &mut keys, 1, true).expect("compiles");
+        let program = compile(&rules, &mut resolver, 1, true).expect("compiles");
+
+        assert!(program.policy.rules.is_empty());
+        assert_eq!(program.unresolved[0].reason, "database is unavailable");
+    }
+
+    #[test]
+    fn block_rules_carry_no_rate() {
+        let mut rule = traffic_rule(2, endpoint("203.0.113.1", None), RuleDirection::Outbound);
+        rule.action = ActionSpec::Block;
+        let mut resolver = FakeResolver::targets(vec![endpoint_target("203.0.113.1", None)]);
+        let program = compile(&[rule], &mut resolver, 1, true).expect("compiles");
 
         let state = &program.policy.rules[0].states[0];
         assert_eq!(state.rate_bytes_per_s, 0);
@@ -1016,22 +1064,14 @@ mod tests {
 
     #[test]
     fn invalid_rules_are_unresolved_with_a_reason() {
-        let mut too_slow = traffic_rule(
-            1,
-            RuleMatch::Endpoint {
-                address: "203.0.113.1".parse().expect("address"),
-                port: None,
-            },
-            RuleDirection::Outbound,
-        );
-        too_slow.rate_bytes_per_s = 1;
-        too_slow.burst_bytes = 1;
-
-        let mut keys = FakeKeys {
-            keys: Vec::new(),
-            error: None,
+        let mut too_slow = traffic_rule(1, endpoint("203.0.113.1", None), RuleDirection::Outbound);
+        too_slow.action = ActionSpec::Limit {
+            rate_bytes_per_s: 1,
+            burst_bytes: 1,
         };
-        let program = compile(&[too_slow], &mut keys, 1, true).expect("compiles");
+
+        let mut resolver = FakeResolver::targets(Vec::new());
+        let program = compile(&[too_slow], &mut resolver, 1, true).expect("compiles");
 
         assert!(program.policy.rules.is_empty());
         assert_eq!(program.unresolved[0].rule_id, 1);
@@ -1039,20 +1079,41 @@ mod tests {
     }
 
     #[test]
+    fn unsupported_selectors_are_unresolved_with_a_reason() {
+        let rule = traffic_rule(
+            4,
+            Selector::Application {
+                id: "mystery:1".to_owned(),
+            },
+            RuleDirection::Outbound,
+        );
+        let mut resolver = FakeResolver::targets(Vec::new());
+        let program = compile(&[rule], &mut resolver, 1, true).expect("compiles");
+
+        assert!(program.policy.rules.is_empty());
+        assert!(
+            program.unresolved[0]
+                .reason
+                .contains("cont:, proc: or proc:comm:")
+        );
+    }
+
+    #[test]
     fn match_capacity_overflow_fails_the_program() {
         let rules = vec![traffic_rule(
             1,
-            RuleMatch::Application {
-                identity: "cont:big".to_owned(),
+            Selector::Application {
+                id: "cont:big".to_owned(),
             },
             RuleDirection::Outbound,
         )];
-        let mut keys = FakeKeys {
-            keys: (0..65).map(AppKey::Cgroup).collect(),
-            error: None,
-        };
+        let mut resolver = FakeResolver::targets(
+            (0..65)
+                .map(|cgroup_id| MatchTarget::AppCgroup { cgroup_id })
+                .collect(),
+        );
 
-        let error = compile(&rules, &mut keys, 1, true).expect_err("capacity overflow");
+        let error = compile(&rules, &mut resolver, 1, true).expect_err("capacity overflow");
         assert!(error.contains("kernel capacity"), "{error}");
     }
 
@@ -1062,39 +1123,23 @@ mod tests {
             .map(|index| {
                 traffic_rule(
                     index as u32 + 1,
-                    RuleMatch::Endpoint {
-                        address: Ipv4Addr::new(203, 0, 113, index as u8 + 1),
-                        port: None,
-                    },
+                    endpoint(&format!("203.0.113.{}", index as u8 + 1), None),
                     RuleDirection::Outbound,
                 )
             })
             .collect();
-        let mut keys = FakeKeys {
-            keys: Vec::new(),
-            error: None,
-        };
+        let mut resolver = FakeResolver::default();
 
-        let program = compile(&rules, &mut keys, 1, true).expect("compiles at capacity");
+        let program = compile(&rules, &mut resolver, 1, true).expect("compiles at capacity");
         assert_eq!(program.policy.rules.len(), MAX_TRAFFIC_RULES);
     }
 
     #[test]
     fn disabled_rules_are_skipped() {
-        let mut rule = traffic_rule(
-            1,
-            RuleMatch::Endpoint {
-                address: "203.0.113.1".parse().expect("address"),
-                port: None,
-            },
-            RuleDirection::Outbound,
-        );
+        let mut rule = traffic_rule(1, endpoint("203.0.113.1", None), RuleDirection::Outbound);
         rule.enabled = false;
-        let mut keys = FakeKeys {
-            keys: Vec::new(),
-            error: None,
-        };
-        let program = compile(&[rule], &mut keys, 1, true).expect("compiles");
+        let mut resolver = FakeResolver::targets(Vec::new());
+        let program = compile(&[rule], &mut resolver, 1, true).expect("compiles");
 
         assert!(program.policy.rules.is_empty());
         assert!(program.unresolved.is_empty());

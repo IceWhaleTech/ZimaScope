@@ -15,7 +15,6 @@ use super::selector::Selector;
 use crate::cgroup::CgroupIndex;
 
 /// Stored process names backing `proc:<exe>` identities.
-#[allow(dead_code)]
 pub(crate) trait ApplicationComms {
     /// The kernel `comm` recorded for an executable-path identity.
     fn comm(&self, id: &str) -> Option<String>;
@@ -80,13 +79,11 @@ pub enum ResolveError {
 }
 
 /// Resolves selectors against the host's evidence sources.
-#[allow(dead_code)]
 pub(crate) struct SystemEvidenceResolver<'a> {
     cgroups: &'a mut CgroupIndex,
     comms: &'a dyn ApplicationComms,
 }
 
-#[allow(dead_code)]
 impl<'a> SystemEvidenceResolver<'a> {
     pub fn new(cgroups: &'a mut CgroupIndex, comms: &'a dyn ApplicationComms) -> Self {
         Self { cgroups, comms }

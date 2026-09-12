@@ -25,7 +25,7 @@ mod db;
 use std::{
     collections::HashMap,
     convert::Infallible,
-    net::Ipv4Addr,
+    net::IpAddr,
     path::Path,
     sync::{Arc, Mutex, MutexGuard},
     time::{Duration, SystemTime},
@@ -54,11 +54,13 @@ use zimascope_common::{
 
 use crate::{
     FingerprintLibrary, PolicyHandle, SharedFingerprints,
+    cgroup::CgroupIndex,
     policy::{
-        MAX_TRAFFIC_RULES, RuleDirection, RuleMatch, SystemApplicationKeys, TrafficRule,
-        action_from_name, action_name, compile, validate_rule,
+        ActionSpec, MAX_TRAFFIC_RULES, RuleDirection, TrafficRule, action_from_name, action_name,
+        compile, validate_rule,
     },
     proxy::ProxyResolver,
+    query::{Selector, SystemEvidenceResolver},
 };
 
 use self::{
@@ -101,7 +103,7 @@ struct Inner {
     proxy: ProxyResolver,
     policy_handle: Option<PolicyHandle>,
     policy: PolicyRuntime,
-    application_keys: SystemApplicationKeys,
+    cgroups: CgroupIndex,
     /// Cumulative policy drops since startup, accumulated from the interval
     /// deltas carried by every collection batch.
     policy_drops: TrafficCounters,
@@ -153,7 +155,7 @@ impl ApiState {
                 proxy,
                 policy_handle: None,
                 policy: PolicyRuntime::default(),
-                application_keys: SystemApplicationKeys::new(),
+                cgroups: CgroupIndex::default(),
                 policy_drops: TrafficCounters::default(),
             })),
             events,
@@ -170,7 +172,8 @@ impl ApiState {
     /// Failures are recorded for `/v1/status`; rules stay persisted either way.
     pub async fn apply_policy(&self) -> anyhow::Result<crate::policy::ApplySummary> {
         let (handle, program, unresolved) = {
-            let mut inner = self.lock();
+            let mut guard = self.lock();
+            let inner = &mut *guard;
             let Some(handle) = inner.policy_handle.clone() else {
                 inner.policy.last_error = Some("collector is not running".to_owned());
                 anyhow::bail!("collector is not running");
@@ -178,23 +181,21 @@ impl ApiState {
 
             let master = inner.settings.traffic_rules.enabled;
             let revision = inner.db.rules_revision();
-            let records = inner.db.list_traffic_rules()?;
-            let mut rules = Vec::with_capacity(records.len());
-            let mut unresolved = HashMap::new();
-            for record in records {
-                let mut rule = record.rule;
-                if let Some(reason) = resolve_rule_identity(&inner.db, &mut rule) {
-                    unresolved.insert(rule.id, reason);
-                    continue;
-                }
-                rules.push(rule);
-            }
+            let rules: Vec<TrafficRule> = inner
+                .db
+                .list_traffic_rules()?
+                .into_iter()
+                .map(|record| record.rule)
+                .collect();
 
-            let compiled = compile(&rules, &mut inner.application_keys, revision, master)
+            let mut resolver = SystemEvidenceResolver::new(&mut inner.cgroups, &inner.db);
+            let compiled = compile(&rules, &mut resolver, revision, master)
                 .map_err(|error| anyhow::anyhow!(error))?;
-            for rule in &compiled.unresolved {
-                unresolved.insert(rule.rule_id, rule.reason.clone());
-            }
+            let unresolved = compiled
+                .unresolved
+                .iter()
+                .map(|rule| (rule.rule_id, rule.reason.clone()))
+                .collect();
             (handle, compiled.policy, unresolved)
         };
 
@@ -699,15 +700,15 @@ impl Inner {
     ) -> TrafficRuleDto {
         let rule = &record.rule;
         let (state, state_reason) = self.traffic_rule_state(rule);
-        let matcher = match &rule.matcher {
-            RuleMatch::Endpoint { address, port } => TrafficRuleMatchDto {
+        let matcher = match &rule.selector {
+            Selector::Endpoint { address, port } => TrafficRuleMatchDto {
                 kind: "endpoint",
                 address: Some(address.to_string()),
                 prefix_len: None,
                 port: *port,
                 application_id: None,
             },
-            RuleMatch::Cidr {
+            Selector::Cidr {
                 address,
                 prefix_len,
             } => TrafficRuleMatchDto {
@@ -717,22 +718,23 @@ impl Inner {
                 port: None,
                 application_id: None,
             },
-            RuleMatch::Application { identity } => TrafficRuleMatchDto {
+            Selector::Application { id } => TrafficRuleMatchDto {
                 kind: "application",
                 address: None,
                 prefix_len: None,
                 port: None,
-                application_id: Some(identity.clone()),
+                application_id: Some(id.clone()),
             },
         };
+        let (rate_bytes_per_s, burst_bytes) = rule.action.rates();
 
         TrafficRuleDto {
             id: rule.id,
-            action: action_name(rule.action),
+            action: action_name(rule.action.action()),
             direction: rule.direction.as_str(),
             matcher,
-            rate_bytes_per_s: rule.rate_bytes_per_s,
-            burst_bytes: rule.burst_bytes,
+            rate_bytes_per_s,
+            burst_bytes,
             enabled: rule.enabled,
             state,
             state_reason,
@@ -1004,26 +1006,28 @@ fn rule_bucket_keys(rule: &TrafficRule) -> Vec<BucketKey> {
 }
 
 fn draft_from_create(request: &CreateTrafficRuleRequest) -> Result<TrafficRuleDraft, ApiError> {
-    let action = action_from_name(&request.action)
+    let kind = action_from_name(&request.action)
         .ok_or_else(|| ApiError::unprocessable(format!("unknown action {:?}", request.action)))?;
     let direction = RuleDirection::from_name(&request.direction).ok_or_else(|| {
         ApiError::unprocessable(format!("unknown direction {:?}", request.direction))
     })?;
-    if action == RuleAction::Block && request.rate_bytes_per_s.is_some() {
-        return Err(ApiError::unprocessable("block rules carry no rate"));
-    }
-    let matcher = matcher_from_request(&request.matcher)?;
-    let rate = request.rate_bytes_per_s.unwrap_or(0);
-    let (rate, burst) = match action {
-        RuleAction::Limit => (rate, rate),
-        RuleAction::Block => (0, 0),
+    let action = match kind {
+        RuleAction::Limit => ActionSpec::Limit {
+            rate_bytes_per_s: request.rate_bytes_per_s.unwrap_or(0),
+            burst_bytes: request.rate_bytes_per_s.unwrap_or(0),
+        },
+        RuleAction::Block => {
+            if request.rate_bytes_per_s.is_some() {
+                return Err(ApiError::unprocessable("block rules carry no rate"));
+            }
+            ActionSpec::Block
+        }
     };
+    let selector = selector_from_request(&request.matcher)?;
     let draft = TrafficRuleDraft {
         action,
         direction,
-        matcher,
-        rate_bytes_per_s: rate,
-        burst_bytes: burst,
+        selector,
         enabled: request.enabled.unwrap_or(true),
     };
     validate_draft(&draft)?;
@@ -1034,55 +1038,73 @@ fn draft_from_update(
     existing: &TrafficRule,
     request: &UpdateTrafficRuleRequest,
 ) -> Result<TrafficRuleDraft, ApiError> {
-    let action = match &request.action {
-        Some(name) => action_from_name(name)
-            .ok_or_else(|| ApiError::unprocessable(format!("unknown action {name:?}")))?,
-        None => existing.action,
-    };
     let direction = match &request.direction {
         Some(name) => RuleDirection::from_name(name)
             .ok_or_else(|| ApiError::unprocessable(format!("unknown direction {name:?}")))?,
         None => existing.direction,
     };
-    let matcher = match &request.matcher {
-        Some(request) => matcher_from_request(request)?,
-        None => existing.matcher.clone(),
+    let selector = match &request.matcher {
+        Some(request) => selector_from_request(request)?,
+        None => existing.selector.clone(),
     };
-    if action == RuleAction::Block
-        && existing.action != RuleAction::Block
-        && request.rate_bytes_per_s.is_some()
-    {
-        return Err(ApiError::unprocessable("block rules carry no rate"));
-    }
-    let rate = match action {
-        RuleAction::Limit => request
-            .rate_bytes_per_s
-            .unwrap_or(existing.rate_bytes_per_s),
-        RuleAction::Block => 0,
+    let action = match &request.action {
+        Some(name) => match action_from_name(name)
+            .ok_or_else(|| ApiError::unprocessable(format!("unknown action {name:?}")))?
+        {
+            RuleAction::Limit => {
+                let (rate, _) = existing.action.rates();
+                let rate = request.rate_bytes_per_s.unwrap_or(rate);
+                ActionSpec::Limit {
+                    rate_bytes_per_s: rate,
+                    burst_bytes: rate,
+                }
+            }
+            RuleAction::Block => {
+                if request.rate_bytes_per_s.is_some() {
+                    return Err(ApiError::unprocessable("block rules carry no rate"));
+                }
+                ActionSpec::Block
+            }
+        },
+        None => match &existing.action {
+            ActionSpec::Limit {
+                rate_bytes_per_s, ..
+            } => {
+                let rate = request.rate_bytes_per_s.unwrap_or(*rate_bytes_per_s);
+                ActionSpec::Limit {
+                    rate_bytes_per_s: rate,
+                    burst_bytes: rate,
+                }
+            }
+            ActionSpec::Block => {
+                if request.rate_bytes_per_s.is_some() {
+                    return Err(ApiError::unprocessable("block rules carry no rate"));
+                }
+                ActionSpec::Block
+            }
+        },
     };
     let draft = TrafficRuleDraft {
         action,
         direction,
-        matcher,
-        rate_bytes_per_s: rate,
-        burst_bytes: rate,
+        selector,
         enabled: request.enabled.unwrap_or(existing.enabled),
     };
     validate_draft(&draft)?;
     Ok(draft)
 }
 
-fn matcher_from_request(request: &TrafficRuleMatchRequest) -> Result<RuleMatch, ApiError> {
+fn selector_from_request(request: &TrafficRuleMatchRequest) -> Result<Selector, ApiError> {
     match request.kind.as_str() {
         "endpoint" => {
             let address = request
                 .address
                 .as_deref()
                 .ok_or_else(|| ApiError::unprocessable("endpoint match needs an address"))?;
-            let address = address.parse::<Ipv4Addr>().map_err(|_| {
+            let address = address.parse::<IpAddr>().map_err(|_| {
                 ApiError::unprocessable(format!("invalid endpoint address {address:?}"))
             })?;
-            Ok(RuleMatch::Endpoint {
+            Ok(Selector::Endpoint {
                 address,
                 port: request.port,
             })
@@ -1092,26 +1114,26 @@ fn matcher_from_request(request: &TrafficRuleMatchRequest) -> Result<RuleMatch, 
                 .address
                 .as_deref()
                 .ok_or_else(|| ApiError::unprocessable("cidr match needs an address"))?;
-            let address = address.parse::<Ipv4Addr>().map_err(|_| {
+            let address = address.parse::<IpAddr>().map_err(|_| {
                 ApiError::unprocessable(format!("invalid CIDR address {address:?}"))
             })?;
             let prefix_len = request
                 .prefix_len
                 .ok_or_else(|| ApiError::unprocessable("cidr match needs a prefix_len"))?;
-            Ok(RuleMatch::Cidr {
+            Ok(Selector::Cidr {
                 address,
                 prefix_len,
             })
         }
         "application" => {
-            let identity = request
+            let id = request
                 .application_id
                 .clone()
-                .filter(|identity| !identity.trim().is_empty())
+                .filter(|id| !id.trim().is_empty())
                 .ok_or_else(|| {
                     ApiError::unprocessable("application match needs an application_id")
                 })?;
-            Ok(RuleMatch::Application { identity })
+            Ok(Selector::Application { id })
         }
         other => Err(ApiError::unprocessable(format!(
             "unknown match kind {other:?}"
@@ -1122,35 +1144,12 @@ fn matcher_from_request(request: &TrafficRuleMatchRequest) -> Result<RuleMatch, 
 fn validate_draft(draft: &TrafficRuleDraft) -> Result<(), ApiError> {
     let rule = TrafficRule {
         id: 0,
-        action: draft.action,
+        action: draft.action.clone(),
         direction: draft.direction,
-        matcher: draft.matcher.clone(),
-        rate_bytes_per_s: draft.rate_bytes_per_s,
-        burst_bytes: draft.burst_bytes,
+        selector: draft.selector.clone(),
         enabled: draft.enabled,
     };
     validate_rule(&rule).map_err(ApiError::unprocessable)
-}
-
-/// Rewrites a `proc:<exe>` identity to the kernel `comm` recorded for that
-/// Application Identity; returns the reason when no `comm` exists.
-fn resolve_rule_identity(db: &Db, rule: &mut TrafficRule) -> Option<String> {
-    let RuleMatch::Application { identity } = &rule.matcher else {
-        return None;
-    };
-    let executable = identity.strip_prefix("proc:")?;
-    if executable.starts_with("comm:") {
-        return None;
-    }
-    match db.application_comm(identity) {
-        Some(comm) => {
-            rule.matcher = RuleMatch::Application {
-                identity: format!("proc:comm:{comm}"),
-            };
-            None
-        }
-        None => Some(format!("no stored process name for {identity}")),
-    }
 }
 
 async fn clear_history(
@@ -1230,6 +1229,7 @@ mod tests {
     };
 
     use super::*;
+    use std::net::Ipv4Addr;
 
     fn state() -> ApiState {
         ApiState::new(ApiConfig {
@@ -3104,14 +3104,12 @@ mod tests {
                 inner
                     .db
                     .insert_traffic_rule(&TrafficRuleDraft {
-                        action: RuleAction::Block,
+                        action: ActionSpec::Block,
                         direction: RuleDirection::Outbound,
-                        matcher: RuleMatch::Endpoint {
-                            address: Ipv4Addr::new(203, 0, 113, index as u8 + 1),
+                        selector: Selector::Endpoint {
+                            address: IpAddr::from(Ipv4Addr::new(203, 0, 113, index as u8 + 1)),
                             port: None,
                         },
-                        rate_bytes_per_s: 0,
-                        burst_bytes: 0,
                         enabled: true,
                     })
                     .expect("seed rule");
