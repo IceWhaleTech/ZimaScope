@@ -16,6 +16,7 @@ use std::{
     net::UdpSocket,
     path::{Path, PathBuf},
     process::Command,
+    sync::Mutex,
     thread,
     time::Duration,
 };
@@ -23,7 +24,7 @@ use std::{
 use anyhow::{Context, Result, bail};
 use aya::{
     Ebpf,
-    maps::{MapData, PerCpuArray, PerCpuHashMap},
+    maps::{Array, HashMap as AyaHashMap, MapData, PerCpuArray, PerCpuHashMap},
     programs::{
         SchedClassifier, TcAttachType,
         tc::{self, SchedClassifierLink},
@@ -31,8 +32,9 @@ use aya::{
     util::KernelVersion,
 };
 use zimascope_common::kernel_abi::{
-    self, FLOW_MAP, FlowKey, FlowValue, KERNEL_STATS_MAP, KernelStats, TC_EGRESS_PROGRAM,
-    TC_INGRESS_PROGRAM,
+    BucketKey, Direction, ENDPOINT_EXACT_EGRESS_MAP, EndpointMatchKey, FLOW_MAP, FlowKey,
+    FlowValue, KERNEL_STATS_MAP, KernelStats, POLICY_CONFIG_MAP, PolicyConfig, RULE_STATES_MAP,
+    RuleAction, RuleRef, RuleState, TC_EGRESS_PROGRAM, TC_INGRESS_PROGRAM,
 };
 
 const NS: &str = "zs-boundary";
@@ -43,6 +45,14 @@ const PEER_ADDR: &str = "10.99.77.2";
 const UDP_PORT: u16 = 39_001;
 const PACKETS: usize = 16;
 const CHILD_ENV: &str = "ZS_BOUNDARY_CHILD";
+
+/// Every harness test owns the same namespace and veth names, so they run one
+/// at a time.
+static HARNESS: Mutex<()> = Mutex::new(());
+
+fn serialized() -> std::sync::MutexGuard<'static, ()> {
+    HARNESS.lock().unwrap_or_else(|error| error.into_inner())
+}
 
 #[repr(transparent)]
 #[derive(Clone, Copy)]
@@ -65,39 +75,53 @@ struct PodKernelStats(KernelStats);
 // Safety: `#[repr(transparent)]` over a `#[repr(C)]` POD type with no padding.
 unsafe impl aya::Pod for PodKernelStats {}
 
+#[repr(transparent)]
+#[derive(Clone, Copy)]
+struct PodPolicyConfig(PolicyConfig);
+
+// Safety: `#[repr(transparent)]` over a `#[repr(C)]` POD type with no padding.
+unsafe impl aya::Pod for PodPolicyConfig {}
+
+#[repr(transparent)]
+#[derive(Clone, Copy)]
+struct PodBucketKey(BucketKey);
+
+// Safety: `#[repr(transparent)]` over a `#[repr(C)]` POD type with no padding.
+unsafe impl aya::Pod for PodBucketKey {}
+
+#[repr(transparent)]
+#[derive(Clone, Copy)]
+struct PodRuleState(RuleState);
+
+// Safety: `#[repr(transparent)]` over a `#[repr(C)]` POD type with no padding.
+unsafe impl aya::Pod for PodRuleState {}
+
+#[repr(transparent)]
+#[derive(Clone, Copy)]
+struct PodEndpointMatchKey(EndpointMatchKey);
+
+// Safety: `#[repr(transparent)]` over a `#[repr(C)]` POD type with no padding.
+unsafe impl aya::Pod for PodEndpointMatchKey {}
+
+#[repr(transparent)]
+#[derive(Clone, Copy)]
+struct PodRuleRef(RuleRef);
+
+// Safety: `#[repr(transparent)]` over a `#[repr(C)]` POD type with no padding.
+unsafe impl aya::Pod for PodRuleRef {}
+
 #[test]
 #[ignore = "requires root, iproute2 and a kernel with BPF/tcx"]
 fn records_both_directions_at_the_boundary() -> Result<()> {
-    let _boundary = Boundary::create()?;
-    let mut ebpf = Ebpf::load(&std::fs::read(object_path()?)?).context("load eBPF object")?;
-    let links = load_and_attach(&mut ebpf, HOST_IFACE)?;
-
-    let flows = PerCpuHashMap::<MapData, PodFlowKey, PodFlowValue>::try_from(
-        ebpf.take_map(FLOW_MAP).context("take flow map")?,
-    )
-    .context("convert flow map")?;
-    let stats = PerCpuArray::<MapData, PodKernelStats>::try_from(
-        ebpf.take_map(KERNEL_STATS_MAP)
-            .context("take kernel stats map")?,
-    )
-    .context("convert kernel stats map")?;
+    let _guard = serialized();
+    let harness = Harness::new()?;
 
     send_outbound()?;
     send_inbound_from_peer()?;
     thread::sleep(Duration::from_millis(300));
 
-    let outbound = flow_counters(
-        &flows,
-        kernel_abi::Direction::Outbound as u8,
-        HOST_ADDR,
-        PEER_ADDR,
-    )?;
-    let inbound = flow_counters(
-        &flows,
-        kernel_abi::Direction::Inbound as u8,
-        PEER_ADDR,
-        HOST_ADDR,
-    )?;
+    let outbound = harness.flow_totals(Direction::Outbound, HOST_ADDR, PEER_ADDR, UDP_PORT)?;
+    let inbound = harness.flow_totals(Direction::Inbound, PEER_ADDR, HOST_ADDR, UDP_PORT)?;
 
     assert!(
         outbound.0 >= PACKETS as u64,
@@ -112,14 +136,81 @@ fn records_both_directions_at_the_boundary() -> Result<()> {
     );
     assert!(inbound.1 > 0, "inbound bytes are zero");
 
-    let values = stats.get(&0, 0).context("read kernel stats")?;
-    let packets_seen: u64 = values.iter().map(|value| value.0.packets_seen).sum();
+    let packets_seen = harness.packets_seen()?;
     assert!(
         packets_seen >= (PACKETS * 2) as u64,
         "packets_seen: {packets_seen}"
     );
+    Ok(())
+}
 
-    drop(links);
+#[test]
+#[ignore = "requires root, iproute2 and a kernel with BPF/tcx"]
+fn blocks_a_matching_endpoint() -> Result<()> {
+    let _guard = serialized();
+    let mut harness = Harness::new()?;
+    harness.set_rule(1, RuleAction::Block, 0, 0)?;
+
+    send_outbound()?;
+    thread::sleep(Duration::from_millis(200));
+
+    let outbound = harness.flow_totals(Direction::Outbound, HOST_ADDR, PEER_ADDR, UDP_PORT)?;
+    assert_eq!(outbound.0, 0, "blocked packets reached the Flow map");
+
+    let dropped = harness.policy_dropped_packets()?;
+    assert!(dropped >= PACKETS as u64, "policy drops: {dropped}");
+
+    let state = harness.rule_state(1, Direction::Outbound)?;
+    assert!(state.matched_packets >= PACKETS as u64);
+    assert!(state.dropped_packets >= PACKETS as u64);
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires root, iproute2 and a kernel with BPF/tcx"]
+fn disabled_policy_passes_matching_traffic() -> Result<()> {
+    let _guard = serialized();
+    let mut harness = Harness::new()?;
+    harness.set_rule(1, RuleAction::Block, 0, 0)?;
+    harness.disable_policy()?;
+
+    send_outbound()?;
+    thread::sleep(Duration::from_millis(200));
+
+    let outbound = harness.flow_totals(Direction::Outbound, HOST_ADDR, PEER_ADDR, UDP_PORT)?;
+    assert!(
+        outbound.0 >= PACKETS as u64,
+        "outbound packets: {}",
+        outbound.0
+    );
+    assert_eq!(harness.policy_dropped_packets()?, 0);
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires root, iproute2 and a kernel with BPF/tcx"]
+fn limit_drops_traffic_above_the_burst() -> Result<()> {
+    let _guard = serialized();
+    let mut harness = Harness::new()?;
+    harness.set_rule(2, RuleAction::Limit, 128, 128)?;
+
+    send_outbound()?;
+    thread::sleep(Duration::from_millis(200));
+
+    let state = harness.rule_state(2, Direction::Outbound)?;
+    assert!(
+        state.dropped_packets >= (PACKETS - 4) as u64,
+        "dropped packets: {}",
+        state.dropped_packets
+    );
+    assert!(state.matched_packets >= PACKETS as u64);
+
+    let outbound = harness.flow_totals(Direction::Outbound, HOST_ADDR, PEER_ADDR, UDP_PORT)?;
+    assert!(
+        outbound.0 <= 4,
+        "limited packets that passed: {}",
+        outbound.0
+    );
     Ok(())
 }
 
@@ -136,6 +227,172 @@ fn sends_udp_from_peer() {
             .expect("send inbound datagram");
     }
     thread::sleep(Duration::from_millis(100));
+}
+
+struct Harness {
+    _ebpf: Ebpf,
+    flows: PerCpuHashMap<MapData, PodFlowKey, PodFlowValue>,
+    stats: PerCpuArray<MapData, PodKernelStats>,
+    config: Array<MapData, PodPolicyConfig>,
+    states: AyaHashMap<MapData, PodBucketKey, PodRuleState>,
+    exact_egress: AyaHashMap<MapData, PodEndpointMatchKey, PodRuleRef>,
+    _links: Vec<SchedClassifierLink>,
+    _boundary: Boundary,
+}
+
+impl Harness {
+    fn new() -> Result<Self> {
+        let boundary = Boundary::create()?;
+        let mut ebpf = Ebpf::load(&std::fs::read(object_path()?)?).context("load eBPF object")?;
+        let links = load_and_attach(&mut ebpf, HOST_IFACE)?;
+
+        let flows = PerCpuHashMap::try_from(ebpf.take_map(FLOW_MAP).context("take flow map")?)
+            .context("convert flow map")?;
+        let stats = PerCpuArray::try_from(
+            ebpf.take_map(KERNEL_STATS_MAP)
+                .context("take kernel stats map")?,
+        )
+        .context("convert kernel stats map")?;
+        let config = Array::try_from(
+            ebpf.take_map(POLICY_CONFIG_MAP)
+                .context("take policy config map")?,
+        )
+        .context("convert policy config map")?;
+        let states = AyaHashMap::try_from(
+            ebpf.take_map(RULE_STATES_MAP)
+                .context("take rule states map")?,
+        )
+        .context("convert rule states map")?;
+        let exact_egress = AyaHashMap::try_from(
+            ebpf.take_map(ENDPOINT_EXACT_EGRESS_MAP)
+                .context("take endpoint exact egress map")?,
+        )
+        .context("convert endpoint exact egress map")?;
+
+        Ok(Self {
+            _ebpf: ebpf,
+            flows,
+            stats,
+            config,
+            states,
+            exact_egress,
+            _links: links,
+            _boundary: boundary,
+        })
+    }
+
+    /// Installs one outbound exact-endpoint rule with fail-open ordering:
+    /// state first, match entry second, configuration last.
+    fn set_rule(&mut self, rule_id: u32, action: RuleAction, rate: u64, burst: u64) -> Result<()> {
+        let state = RuleState {
+            rate_bytes_per_s: rate,
+            burst_bytes: burst,
+            tokens: burst,
+            ..RuleState::default()
+        };
+        let key = BucketKey {
+            rule_id,
+            direction: Direction::Outbound as u8,
+            reserved: [0; 3],
+        };
+        self.states
+            .insert(PodBucketKey(key), PodRuleState(state), 0)
+            .context("insert rule state")?;
+
+        let mut addr = [0u8; 16];
+        addr[12..].copy_from_slice(&PEER_ADDR.parse::<std::net::Ipv4Addr>()?.octets());
+        let match_key = EndpointMatchKey {
+            addr,
+            port_be: UDP_PORT.to_be(),
+            reserved: [0; 6],
+        };
+        self.exact_egress
+            .insert(
+                PodEndpointMatchKey(match_key),
+                PodRuleRef(RuleRef {
+                    rule_id,
+                    action: action as u8,
+                    reserved: [0; 3],
+                }),
+                0,
+            )
+            .context("insert endpoint match")?;
+
+        self.write_config(true)
+    }
+
+    fn disable_policy(&mut self) -> Result<()> {
+        self.write_config(false)
+    }
+
+    fn write_config(&mut self, enabled: bool) -> Result<()> {
+        self.config
+            .set(
+                0,
+                PodPolicyConfig(PolicyConfig {
+                    enabled: u8::from(enabled),
+                    app_rules: 0,
+                    endpoint_rules: 1,
+                    reserved: 0,
+                    revision: 1,
+                }),
+                0,
+            )
+            .context("write policy config")
+    }
+
+    fn rule_state(&self, rule_id: u32, direction: Direction) -> Result<RuleState> {
+        let key = BucketKey {
+            rule_id,
+            direction: direction as u8,
+            reserved: [0; 3],
+        };
+        self.states
+            .get(&PodBucketKey(key), 0)
+            .map(|value| value.0)
+            .context("read rule state")
+    }
+
+    fn policy_dropped_packets(&self) -> Result<u64> {
+        let values = self.stats.get(&0, 0).context("read kernel stats")?;
+        Ok(values
+            .iter()
+            .map(|value| value.0.policy_dropped_packets)
+            .sum())
+    }
+
+    fn packets_seen(&self) -> Result<u64> {
+        let values = self.stats.get(&0, 0).context("read kernel stats")?;
+        Ok(values.iter().map(|value| value.0.packets_seen).sum())
+    }
+
+    fn flow_totals(
+        &self,
+        direction: Direction,
+        src: &str,
+        dst: &str,
+        udp_port: u16,
+    ) -> Result<(u64, u64)> {
+        let src_addr = ipv4(src);
+        let dst_addr = ipv4(dst);
+        let port_be = udp_port.to_be();
+        let mut packets = 0u64;
+        let mut bytes = 0u64;
+        for item in self.flows.iter() {
+            let (key, values) = item.context("read flow map entry")?;
+            let key = key.0;
+            if key.direction != direction as u8
+                || key.src_addr != src_addr
+                || key.dst_addr != dst_addr
+                || key.dst_port_be != port_be
+            {
+                continue;
+            }
+            packets += values.iter().map(|value| value.0.packets).sum::<u64>();
+            bytes += values.iter().map(|value| value.0.bytes).sum::<u64>();
+        }
+        Ok((packets, bytes))
+    }
 }
 
 struct Boundary;
@@ -266,28 +523,6 @@ fn load_and_attach(ebpf: &mut Ebpf, interface: &str) -> Result<Vec<SchedClassifi
         );
     }
     Ok(links)
-}
-
-fn flow_counters(
-    flows: &PerCpuHashMap<MapData, PodFlowKey, PodFlowValue>,
-    direction: u8,
-    src: &str,
-    dst: &str,
-) -> Result<(u64, u64)> {
-    let src_addr = ipv4(src);
-    let dst_addr = ipv4(dst);
-    let mut packets = 0u64;
-    let mut bytes = 0u64;
-    for item in flows.iter() {
-        let (key, values) = item.context("read flow map entry")?;
-        let key = key.0;
-        if key.direction != direction || key.src_addr != src_addr || key.dst_addr != dst_addr {
-            continue;
-        }
-        packets += values.iter().map(|value| value.0.packets).sum::<u64>();
-        bytes += values.iter().map(|value| value.0.bytes).sum::<u64>();
-    }
-    Ok((packets, bytes))
 }
 
 fn ipv4(addr: &str) -> [u8; 16] {

@@ -7,7 +7,7 @@
 
 /// Version of the kernel/user-space contract. Bump this whenever the layout of
 /// any type in this module changes.
-pub const ABI_VERSION: u16 = 3;
+pub const ABI_VERSION: u16 = 4;
 
 /// Maximum normalized domain length. A DNS name is at most 253 characters.
 pub const DOMAIN_MAX_LEN: usize = 253;
@@ -36,6 +36,10 @@ pub const DEFAULT_OWNER_CAPACITY: u32 = 65_536;
 /// Default number of listening-port entries the eBPF map is compiled with.
 pub const DEFAULT_LISTENER_CAPACITY: u32 = 4_096;
 
+/// Default number of Traffic Rules the match maps are compiled with. Every
+/// match map and the rule-state map are sized from this bound.
+pub const DEFAULT_TRAFFIC_RULE_CAPACITY: u32 = 64;
+
 /// Program names include the ABI version so a stale object is rejected at
 /// lookup instead of running with mismatched struct layouts.
 pub const TC_INGRESS_PROGRAM: &str = "tc_ingress_v1";
@@ -50,6 +54,16 @@ pub const DOMAIN_EVENTS_MAP: &str = "domain_events";
 pub const SERVICE_EVENTS_MAP: &str = "service_events";
 pub const OWNER_MAP: &str = "owner_map";
 pub const LISTENER_MAP: &str = "listener_map";
+pub const POLICY_CONFIG_MAP: &str = "policy_config";
+pub const RULE_STATES_MAP: &str = "rule_states";
+pub const APP_CGROUP_INGRESS_MAP: &str = "app_cgroup_ingress";
+pub const APP_CGROUP_EGRESS_MAP: &str = "app_cgroup_egress";
+pub const APP_COMM_INGRESS_MAP: &str = "app_comm_ingress";
+pub const APP_COMM_EGRESS_MAP: &str = "app_comm_egress";
+pub const ENDPOINT_EXACT_INGRESS_MAP: &str = "endpoint_exact_ingress";
+pub const ENDPOINT_EXACT_EGRESS_MAP: &str = "endpoint_exact_egress";
+pub const ENDPOINT_CIDR_INGRESS_MAP: &str = "endpoint_cidr_ingress";
+pub const ENDPOINT_CIDR_EGRESS_MAP: &str = "endpoint_cidr_egress";
 
 /// Compile-time description of the ABI layout, stored in the eBPF object so a
 /// version mismatch can be rejected before any collection starts.
@@ -64,6 +78,8 @@ pub struct AbiMetadata {
     pub service_sample_size: u16,
     pub owner_key_size: u16,
     pub owner_value_size: u16,
+    pub rule_state_size: u16,
+    pub policy_config_size: u16,
 }
 
 #[repr(u8)]
@@ -114,6 +130,8 @@ impl AbiMetadata {
         service_sample_size: core::mem::size_of::<ServiceSample>() as u16,
         owner_key_size: core::mem::size_of::<OwnerKey>() as u16,
         owner_value_size: core::mem::size_of::<OwnerValue>() as u16,
+        rule_state_size: core::mem::size_of::<RuleState>() as u16,
+        policy_config_size: core::mem::size_of::<PolicyConfig>() as u16,
     };
 }
 
@@ -168,6 +186,25 @@ impl OwnerKind {
         match value {
             1 => Some(Self::Socket),
             2 => Some(Self::Listener),
+            _ => None,
+        }
+    }
+}
+
+/// Action a matched Traffic Rule applies to a packet.
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RuleAction {
+    Limit = 1,
+    Block = 2,
+}
+
+impl RuleAction {
+    /// Validates a raw ABI discriminant.
+    pub const fn from_abi(value: u8) -> Option<Self> {
+        match value {
+            1 => Some(Self::Limit),
+            2 => Some(Self::Block),
             _ => None,
         }
     }
@@ -239,6 +276,76 @@ pub struct OwnerValue {
     pub observed_mono_ns: u64,
 }
 
+/// Value stored in every Traffic Rule match map.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct RuleRef {
+    pub rule_id: u32,
+    pub action: u8,
+    pub reserved: [u8; 3],
+}
+
+/// Key of one rule-direction rule state entry.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct BucketKey {
+    pub rule_id: u32,
+    pub direction: u8,
+    pub reserved: [u8; 3],
+}
+
+/// ABI placeholder for the kernel's `struct bpf_spin_lock`.
+///
+/// The kernel locates the lock in a map value by its exact BTF name, so this
+/// type keeps that name; the eBPF side casts a pointer to it into the aya
+/// binding of the same layout when calling the spin-lock helpers.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+#[allow(non_camel_case_types)]
+pub struct bpf_spin_lock {
+    pub val: u32,
+}
+
+/// Runtime state of one rule in one direction: a token bucket for `limit`
+/// rules and counters for every rule. User space reads and updates it with
+/// `BPF_F_LOCK`; the packet path holds `lock` around every read-modify-write.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct RuleState {
+    pub lock: bpf_spin_lock,
+    pub reserved: u32,
+    pub rate_bytes_per_s: u64,
+    pub burst_bytes: u64,
+    pub tokens: u64,
+    pub last_refill_mono_ns: u64,
+    pub matched_packets: u64,
+    pub matched_bytes: u64,
+    pub dropped_packets: u64,
+    pub dropped_bytes: u64,
+}
+
+/// Exact Endpoint match key. IPv4 addresses are zero-extended; a `port_be` of
+/// zero matches every port.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct EndpointMatchKey {
+    pub addr: [u8; 16],
+    pub port_be: u16,
+    pub reserved: [u8; 6],
+}
+
+/// Single-entry policy fast path. `app_rules` and `endpoint_rules` let the
+/// packet path skip whole tiers that hold no rules.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct PolicyConfig {
+    pub enabled: u8,
+    pub app_rules: u8,
+    pub endpoint_rules: u8,
+    pub reserved: u8,
+    pub revision: u32,
+}
+
 /// One bounded payload sample emitted from the packet path.
 ///
 /// User space parses DNS responses, TLS ClientHellos and HTTP requests out of
@@ -291,10 +398,13 @@ pub struct KernelStats {
     pub service_events_dropped: u64,
     pub owner_events_inserted: u64,
     pub owner_events_dropped: u64,
+    pub policy_dropped_packets: u64,
+    pub policy_dropped_bytes: u64,
+    pub policy_missing_state: u64,
 }
 
 const _: () = {
-    assert!(core::mem::size_of::<AbiMetadata>() == 16);
+    assert!(core::mem::size_of::<AbiMetadata>() == 20);
     assert!(core::mem::align_of::<AbiMetadata>() == 2);
 
     assert!(core::mem::size_of::<FlowKey>() == 44);
@@ -309,13 +419,31 @@ const _: () = {
     assert!(core::mem::size_of::<OwnerValue>() == 48);
     assert!(core::mem::align_of::<OwnerValue>() == 8);
 
+    assert!(core::mem::size_of::<RuleRef>() == 8);
+    assert!(core::mem::align_of::<RuleRef>() == 4);
+
+    assert!(core::mem::size_of::<BucketKey>() == 8);
+    assert!(core::mem::align_of::<BucketKey>() == 4);
+
+    assert!(core::mem::size_of::<bpf_spin_lock>() == 4);
+    assert!(core::mem::align_of::<bpf_spin_lock>() == 4);
+
+    assert!(core::mem::size_of::<RuleState>() == 72);
+    assert!(core::mem::align_of::<RuleState>() == 8);
+
+    assert!(core::mem::size_of::<EndpointMatchKey>() == 24);
+    assert!(core::mem::align_of::<EndpointMatchKey>() == 2);
+
+    assert!(core::mem::size_of::<PolicyConfig>() == 8);
+    assert!(core::mem::align_of::<PolicyConfig>() == 4);
+
     assert!(core::mem::size_of::<DomainSample>() == 552);
     assert!(core::mem::align_of::<DomainSample>() == 8);
 
     assert!(core::mem::size_of::<ServiceSample>() == 128);
     assert!(core::mem::align_of::<ServiceSample>() == 8);
 
-    assert!(core::mem::size_of::<KernelStats>() == 88);
+    assert!(core::mem::size_of::<KernelStats>() == 112);
     assert!(core::mem::align_of::<KernelStats>() == 8);
 
     assert!(core::mem::offset_of!(FlowKey, src_addr) == 0);
@@ -349,6 +477,26 @@ const _: () = {
     assert!(core::mem::offset_of!(FlowValue, tcp_flags) == 32);
     assert!(core::mem::offset_of!(FlowValue, parse_flags) == 34);
     assert!(core::mem::offset_of!(FlowValue, service_flags) == 36);
+
+    assert!(core::mem::offset_of!(RuleRef, rule_id) == 0);
+    assert!(core::mem::offset_of!(RuleRef, action) == 4);
+
+    assert!(core::mem::offset_of!(BucketKey, rule_id) == 0);
+    assert!(core::mem::offset_of!(BucketKey, direction) == 4);
+
+    assert!(core::mem::offset_of!(RuleState, lock) == 0);
+    assert!(core::mem::offset_of!(RuleState, reserved) == 4);
+    assert!(core::mem::offset_of!(RuleState, rate_bytes_per_s) == 8);
+    assert!(core::mem::offset_of!(RuleState, tokens) == 24);
+    assert!(core::mem::offset_of!(RuleState, last_refill_mono_ns) == 32);
+    assert!(core::mem::offset_of!(RuleState, matched_packets) == 40);
+    assert!(core::mem::offset_of!(RuleState, dropped_bytes) == 64);
+
+    assert!(core::mem::offset_of!(EndpointMatchKey, addr) == 0);
+    assert!(core::mem::offset_of!(EndpointMatchKey, port_be) == 16);
+
+    assert!(core::mem::offset_of!(PolicyConfig, enabled) == 0);
+    assert!(core::mem::offset_of!(PolicyConfig, revision) == 4);
 };
 
 #[cfg(test)]
@@ -375,6 +523,11 @@ mod tests {
         );
         assert_eq!(metadata.owner_key_size as usize, size_of::<OwnerKey>());
         assert_eq!(metadata.owner_value_size as usize, size_of::<OwnerValue>());
+        assert_eq!(metadata.rule_state_size as usize, size_of::<RuleState>());
+        assert_eq!(
+            metadata.policy_config_size as usize,
+            size_of::<PolicyConfig>()
+        );
     }
 
     #[test]
@@ -402,6 +555,10 @@ mod tests {
         assert_eq!(OwnerKind::from_abi(1), Some(OwnerKind::Socket));
         assert_eq!(OwnerKind::from_abi(2), Some(OwnerKind::Listener));
         assert_eq!(OwnerKind::from_abi(3), None);
+
+        assert_eq!(RuleAction::from_abi(1), Some(RuleAction::Limit));
+        assert_eq!(RuleAction::from_abi(2), Some(RuleAction::Block));
+        assert_eq!(RuleAction::from_abi(3), None);
     }
 
     #[test]

@@ -14,7 +14,8 @@ use anyhow::{Context, Result, bail};
 use aya::{
     Ebpf,
     maps::{
-        Array, HashMap as AyaHashMap, IterableMap, MapData, PerCpuArray, PerCpuHashMap, RingBuf,
+        Array, HashMap as AyaHashMap, IterableMap, Map as AyaMap, MapData, PerCpuArray,
+        PerCpuHashMap, RingBuf,
     },
     programs::{
         CgroupAttachMode, CgroupSockAddr, Link, ProgramError, SchedClassifier, SockOps,
@@ -159,6 +160,7 @@ impl AyaKernelSource {
         let listeners = take_owner_map(&mut ebpf, LISTENER_MAP)?;
 
         load_programs(&mut ebpf)?;
+        verify_policy_maps(&mut ebpf)?;
 
         // Application Identity is advisory: TC collection starts even when the
         // cgroup attach is unavailable, and health explains why.
@@ -392,11 +394,88 @@ fn verify_abi(ebpf: &mut Ebpf) -> Result<()> {
         || published.kernel_stats_size != expected.kernel_stats_size
         || published.owner_key_size != expected.owner_key_size
         || published.owner_value_size != expected.owner_value_size
+        || published.rule_state_size != expected.rule_state_size
+        || published.policy_config_size != expected.policy_config_size
     {
         bail!("eBPF ABI mismatch: recorded struct sizes do not match user space");
     }
 
     Ok(())
+}
+
+/// Verifies the fixed capacities of every Traffic Rule map before attachment.
+///
+/// Called after program loading so the kernel already holds the map
+/// references; the temporary handles can be dropped.
+fn verify_policy_maps(ebpf: &mut Ebpf) -> Result<()> {
+    let rules = kernel_abi::DEFAULT_TRAFFIC_RULE_CAPACITY as usize;
+    let expected: [(&str, usize); 10] = [
+        (kernel_abi::POLICY_CONFIG_MAP, 1),
+        (kernel_abi::RULE_STATES_MAP, rules * 2),
+        (kernel_abi::APP_CGROUP_INGRESS_MAP, rules),
+        (kernel_abi::APP_CGROUP_EGRESS_MAP, rules),
+        (kernel_abi::APP_COMM_INGRESS_MAP, rules),
+        (kernel_abi::APP_COMM_EGRESS_MAP, rules),
+        (kernel_abi::ENDPOINT_EXACT_INGRESS_MAP, rules),
+        (kernel_abi::ENDPOINT_EXACT_EGRESS_MAP, rules),
+        (kernel_abi::ENDPOINT_CIDR_INGRESS_MAP, rules),
+        (kernel_abi::ENDPOINT_CIDR_EGRESS_MAP, rules),
+    ];
+
+    for (name, capacity) in expected {
+        let map = ebpf
+            .take_map(name)
+            .with_context(|| format!("eBPF map {name:?} is missing"))?;
+        let actual = read_map_capacity(map, name)?;
+        if actual != capacity {
+            bail!(
+                "policy map {name:?} capacity mismatch: expected {capacity}, \
+                 eBPF object provides {actual}; rebuild the object"
+            );
+        }
+    }
+
+    Ok(())
+}
+
+/// Extracts the shared [`MapData`] handle from a taken map of any type.
+fn read_map_capacity(map: AyaMap, name: &str) -> Result<usize> {
+    let data = match map {
+        AyaMap::Array(data)
+        | AyaMap::ArrayOfMaps(data)
+        | AyaMap::BloomFilter(data)
+        | AyaMap::CgroupArray(data)
+        | AyaMap::CgroupStorage(data)
+        | AyaMap::CgrpStorage(data)
+        | AyaMap::CpuMap(data)
+        | AyaMap::DevMap(data)
+        | AyaMap::DevMapHash(data)
+        | AyaMap::HashMap(data)
+        | AyaMap::HashOfMaps(data)
+        | AyaMap::InodeStorage(data)
+        | AyaMap::LpmTrie(data)
+        | AyaMap::LruHashMap(data)
+        | AyaMap::PerCpuArray(data)
+        | AyaMap::PerCpuCgroupStorage(data)
+        | AyaMap::PerCpuHashMap(data)
+        | AyaMap::PerCpuLruHashMap(data)
+        | AyaMap::PerfEventArray(data)
+        | AyaMap::ProgramArray(data)
+        | AyaMap::Queue(data)
+        | AyaMap::ReusePortSockArray(data)
+        | AyaMap::RingBuf(data)
+        | AyaMap::SockHash(data)
+        | AyaMap::SockMap(data)
+        | AyaMap::SkStorage(data)
+        | AyaMap::Stack(data)
+        | AyaMap::StackTraceMap(data)
+        | AyaMap::Unsupported(data)
+        | AyaMap::XskMap(data) => data,
+    };
+    Ok(data
+        .info()
+        .with_context(|| format!("read {name:?} map info"))?
+        .max_entries() as usize)
 }
 
 fn take_flow_map(ebpf: &mut Ebpf) -> Result<PerCpuHashMap<MapData, PodFlowKey, PodFlowValue>> {

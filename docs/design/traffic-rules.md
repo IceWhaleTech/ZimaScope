@@ -121,6 +121,7 @@ pub struct BucketKey {
 #[repr(C)]
 pub struct RuleState {
     pub lock: bpf_spin_lock,
+    pub reserved: u32,
     pub rate_bytes_per_s: u64,
     pub burst_bytes: u64,
     pub tokens: u64,
@@ -139,13 +140,6 @@ pub struct EndpointMatchKey {
     pub reserved: [u8; 6],
 }
 
-/// LPM trie key for IPv4 CIDR rules.
-#[repr(C)]
-pub struct CidrKey {
-    pub prefix_len: u32,
-    pub addr: [u8; 4],
-}
-
 /// Single-entry fast-path configuration.
 #[repr(C)]
 pub struct PolicyConfig {
@@ -156,6 +150,9 @@ pub struct PolicyConfig {
     pub revision: u32,
 }
 ```
+
+CIDR rules key the LPM trie with its packed `{ prefix_len: u32, addr: [u8; 4] }`
+layout instead of a named struct.
 
 `RuleState` is the only map value that needs BTF: the kernel requires BTF
 description for `bpf_spin_lock` in a map value, so the bucket map is declared

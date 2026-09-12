@@ -1,17 +1,17 @@
 //! TC ingress and egress entry points.
 //!
-//! Every path returns `TC_ACT_UNSPEC`: ZimaScope observes traffic and never
-//! drops, delays or modifies a packet. Under tcx multiprog a program that
-//! returns `TC_ACT_OK` also stops the chain, so `TC_ACT_UNSPEC` is what lets
-//! other classifiers attached to the same interface still run; when ZimaScope
-//! is last the kernel treats it as pass.
+//! Every path passes the packet with `TC_ACT_UNSPEC` unless a Traffic Rule
+//! drops it with `TC_ACT_SHOT`. Under tcx multiprog a program that returns
+//! `TC_ACT_OK` also stops the chain, so `TC_ACT_UNSPEC` is what lets other
+//! classifiers attached to the same interface still run; when ZimaScope is
+//! last the kernel treats it as pass.
 //!
 //! The packet path never parses domain evidence. For candidate packets it
 //! peeks at constant offsets and copies a bounded L4 payload sample into a
 //! ring buffer; DNS, TLS SNI and HTTP Host are parsed in user space.
 
 use aya_ebpf::{
-    bindings::{BPF_ANY, TC_ACT_UNSPEC},
+    bindings::{BPF_ANY, TC_ACT_SHOT, TC_ACT_UNSPEC},
     cty::c_void,
     helpers::{bpf_ktime_get_ns, bpf_skb_load_bytes},
     macros::classifier,
@@ -26,7 +26,10 @@ use zimascope_ebpf::{
     parse::{PacketCursor, ParseResult, ParsedFlow, parse},
 };
 
-use crate::maps::{DOMAIN_EVENTS, FLOW_MAP, KERNEL_STATS, SERVICE_EVENTS};
+use crate::{
+    maps::{DOMAIN_EVENTS, FLOW_MAP, KERNEL_STATS, SERVICE_EVENTS},
+    policy::{self, Verdict},
+};
 
 #[classifier]
 pub fn tc_ingress_v1(ctx: TcContext) -> i32 {
@@ -50,29 +53,26 @@ fn process(ctx: &TcContext, direction: u8) -> i32 {
             let observed_mono_ns = unsafe { bpf_ktime_get_ns() };
             let packet_len = ctx.len() as u64;
             let ifindex = unsafe { (*ctx.skb.skb).ifindex };
+            record_seen_and_parsed();
+
+            if policy::evaluate(&flow, direction, packet_len) == Verdict::Drop {
+                record_policy_drop(packet_len);
+                return TC_ACT_SHOT as i32;
+            }
+
             let key = flow_key(&flow, direction, ifindex);
             let recorded = update_flow(&ctx, &key, &flow, observed_mono_ns, packet_len);
 
             if recorded {
                 sample_domains(ctx, &flow, direction, ifindex, observed_mono_ns);
-            }
-
-            if let Some(stats) = KERNEL_STATS.get_ptr_mut(0) {
-                let stats = unsafe { &mut *stats };
-                stats.packets_seen = stats.packets_seen.saturating_add(1);
-                stats.packets_parsed = stats.packets_parsed.saturating_add(1);
-                if !recorded {
-                    stats.map_update_failures = stats.map_update_failures.saturating_add(1);
-                }
+            } else {
+                record_map_update_failure();
             }
         }
         result @ (ParseResult::Skipped | ParseResult::Truncated | ParseResult::Invalid) => {
-            if let Some(stats) = KERNEL_STATS.get_ptr_mut(0) {
-                let stats = unsafe { &mut *stats };
-                stats.packets_seen = stats.packets_seen.saturating_add(1);
-                if result.is_failure() {
-                    stats.parse_failures = stats.parse_failures.saturating_add(1);
-                }
+            record_seen();
+            if result.is_failure() {
+                record_parse_failure();
             }
         }
     }
@@ -353,6 +353,48 @@ fn record_service_dropped() {
     if let Some(stats) = KERNEL_STATS.get_ptr_mut(0) {
         let stats = unsafe { &mut *stats };
         stats.service_events_dropped = stats.service_events_dropped.saturating_add(1);
+    }
+}
+
+#[inline(always)]
+fn record_seen() {
+    if let Some(stats) = KERNEL_STATS.get_ptr_mut(0) {
+        let stats = unsafe { &mut *stats };
+        stats.packets_seen = stats.packets_seen.saturating_add(1);
+    }
+}
+
+#[inline(always)]
+fn record_seen_and_parsed() {
+    if let Some(stats) = KERNEL_STATS.get_ptr_mut(0) {
+        let stats = unsafe { &mut *stats };
+        stats.packets_seen = stats.packets_seen.saturating_add(1);
+        stats.packets_parsed = stats.packets_parsed.saturating_add(1);
+    }
+}
+
+#[inline(always)]
+fn record_parse_failure() {
+    if let Some(stats) = KERNEL_STATS.get_ptr_mut(0) {
+        let stats = unsafe { &mut *stats };
+        stats.parse_failures = stats.parse_failures.saturating_add(1);
+    }
+}
+
+#[inline(always)]
+fn record_map_update_failure() {
+    if let Some(stats) = KERNEL_STATS.get_ptr_mut(0) {
+        let stats = unsafe { &mut *stats };
+        stats.map_update_failures = stats.map_update_failures.saturating_add(1);
+    }
+}
+
+#[inline(always)]
+fn record_policy_drop(packet_len: u64) {
+    if let Some(stats) = KERNEL_STATS.get_ptr_mut(0) {
+        let stats = unsafe { &mut *stats };
+        stats.policy_dropped_packets = stats.policy_dropped_packets.saturating_add(1);
+        stats.policy_dropped_bytes = stats.policy_dropped_bytes.saturating_add(packet_len);
     }
 }
 

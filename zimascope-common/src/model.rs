@@ -225,6 +225,9 @@ pub struct KernelCounters {
     pub service_events_dropped: u64,
     pub owner_events_inserted: u64,
     pub owner_events_dropped: u64,
+    pub policy_dropped_packets: u64,
+    pub policy_dropped_bytes: u64,
+    pub policy_missing_state: u64,
 }
 
 /// A known interval in which ZimaScope could not observe complete metadata.

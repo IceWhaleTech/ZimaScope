@@ -97,6 +97,9 @@ impl HealthTracker {
             service_events_dropped: stats.service_events_dropped,
             owner_events_inserted: stats.owner_events_inserted,
             owner_events_dropped: stats.owner_events_dropped,
+            policy_dropped_packets: stats.policy_dropped_packets,
+            policy_dropped_bytes: stats.policy_dropped_bytes,
+            policy_missing_state: stats.policy_missing_state,
         };
 
         let delta = if self.kernel_seen && is_monotonic(self.last_kernel, current) {
@@ -119,6 +122,12 @@ impl HealthTracker {
                     - self.last_kernel.owner_events_inserted,
                 owner_events_dropped: current.owner_events_dropped
                     - self.last_kernel.owner_events_dropped,
+                policy_dropped_packets: current.policy_dropped_packets
+                    - self.last_kernel.policy_dropped_packets,
+                policy_dropped_bytes: current.policy_dropped_bytes
+                    - self.last_kernel.policy_dropped_bytes,
+                policy_missing_state: current.policy_missing_state
+                    - self.last_kernel.policy_missing_state,
             }
         } else {
             current
@@ -165,4 +174,7 @@ fn is_monotonic(previous: KernelCounters, current: KernelCounters) -> bool {
         && current.service_events_dropped >= previous.service_events_dropped
         && current.owner_events_inserted >= previous.owner_events_inserted
         && current.owner_events_dropped >= previous.owner_events_dropped
+        && current.policy_dropped_packets >= previous.policy_dropped_packets
+        && current.policy_dropped_bytes >= previous.policy_dropped_bytes
+        && current.policy_missing_state >= previous.policy_missing_state
 }
