@@ -227,6 +227,13 @@
   [data-slot="table-body"] > tr:nth-child(odd):not(:only-child) {
     background-color: color-mix(in srgb, var(--muted) 48%, transparent);
   }
+
+  /* Keep rows mounted so scrollbar-thumb dragging can never outrun React.
+     The browser may still skip layout and paint work for off-screen rows. */
+  .explorer-table-body > tr {
+    content-visibility: auto;
+    contain-intrinsic-block-size: 50px;
+  }
 }
 
 /* ---------- Accessibility equivalents ------------------------------------- */

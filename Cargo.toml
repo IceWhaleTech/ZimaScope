@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["xtask", "zimascope-agent", "zimascope-common", "zimascope-ebpf"]
+members = ["xtask", "zimascoped", "zimascope-common", "zimascope-ebpf"]
 
 [workspace.package]
 version = "0.2.1"

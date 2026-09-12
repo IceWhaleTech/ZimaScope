@@ -298,7 +298,7 @@ impl FingerprintLibrary {
                 Ok(library) => library,
                 Err(error) => {
                     eprintln!(
-                        "zimascope-agent: ignoring invalid fingerprints at {}: {error}",
+                        "zimascoped: ignoring invalid fingerprints at {}: {error}",
                         path.display()
                     );
                     Self::default_library()
@@ -307,7 +307,7 @@ impl FingerprintLibrary {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Self::default_library(),
             Err(error) => {
                 eprintln!(
-                    "zimascope-agent: cannot read fingerprints at {}: {error}",
+                    "zimascoped: cannot read fingerprints at {}: {error}",
                     path.display()
                 );
                 Self::default_library()

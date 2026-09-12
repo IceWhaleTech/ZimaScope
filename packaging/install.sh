@@ -5,12 +5,13 @@
 #
 # Usage: sudo packaging/install.sh <release-dir>
 #   <release-dir> must contain:
-#     bin/zimascope-agent
+#     bin/zimascoped
 #     web/index.html ...
 set -euo pipefail
 
 INSTALL_ROOT="/opt/zimascope"
-SERVICE_NAME="zimascope-agent.service"
+SERVICE_NAME="zimascoped.service"
+LEGACY_AGENT_SERVICE="zimascope-agent.service"
 LEGACY_UI_SERVICE="zimascope-ui.service"
 
 if [[ ${EUID} -ne 0 ]]; then
@@ -19,8 +20,8 @@ if [[ ${EUID} -ne 0 ]]; then
 fi
 
 RELEASE_DIR=${1:-}
-if [[ -z ${RELEASE_DIR} || ! -x "${RELEASE_DIR}/bin/zimascope-agent" ]]; then
-  echo "install.sh: usage: install.sh <release-dir> (needs bin/zimascope-agent)" >&2
+if [[ -z ${RELEASE_DIR} || ! -x "${RELEASE_DIR}/bin/zimascoped" ]]; then
+  echo "install.sh: usage: install.sh <release-dir> (needs bin/zimascoped)" >&2
   exit 1
 fi
 if [[ ! -f "${RELEASE_DIR}/web/index.html" ]]; then
@@ -37,8 +38,8 @@ fi
 
 echo "==> installing agent to ${INSTALL_ROOT}/bin"
 install -d -m 0755 "${INSTALL_ROOT}/bin"
-install -m 0755 -o root -g root "${RELEASE_DIR}/bin/zimascope-agent" \
-  "${INSTALL_ROOT}/bin/zimascope-agent"
+install -m 0755 -o root -g root "${RELEASE_DIR}/bin/zimascoped" \
+  "${INSTALL_ROOT}/bin/zimascoped"
 
 echo "==> installing frontend to ${INSTALL_ROOT}/web"
 rm -rf "${INSTALL_ROOT}/web"
@@ -49,6 +50,12 @@ chown -R root:root "${INSTALL_ROOT}/web"
 echo "==> installing ${SERVICE_NAME}"
 install -m 0644 -o root -g root "${UNIT_SRC}" "/etc/systemd/system/${SERVICE_NAME}"
 install -d -m 0755 /var/lib/zimascope
+
+# Retire the pre-rename daemon before starting zimascoped, otherwise both
+# units can compete for the same sockets and HTTP port during upgrades.
+echo "==> retiring ${LEGACY_AGENT_SERVICE}"
+systemctl disable --now "${LEGACY_AGENT_SERVICE}" >/dev/null 2>&1 || true
+rm -f "/etc/systemd/system/${LEGACY_AGENT_SERVICE}" "${INSTALL_ROOT}/bin/zimascope-agent"
 
 # Older releases served the SPA with `vite preview` on :8080; the agent owns
 # that port now, so the legacy unit must be stopped before the restart.

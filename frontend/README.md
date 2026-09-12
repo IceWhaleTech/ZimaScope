@@ -52,7 +52,7 @@ detail panel on load. Press `/` anywhere to jump to Flow search.
 ```sh
 # terminal 1: agent with a dev-only local TCP listener (never set in production)
 ZIMASCOPE_API_TCP=127.0.0.1:8787 ZIMASCOPE_DATABASE=/tmp/zimascope.db \
-  ./target/debug/zimascope-agent
+  ./target/debug/zimascoped
 
 # terminal 2
 npm install

@@ -56,7 +56,6 @@ import {
 import { useDetails } from "@/hooks/use-details";
 import { useHideLan } from "@/hooks/use-hide-lan";
 import { useSetTopbar } from "@/hooks/use-topbar";
-import { TABLE_ROW_HEIGHT, useWindowedRows } from "@/hooks/use-windowed-rows";
 import { setStreamQuery, subscribeTicks } from "@/store";
 import { excludeScopeParam } from "@/lib/filters";
 import { downloadExport } from "@/lib/download";
@@ -253,16 +252,6 @@ function SortableHead({
         />
       </button>
     </TableHead>
-  );
-}
-
-/** Keeps the scroll height of the windowed table body without painting rows. */
-function SpacerRow({ height, columns }: { height: number; columns: number }) {
-  if (height <= 0) return null;
-  return (
-    <tr aria-hidden="true">
-      <td colSpan={columns} style={{ height, padding: 0, border: 0, lineHeight: 0 }} />
-    </tr>
   );
 }
 
@@ -501,18 +490,6 @@ export function ExplorerView() {
     () => flattenConnectionGroups(connectionGroups, expandedGroups),
     [connectionGroups, expandedGroups],
   );
-  const rowCount =
-    displayedScope === "flows"
-      ? view === "connections"
-        ? flatConnections.length
-        : items.length
-      : displayedScope === "endpoints"
-        ? endpointItems.length
-        : displayedScope === "domains"
-          ? domainItems.length
-          : applicationItems.length;
-  const rowWindow = useWindowedRows(bodyRef, rowCount);
-
   // The live stream is retargeted to the same filters the Flow list uses, so
   // ticks only carry rows this view can show.
   useEffect(() => {
@@ -812,7 +789,7 @@ export function ExplorerView() {
       if (view === "connections") {
         return (
           <ConnectionRows
-            items={flatConnections.slice(rowWindow.start, rowWindow.end)}
+            items={flatConnections}
             onToggle={(key) =>
               setExpandedGroups((previous) => {
                 const next = new Set(previous);
@@ -825,35 +802,35 @@ export function ExplorerView() {
           />
         );
       }
-      return items
-        .slice(rowWindow.start, rowWindow.end)
-        .map((flow) => (
-          <FlowRow key={flow.id} flow={flow} selected={flow.id === selectedId} onOpen={openFlow} />
-        ));
+      return items.map((flow) => (
+        <FlowRow key={flow.id} flow={flow} selected={flow.id === selectedId} onOpen={openFlow} />
+      ));
     }
     if (active === "endpoints") {
-      return endpointItems
-        .slice(rowWindow.start, rowWindow.end)
-        .map((endpoint) => (
-          <EndpointRow key={endpoint.address} endpoint={endpoint} onOpen={(address) => open({ kind: "endpoint", address })} />
-        ));
+      return endpointItems.map((endpoint) => (
+        <EndpointRow
+          key={endpoint.address}
+          endpoint={endpoint}
+          onOpen={(address) => open({ kind: "endpoint", address })}
+        />
+      ));
     }
     if (active === "applications") {
-      return applicationItems
-        .slice(rowWindow.start, rowWindow.end)
-        .map((application) => (
-          <ApplicationRow
-            key={application.id}
-            application={application}
-            onOpen={(id) => open({ kind: "application", id })}
-          />
-        ));
-    }
-    return domainItems
-      .slice(rowWindow.start, rowWindow.end)
-      .map((domain) => (
-        <DomainRow key={domain.domain} domain={domain} onOpen={(name) => open({ kind: "domain", name })} />
+      return applicationItems.map((application) => (
+        <ApplicationRow
+          key={application.id}
+          application={application}
+          onOpen={(id) => open({ kind: "application", id })}
+        />
       ));
+    }
+    return domainItems.map((domain) => (
+      <DomainRow
+        key={domain.domain}
+        domain={domain}
+        onOpen={(name) => open({ kind: "domain", name })}
+      />
+    ));
   };
 
   // Body content follows the *displayed* lens so rows fade in place — only
@@ -878,16 +855,7 @@ export function ExplorerView() {
         : displayedScope === "domains"
           ? domainsQuery
           : applicationsQuery;
-  const bodyRows = (
-    <>
-      <SpacerRow height={rowWindow.start * TABLE_ROW_HEIGHT} columns={displayedColumns.length} />
-      {renderRows(displayedScope)}
-      <SpacerRow
-        height={(rowCount - rowWindow.end) * TABLE_ROW_HEIGHT}
-        columns={displayedColumns.length}
-      />
-    </>
-  );
+  const bodyRows = renderRows(displayedScope);
   const bodyEmpty =
     displayedScope === "flows"
       ? view === "connections"
@@ -1111,7 +1079,7 @@ export function ExplorerView() {
           <motion.tbody
             ref={bodyRef}
             data-slot="table-body"
-            className="[&_tr:last-child]:border-0"
+            className="explorer-table-body [&_tr:last-child]:border-0"
             initial={false}
             animate={phase === "out" ? { opacity: 0, y: -4 } : { opacity: 1, y: 0 }}
             transition={{ duration: phase === "out" ? 0.13 : 0.2, ease: EASE }}

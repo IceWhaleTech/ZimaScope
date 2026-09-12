@@ -402,7 +402,7 @@ ZimaOS backend/UI
 zimascope/
 ├── zimascope-ebpf/       # TC hooks, parsers, maps
 ├── zimascope-common/     # shared POD types
-├── zimascope-agent/      # loader, aggregation, enrichment, storage, API
+├── zimascoped/          # loader, aggregation, enrichment, storage, API
 ├── zimascope-ui/         # ZimaOS UI integration
 ├── xtask/               # build and packaging
 └── tests/               # netns/veth integration and fixtures

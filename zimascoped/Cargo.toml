@@ -1,16 +1,16 @@
 [package]
-name = "zimascope-agent"
+name = "zimascoped"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
 [lib]
-name = "zimascope_agent"
+name = "zimascoped"
 path = "src/lib.rs"
 
 [[bin]]
-name = "zimascope-agent"
+name = "zimascoped"
 path = "src/main.rs"
 
 [dependencies]

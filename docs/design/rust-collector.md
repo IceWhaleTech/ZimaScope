@@ -14,7 +14,7 @@ zimascope-ebpf
   parse.rs            bounded Ethernet/VLAN/IPv4/TCP/UDP parsing
   maps.rs             flow, domain-event, and statistics maps
 
-zimascope-agent
+zimascoped
   collector/mod.rs    external Collector interface
   collector/aya.rs    production Aya adapter
   collector/tracker.rs

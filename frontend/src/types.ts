@@ -1,4 +1,4 @@
-// Wire types mirroring the local API DTOs (zimascope-agent/src/api/dto.rs).
+// Wire types mirroring the local API DTOs (zimascoped/src/api/dto.rs).
 
 export type Direction = "inbound" | "outbound";
 export type Protocol = "tcp" | "udp";

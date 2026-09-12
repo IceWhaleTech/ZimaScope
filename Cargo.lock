@@ -1139,7 +1139,23 @@ dependencies = [
 ]
 
 [[package]]
-name = "zimascope-agent"
+name = "zimascope-common"
+version = "0.2.1"
+dependencies = [
+ "serde",
+]
+
+[[package]]
+name = "zimascope-ebpf"
+version = "0.2.1"
+dependencies = [
+ "aya-ebpf",
+ "network-types",
+ "zimascope-common",
+]
+
+[[package]]
+name = "zimascoped"
 version = "0.2.1"
 dependencies = [
  "anyhow",
@@ -1158,22 +1174,6 @@ dependencies = [
  "tower-http",
  "zimascope-common",
  "zimascope-ebpf",
-]
-
-[[package]]
-name = "zimascope-common"
-version = "0.2.1"
-dependencies = [
- "serde",
-]
-
-[[package]]
-name = "zimascope-ebpf"
-version = "0.2.1"
-dependencies = [
- "aya-ebpf",
- "network-types",
- "zimascope-common",
 ]
 
 [[package]]

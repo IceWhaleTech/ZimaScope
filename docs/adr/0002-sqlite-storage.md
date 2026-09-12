@@ -15,7 +15,7 @@ ZimaScope will persist and query Flow history with SQLite accessed through `rusq
 
 ## Consequences
 
-- `zimascope-agent/src/api/db.rs` owns schema creation, migrations (`PRAGMA user_version`), ingestion, and queries. The HTTP contract does not depend on the storage engine.
+- `zimascoped/src/api/db.rs` owns schema creation, migrations (`PRAGMA user_version`), ingestion, and queries. The HTTP contract does not depend on the storage engine.
 - Writes are grouped in one transaction per collection interval; reads use the same single connection behind a mutex. Queries are local and indexed; any future long-running read must move off the request path.
 - Pagination uses `limit` + `offset` with a deterministic tie-breaker (`id` or address). Cursor pagination was dropped as unnecessary for bounded, local data and to keep one pagination implementation.
 - Flows keep their Associated Domains as a serialized JSON array and are queried with SQLite JSON functions (`json_each`, `instr`). This avoids a join table while keeping filters exact.

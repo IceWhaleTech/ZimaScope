@@ -4,7 +4,7 @@ use std::{
     sync::{Arc, RwLock},
 };
 
-use zimascope_agent::{
+use zimascoped::{
     Collector, CollectorConfig, FingerprintLibrary,
     api::{self, ApiConfig, ApiState},
 };
@@ -63,12 +63,12 @@ async fn main() {
             let state = state.clone();
             servers.push(tokio::spawn(async move {
                 if let Err(error) = api::serve_unix(listener, state).await {
-                    eprintln!("zimascope-agent: api server stopped: {error}");
+                    eprintln!("zimascoped: api server stopped: {error}");
                 }
             }));
         }
         Err(error) => eprintln!(
-            "zimascope-agent: cannot serve API on {}: {error}",
+            "zimascoped: cannot serve API on {}: {error}",
             socket_path.display()
         ),
     }
@@ -77,14 +77,14 @@ async fn main() {
         match tokio::net::TcpListener::bind(address).await {
             Ok(listener) => {
                 let state = state.clone();
-                eprintln!("zimascope-agent: dev API listening on http://{address}");
+                eprintln!("zimascoped: dev API listening on http://{address}");
                 servers.push(tokio::spawn(async move {
                     if let Err(error) = axum::serve(listener, api::router(state)).await {
-                        eprintln!("zimascope-agent: dev API server stopped: {error}");
+                        eprintln!("zimascoped: dev API server stopped: {error}");
                     }
                 }));
             }
-            Err(error) => eprintln!("zimascope-agent: cannot serve dev API on {address}: {error}"),
+            Err(error) => eprintln!("zimascoped: cannot serve dev API on {address}: {error}"),
         }
     }
 
@@ -93,26 +93,26 @@ async fn main() {
             Ok(listener) => {
                 let router = match std::env::var_os(UI_ENV).map(PathBuf::from) {
                     Some(ui_dir) if ui_dir.is_dir() => {
-                        eprintln!("zimascope-agent: serving UI from {}", ui_dir.display());
+                        eprintln!("zimascoped: serving UI from {}", ui_dir.display());
                         api::router_with_ui(state.clone(), &ui_dir)
                     }
                     Some(ui_dir) => {
                         eprintln!(
-                            "zimascope-agent: UI directory {} is missing; serving API only",
+                            "zimascoped: UI directory {} is missing; serving API only",
                             ui_dir.display()
                         );
                         api::router(state.clone())
                     }
                     None => api::router(state.clone()),
                 };
-                eprintln!("zimascope-agent: http server listening on http://{address}");
+                eprintln!("zimascoped: http server listening on http://{address}");
                 servers.push(tokio::spawn(async move {
                     if let Err(error) = axum::serve(listener, router).await {
-                        eprintln!("zimascope-agent: http server stopped: {error}");
+                        eprintln!("zimascoped: http server stopped: {error}");
                     }
                 }));
             }
-            Err(error) => eprintln!("zimascope-agent: cannot serve http on {address}: {error}"),
+            Err(error) => eprintln!("zimascoped: cannot serve http on {address}: {error}"),
         }
     }
 
@@ -127,7 +127,7 @@ async fn main() {
             // Keep the local API alive so the UI can explain why collection is
             // unavailable instead of crash-looping (PRD 8.1).
             state.set_collector_error(format!("{error:#}"));
-            eprintln!("zimascope-agent: collection unavailable: {error:#}");
+            eprintln!("zimascoped: collection unavailable: {error:#}");
             wait_for_shutdown().await;
             shutdown_servers(servers, &socket_path);
             return;
@@ -142,7 +142,7 @@ async fn main() {
             },
             result = tokio::signal::ctrl_c() => {
                 if let Err(error) = result {
-                    eprintln!("zimascope-agent: wait for shutdown signal: {error}");
+                    eprintln!("zimascoped: wait for shutdown signal: {error}");
                 }
                 break;
             }
@@ -150,7 +150,7 @@ async fn main() {
     }
 
     if let Err(error) = collector.shutdown().await {
-        eprintln!("zimascope-agent: shutdown failed: {error:#}");
+        eprintln!("zimascoped: shutdown failed: {error:#}");
     }
     shutdown_servers(servers, &socket_path);
 }
@@ -168,7 +168,7 @@ fn env_address(name: &str) -> Option<SocketAddr> {
     match value.parse() {
         Ok(address) => Some(address),
         Err(error) => {
-            eprintln!("zimascope-agent: invalid {name} {value:?}: {error}");
+            eprintln!("zimascoped: invalid {name} {value:?}: {error}");
             None
         }
     }
@@ -176,7 +176,7 @@ fn env_address(name: &str) -> Option<SocketAddr> {
 
 async fn wait_for_shutdown() {
     if let Err(error) = tokio::signal::ctrl_c().await {
-        eprintln!("zimascope-agent: wait for shutdown signal: {error}");
+        eprintln!("zimascoped: wait for shutdown signal: {error}");
     }
 }
 

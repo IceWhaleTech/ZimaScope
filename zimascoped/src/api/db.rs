@@ -440,7 +440,7 @@ impl Db {
         match self.try_ingest(batch, settings, proxy) {
             Ok(event) => event,
             Err(error) => {
-                eprintln!("zimascope-agent: storage ingest failed: {error}");
+                eprintln!("zimascoped: storage ingest failed: {error}");
                 self.database_error = Some(error.to_string());
                 StreamEvent {
                     sequence,

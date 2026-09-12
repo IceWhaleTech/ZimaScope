@@ -90,7 +90,7 @@ fn package(args: Vec<String>) -> Result<()> {
     println!("building the release agent (embedded eBPF object)");
     let status = Command::new("cargo")
         .current_dir(&root)
-        .args(["build", "--release", "--package", "zimascope-agent"])
+        .args(["build", "--release", "--package", "zimascoped"])
         .status()
         .context("run cargo build for the agent")?;
     if !status.success() {
@@ -131,11 +131,11 @@ fn package(args: Vec<String>) -> Result<()> {
     }
     fs::create_dir_all(release_dir.join("bin")).context("create release bin/")?;
 
-    let agent = root.join("target/release/zimascope-agent");
-    fs::copy(&agent, release_dir.join("bin/zimascope-agent"))
+    let agent = root.join("target/release/zimascoped");
+    fs::copy(&agent, release_dir.join("bin/zimascoped"))
         .with_context(|| format!("copy {}", agent.display()))?;
     copy_tree(&web, &release_dir.join("web"))?;
-    for (file, mode) in [("zimascope-agent.service", 0o644), ("install.sh", 0o755)] {
+    for (file, mode) in [("zimascoped.service", 0o644), ("install.sh", 0o755)] {
         let source = root.join("packaging").join(file);
         let target = release_dir.join(file);
         fs::copy(&source, &target).with_context(|| format!("copy {}", source.display()))?;
