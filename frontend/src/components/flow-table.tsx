@@ -8,10 +8,10 @@
  */
 
 import { memo } from "react";
-import { ArrowDown, ArrowUp, Boxes, Terminal } from "lucide-react";
+import { Boxes, Terminal } from "lucide-react";
 import { TableCell, TableRow } from "@/components/ui/table";
-import { DirectionBadge, EvidenceChip, FlowStateDot } from "@/components/flow-bits";
-import { flagEmoji, formatBytes, formatDuration, formatNumber, relativeTime } from "@/lib/format";
+import { DirectionBadge, EvidenceChip, FlowStateDot, TrafficValue } from "@/components/flow-bits";
+import { flagEmoji, formatDuration, relativeTime } from "@/lib/format";
 import { cn } from "@/lib/utils";
 import type { Flow } from "@/types";
 
@@ -97,20 +97,11 @@ export const FlowRow = memo(function FlowRow({
         )}
       </TableCell>
       <TableCell>
-        <span
-          className={cn(
-            "inline-flex items-center gap-1 font-medium tabular-nums",
-            flow.direction === "inbound" ? "text-series-inbound" : "text-series-outbound",
-          )}
-          title={`${formatNumber(flow.packets)} packets ${flow.direction === "inbound" ? "inbound (entering ZimaOS)" : "outbound (leaving ZimaOS)"}`}
-        >
-          {flow.direction === "inbound" ? (
-            <ArrowDown className="size-3" strokeWidth={2.2} />
-          ) : (
-            <ArrowUp className="size-3" strokeWidth={2.2} />
-          )}
-          {formatBytes(flow.bytes)}
-        </span>
+        <TrafficValue
+          direction={flow.direction}
+          counters={{ packets: flow.packets, bytes: flow.bytes }}
+          rateBps={flow.direction === "inbound" ? flow.inbound_bps : flow.outbound_bps}
+        />
       </TableCell>
       <TableCell>
         <span className="whitespace-nowrap" title={formatDuration(flow.duration_ms)}>

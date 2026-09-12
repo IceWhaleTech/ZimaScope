@@ -73,6 +73,9 @@ export interface Flow {
   interface: string | null;
   packets: number;
   bytes: number;
+  /** Average rate over the most recent collection interval. */
+  inbound_bps: number;
+  outbound_bps: number;
   first_seen: number;
   last_seen: number;
   duration_ms: number;
@@ -101,6 +104,9 @@ export interface Connection {
   interface: string | null;
   packets: number;
   bytes: number;
+  /** Average rate over the most recent collection interval. */
+  inbound_bps: number;
+  outbound_bps: number;
   /** Directional counters relative to the Device Boundary. */
   traffic: DirectionTotals;
   first_seen: number;
@@ -118,6 +124,9 @@ export interface EndpointSummary {
   organization: string | null;
   packets: number;
   bytes: number;
+  /** Average rate over the most recent collection interval. */
+  inbound_bps: number;
+  outbound_bps: number;
   traffic: DirectionTotals;
   flow_count: number;
   first_seen: number;
@@ -157,6 +166,9 @@ export interface ApplicationSummary {
   container_id: string | null;
   packets: number;
   bytes: number;
+  /** Average rate over the most recent collection interval. */
+  inbound_bps: number;
+  outbound_bps: number;
   traffic: DirectionTotals;
   flow_count: number;
   first_seen: number;
@@ -173,6 +185,9 @@ export interface ApplicationDetail {
   container_id: string | null;
   packets: number;
   bytes: number;
+  /** Average rate over the most recent collection interval. */
+  inbound_bps: number;
+  outbound_bps: number;
   traffic: DirectionTotals;
   flow_count: number;
   first_seen: number;
@@ -205,6 +220,9 @@ export interface DomainSummary {
   domain: string;
   packets: number;
   bytes: number;
+  /** Average rate over the most recent collection interval. */
+  inbound_bps: number;
+  outbound_bps: number;
   traffic: DirectionTotals;
   flow_count: number;
   first_seen: number;

@@ -1773,6 +1773,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn entities_report_interval_rates() {
+        let state = state();
+        let mut incoming = batch(
+            1,
+            vec![outbound(("93.184.216.34", 443), 40, 4_000, Duration::ZERO)],
+        );
+        incoming.flows[0].application = Some(ApplicationRef {
+            tgid: 4242,
+            uid: 1000,
+            cgroup_id: 0,
+            comm: "curl".into(),
+        });
+        incoming.domains = vec![observation(
+            "example.com",
+            "93.184.216.34",
+            DomainEvidence::TlsSni,
+            AssociationConfidence::Direct,
+        )];
+        state.ingest_batch(incoming);
+
+        // 4_000 bytes over a one-second interval is 32_000 bits per second.
+        let body = body_json(call(&state, get("/v1/flows")).await).await;
+        assert_eq!(body["items"][0]["outbound_bps"], 32_000);
+        assert_eq!(body["items"][0]["inbound_bps"], 0);
+
+        let body = body_json(call(&state, get("/v1/endpoints")).await).await;
+        assert_eq!(body["items"][0]["address"], "93.184.216.34");
+        assert_eq!(body["items"][0]["outbound_bps"], 32_000);
+        assert_eq!(body["items"][0]["inbound_bps"], 0);
+
+        let body = body_json(call(&state, get("/v1/domains")).await).await;
+        assert_eq!(body["items"][0]["domain"], "example.com");
+        assert_eq!(body["items"][0]["outbound_bps"], 32_000);
+
+        let body = body_json(call(&state, get("/v1/applications")).await).await;
+        assert_eq!(body["items"][0]["outbound_bps"], 32_000);
+        assert_eq!(body["items"][0]["inbound_bps"], 0);
+
+        let body = body_json(call(&state, get("/v1/connections")).await).await;
+        assert_eq!(body["items"][0]["outbound_bps"], 32_000);
+        assert_eq!(body["items"][0]["inbound_bps"], 0);
+
+        // Rates describe the latest interval only; idle intervals reset them.
+        state.ingest_batch(batch(2, Vec::new()));
+        let body = body_json(call(&state, get("/v1/flows")).await).await;
+        assert_eq!(body["items"][0]["outbound_bps"], 0);
+        let body = body_json(call(&state, get("/v1/endpoints")).await).await;
+        assert_eq!(body["items"][0]["outbound_bps"], 0);
+        let body = body_json(call(&state, get("/v1/domains")).await).await;
+        assert_eq!(body["items"][0]["outbound_bps"], 0);
+        let body = body_json(call(&state, get("/v1/applications")).await).await;
+        assert_eq!(body["items"][0]["outbound_bps"], 0);
+        let body = body_json(call(&state, get("/v1/connections")).await).await;
+        assert_eq!(body["items"][0]["outbound_bps"], 0);
+    }
+
+    #[tokio::test]
     async fn tick_carries_touched_application_summaries() {
         let state = state();
         let response = call(&state, get("/v1/stream")).await;
@@ -2596,6 +2653,7 @@ mod tests {
         assert!(frame.contains("9.9.9.9"), "frame: {frame}");
         assert!(!frame.contains("1.1.1.1"), "frame: {frame}");
         assert!(frame.contains("\"inbound_bps\":"), "frame: {frame}");
+        assert!(frame.contains("\"inbound_bps\":24000"), "frame: {frame}");
         assert!(frame.contains("\"health\":"), "frame: {frame}");
         assert!(frame.contains("\"remote_profile\":"), "frame: {frame}");
         assert!(frame.contains("\"scope\":\"public\""), "frame: {frame}");

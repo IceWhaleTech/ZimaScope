@@ -47,10 +47,18 @@ export const DomainRow = memo(function DomainRow({
         </span>
       </TableCell>
       <TableCell>
-        <TrafficValue direction="inbound" counters={domain.traffic.inbound} />
+        <TrafficValue
+          direction="inbound"
+          counters={domain.traffic.inbound}
+          rateBps={domain.inbound_bps}
+        />
       </TableCell>
       <TableCell>
-        <TrafficValue direction="outbound" counters={domain.traffic.outbound} />
+        <TrafficValue
+          direction="outbound"
+          counters={domain.traffic.outbound}
+          rateBps={domain.outbound_bps}
+        />
       </TableCell>
       <TableCell>
         <span className="whitespace-nowrap" title={`first seen ${relativeTime(domain.first_seen)}`}>

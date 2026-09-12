@@ -48,10 +48,18 @@ export const ApplicationRow = memo(function ApplicationRow({
         </span>
       </TableCell>
       <TableCell>
-        <TrafficValue direction="inbound" counters={application.traffic.inbound} />
+        <TrafficValue
+          direction="inbound"
+          counters={application.traffic.inbound}
+          rateBps={application.inbound_bps}
+        />
       </TableCell>
       <TableCell>
-        <TrafficValue direction="outbound" counters={application.traffic.outbound} />
+        <TrafficValue
+          direction="outbound"
+          counters={application.traffic.outbound}
+          rateBps={application.outbound_bps}
+        />
       </TableCell>
       <TableCell>
         <span className="tabular-nums text-muted-foreground">{application.flow_count}</span>

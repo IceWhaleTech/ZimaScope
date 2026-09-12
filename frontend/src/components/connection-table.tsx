@@ -123,6 +123,9 @@ export interface ConnectionGroup {
   connections: Connection[];
   bytes: number;
   packets: number;
+  /** Sum of the latest-interval rates of the group's connections. */
+  inbound_bps: number;
+  outbound_bps: number;
   traffic: DirectionTotals;
   first_seen: number;
   last_seen: number;
@@ -156,6 +159,8 @@ export function groupConnections(connections: Connection[], sort: string): Conne
         connections: [],
         bytes: 0,
         packets: 0,
+        inbound_bps: 0,
+        outbound_bps: 0,
         traffic: {
           inbound: { packets: 0, bytes: 0 },
           outbound: { packets: 0, bytes: 0 },
@@ -171,6 +176,8 @@ export function groupConnections(connections: Connection[], sort: string): Conne
     group.connections.push(connection);
     group.bytes += connection.bytes;
     group.packets += connection.packets;
+    group.inbound_bps += connection.inbound_bps;
+    group.outbound_bps += connection.outbound_bps;
     group.traffic.inbound.packets += connection.traffic.inbound.packets;
     group.traffic.inbound.bytes += connection.traffic.inbound.bytes;
     group.traffic.outbound.packets += connection.traffic.outbound.packets;
@@ -285,10 +292,18 @@ const ConnectionRow = memo(function ConnectionRow({
         <DomainCell domains={connection.domains} />
       </TableCell>
       <TableCell>
-        <TrafficValue direction="inbound" counters={connection.traffic.inbound} />
+        <TrafficValue
+          direction="inbound"
+          counters={connection.traffic.inbound}
+          rateBps={connection.inbound_bps}
+        />
       </TableCell>
       <TableCell>
-        <TrafficValue direction="outbound" counters={connection.traffic.outbound} />
+        <TrafficValue
+          direction="outbound"
+          counters={connection.traffic.outbound}
+          rateBps={connection.outbound_bps}
+        />
       </TableCell>
       <TableCell>
         <span className="whitespace-nowrap" title={`started ${relativeTime(connection.first_seen)}`}>
@@ -369,10 +384,18 @@ function GroupRow({
         {domainGroup ? <EvidenceCell domains={group.domains} /> : <DomainCell domains={group.domains} />}
       </TableCell>
       <TableCell>
-        <TrafficValue direction="inbound" counters={group.traffic.inbound} />
+        <TrafficValue
+          direction="inbound"
+          counters={group.traffic.inbound}
+          rateBps={group.inbound_bps}
+        />
       </TableCell>
       <TableCell>
-        <TrafficValue direction="outbound" counters={group.traffic.outbound} />
+        <TrafficValue
+          direction="outbound"
+          counters={group.traffic.outbound}
+          rateBps={group.outbound_bps}
+        />
       </TableCell>
       <TableCell>
         <span className="whitespace-nowrap" title={`first ${relativeTime(group.first_seen)}`}>
@@ -447,10 +470,18 @@ const ChildRow = memo(function ChildRow({
         <DomainCell domains={connection.domains} />
       </TableCell>
       <TableCell>
-        <TrafficValue direction="inbound" counters={connection.traffic.inbound} />
+        <TrafficValue
+          direction="inbound"
+          counters={connection.traffic.inbound}
+          rateBps={connection.inbound_bps}
+        />
       </TableCell>
       <TableCell>
-        <TrafficValue direction="outbound" counters={connection.traffic.outbound} />
+        <TrafficValue
+          direction="outbound"
+          counters={connection.traffic.outbound}
+          rateBps={connection.outbound_bps}
+        />
       </TableCell>
       <TableCell>
         <span className="whitespace-nowrap" title={`started ${relativeTime(connection.first_seen)}`}>

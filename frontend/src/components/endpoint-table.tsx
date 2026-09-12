@@ -48,10 +48,18 @@ export const EndpointRow = memo(function EndpointRow({
         </span>
       </TableCell>
       <TableCell>
-        <TrafficValue direction="inbound" counters={endpoint.traffic.inbound} />
+        <TrafficValue
+          direction="inbound"
+          counters={endpoint.traffic.inbound}
+          rateBps={endpoint.inbound_bps}
+        />
       </TableCell>
       <TableCell>
-        <TrafficValue direction="outbound" counters={endpoint.traffic.outbound} />
+        <TrafficValue
+          direction="outbound"
+          counters={endpoint.traffic.outbound}
+          rateBps={endpoint.outbound_bps}
+        />
       </TableCell>
       <TableCell>
         <span className="whitespace-nowrap" title={`first seen ${relativeTime(endpoint.first_seen)}`}>

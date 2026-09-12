@@ -5,7 +5,14 @@
 
 import { ArrowDown, ArrowDownLeft, ArrowUp, ArrowUpRight } from "lucide-react";
 import { cn } from "@/lib/utils";
-import { evidenceTitle, flagEmoji, formatBytes, formatNumber, scopeLabel } from "@/lib/format";
+import {
+  evidenceTitle,
+  flagEmoji,
+  formatBytes,
+  formatNumber,
+  formatRateText,
+  scopeLabel,
+} from "@/lib/format";
 import type { Confidence, Counters, Evidence, FlowState, Scope } from "@/types";
 
 export function StateBadge({ state }: { state: FlowState }) {
@@ -49,26 +56,38 @@ export function DirectionBadge({ direction }: { direction: string }) {
   );
 }
 
-/** One direction of an aggregate's traffic: arrow + bytes. */
+/**
+ * One direction of an aggregate's traffic: arrow + bytes with the current rate
+ * underneath. The rate line is always rendered so live updates do not change
+ * row height; a missing rate reads as zero.
+ */
 export function TrafficValue({
   direction,
   counters,
+  rateBps,
 }: {
   direction: "inbound" | "outbound";
   counters: Counters;
+  rateBps?: number;
 }) {
   const inbound = direction === "inbound";
   const Icon = inbound ? ArrowDown : ArrowUp;
+  const rate = rateBps ?? 0;
   return (
     <span
       className={cn(
-        "inline-flex items-center gap-1 font-medium tabular-nums whitespace-nowrap",
+        "inline-flex flex-col items-start gap-0.5 font-medium tabular-nums whitespace-nowrap",
         inbound ? "text-series-inbound" : "text-series-outbound",
       )}
-      title={`${formatNumber(counters.packets)} packets ${inbound ? "inbound (entering ZimaOS)" : "outbound (leaving ZimaOS)"}`}
+      title={`${formatNumber(counters.packets)} packets ${inbound ? "inbound (entering ZimaOS)" : "outbound (leaving ZimaOS)"} · ${formatRateText(rate)} over the last interval`}
     >
-      <Icon className="size-3" strokeWidth={2.2} />
-      {formatBytes(counters.bytes)}
+      <span className="inline-flex items-center gap-1">
+        <Icon className="size-3" strokeWidth={2.2} />
+        {formatBytes(counters.bytes)}
+      </span>
+      <span className="pl-4 text-2xs font-normal tabular-nums text-muted-foreground">
+        {formatRateText(rate)}
+      </span>
     </span>
   );
 }

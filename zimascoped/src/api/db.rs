@@ -262,10 +262,20 @@ impl Default for ApiConfig {
     }
 }
 
+/// Average rates of one entity over the most recent collection interval.
 #[derive(Clone, Copy, Debug, Default)]
-struct Rates {
+struct EntityRates {
     inbound_bps: u64,
     outbound_bps: u64,
+}
+
+impl EntityRates {
+    fn add(&mut self, direction: FlowDirection, bps: u64) {
+        match direction {
+            FlowDirection::Inbound => self.inbound_bps = self.inbound_bps.saturating_add(bps),
+            FlowDirection::Outbound => self.outbound_bps = self.outbound_bps.saturating_add(bps),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -432,7 +442,15 @@ pub(crate) struct Db {
     last_batch_at: Option<SystemTime>,
     last_interval: Duration,
     batch_sequence: u64,
-    rates: Rates,
+    rates: EntityRates,
+    /// Rates of the most recent collection interval, keyed per entity. They
+    /// are live read-model state, not persisted history: a row without traffic
+    /// in the interval reads zero.
+    rates_by_flow: HashMap<u64, EntityRates>,
+    rates_by_connection: HashMap<String, EntityRates>,
+    rates_by_endpoint: HashMap<String, EntityRates>,
+    rates_by_domain: HashMap<String, EntityRates>,
+    rates_by_application: HashMap<String, EntityRates>,
     audit: VecDeque<AuditEntry>,
     export_counter: u64,
     export_ttl: Duration,
@@ -502,7 +520,12 @@ impl Db {
             last_batch_at: None,
             last_interval: Duration::from_secs(1),
             batch_sequence: 0,
-            rates: Rates::default(),
+            rates: EntityRates::default(),
+            rates_by_flow: HashMap::new(),
+            rates_by_connection: HashMap::new(),
+            rates_by_endpoint: HashMap::new(),
+            rates_by_domain: HashMap::new(),
+            rates_by_application: HashMap::new(),
             audit: VecDeque::new(),
             export_counter: 0,
             export_ttl: config.export_ttl,
@@ -590,10 +613,15 @@ impl Db {
         }
         let seconds = interval.as_secs_f64();
         let seconds = if seconds > 0.0 { seconds } else { 1.0 };
-        self.rates = Rates {
-            inbound_bps: (inbound.bytes as f64 / seconds) as u64,
-            outbound_bps: (outbound.bytes as f64 / seconds) as u64,
+        self.rates = EntityRates {
+            inbound_bps: (inbound.bytes as f64 * 8.0 / seconds) as u64,
+            outbound_bps: (outbound.bytes as f64 * 8.0 / seconds) as u64,
         };
+        self.rates_by_flow.clear();
+        self.rates_by_connection.clear();
+        self.rates_by_endpoint.clear();
+        self.rates_by_domain.clear();
+        self.rates_by_application.clear();
 
         let mut touched: Vec<u64> = Vec::new();
         let mut domain_events: Vec<DomainObservationDto> = Vec::new();
@@ -643,6 +671,25 @@ impl Db {
                 flow_deltas.insert(id, (update.key.direction, update.delta));
                 upsert_flow(&tx, id, &update, now_instant, now_system, &mut writer)?;
                 touched.push(id);
+
+                let bps = (update.delta.bytes as f64 * 8.0 / seconds) as u64;
+                if bps > 0 {
+                    self.rates_by_flow
+                        .entry(id)
+                        .or_default()
+                        .add(update.key.direction, bps);
+                    let (pair_lo, pair_hi) = connection_pair(&update.key);
+                    let connection = connection_id(
+                        update.key.protocol,
+                        i64::from(update.key.interface_index.get()),
+                        &pair_lo,
+                        &pair_hi,
+                    );
+                    self.rates_by_connection
+                        .entry(connection)
+                        .or_default()
+                        .add(update.key.direction, bps);
+                }
             }
 
             add_bucket(
@@ -670,6 +717,32 @@ impl Db {
         for id in touched {
             if let Some(dto) = self.flow_by_id(id)? {
                 updated.push((id, dto));
+            }
+        }
+
+        for (id, dto) in &updated {
+            let Some((direction, delta)) = flow_deltas.get(id) else {
+                continue;
+            };
+            let bps = (delta.bytes as f64 * 8.0 / seconds) as u64;
+            if bps == 0 {
+                continue;
+            }
+            self.rates_by_endpoint
+                .entry(dto.remote.address.clone())
+                .or_default()
+                .add(*direction, bps);
+            if let Some(application) = &dto.application {
+                self.rates_by_application
+                    .entry(application.id.clone())
+                    .or_default()
+                    .add(*direction, bps);
+            }
+            for domain in &dto.domains {
+                self.rates_by_domain
+                    .entry(domain.domain.clone())
+                    .or_default()
+                    .add(*direction, bps);
             }
         }
 
@@ -861,10 +934,46 @@ impl Db {
 
     fn flow_by_id(&self, id: u64) -> Result<Option<FlowDto>, ApiError> {
         let sql = format!("SELECT {FLOW_COLUMNS} FROM flows WHERE id = ?1");
-        self.conn
+        let dto = self
+            .conn
             .query_row(&sql, [id as i64], flow_dto_from_row)
-            .optional()
-            .map_err(Into::into)
+            .optional()?;
+        Ok(dto.map(|mut dto| {
+            self.apply_flow_rate(&mut dto);
+            dto
+        }))
+    }
+
+    /// Overwrites the DTO's rate fields from the live interval maps. A missing
+    /// entry means the entity carried no traffic in the latest interval.
+    fn apply_flow_rate(&self, dto: &mut FlowDto) {
+        if let Ok(id) = u64::from_str_radix(&dto.id, 16) {
+            if let Some(rate) = self.rates_by_flow.get(&id) {
+                dto.inbound_bps = rate.inbound_bps;
+                dto.outbound_bps = rate.outbound_bps;
+            }
+        }
+    }
+
+    fn apply_endpoint_rate(&self, dto: &mut EndpointSummaryDto) {
+        if let Some(rate) = self.rates_by_endpoint.get(&dto.address) {
+            dto.inbound_bps = rate.inbound_bps;
+            dto.outbound_bps = rate.outbound_bps;
+        }
+    }
+
+    fn apply_domain_rate(&self, dto: &mut DomainSummaryDto) {
+        if let Some(rate) = self.rates_by_domain.get(&dto.domain) {
+            dto.inbound_bps = rate.inbound_bps;
+            dto.outbound_bps = rate.outbound_bps;
+        }
+    }
+
+    fn apply_application_rate(&self, dto: &mut ApplicationSummaryDto) {
+        if let Some(rate) = self.rates_by_application.get(&dto.id) {
+            dto.inbound_bps = rate.inbound_bps;
+            dto.outbound_bps = rate.outbound_bps;
+        }
     }
 
     // ---------------------------------------------------------- applications
@@ -1073,9 +1182,12 @@ impl Db {
         params.push(Value::Integer(offset as i64));
 
         let mut statement = self.conn.prepare(&sql)?;
-        let items = statement
+        let mut items = statement
             .query_map(params_from_iter(params), application_summary_from_row)?
             .collect::<rusqlite::Result<Vec<_>>>()?;
+        for item in &mut items {
+            self.apply_application_rate(item);
+        }
         Ok((items, total as usize))
     }
 
@@ -1095,12 +1207,15 @@ impl Db {
              WHERE flows.app_id IN (SELECT value FROM json_each(?1)) \
              GROUP BY flows.app_id ORDER BY total_bytes DESC, flows.app_id LIMIT ?2"
         ))?;
-        let items = statement
+        let mut items = statement
             .query_map(
                 params![keys, TICK_AGGREGATE_LIMIT as i64],
                 application_summary_from_row,
             )?
             .collect::<rusqlite::Result<Vec<_>>>()?;
+        for item in &mut items {
+            self.apply_application_rate(item);
+        }
         Ok(items)
     }
 
@@ -1233,6 +1348,8 @@ impl Db {
                         interface: row.get(4)?,
                         packets: row.get::<_, i64>(17)? as u64,
                         bytes: row.get::<_, i64>(18)? as u64,
+                        inbound_bps: 0,
+                        outbound_bps: 0,
                         traffic: DirectionTotalsDto {
                             inbound: CountersDto {
                                 packets: row.get::<_, i64>(19)? as u64,
@@ -1263,6 +1380,10 @@ impl Db {
                 // Historical rows predate fingerprinting: Domain Evidence from
                 // a parsed TLS/HTTP handshake still names the protocol.
                 connection.service = evidence_service(&connection.domains).map(ToOwned::to_owned);
+            }
+            if let Some(rate) = self.rates_by_connection.get(&connection.id) {
+                connection.inbound_bps = rate.inbound_bps;
+                connection.outbound_bps = rate.outbound_bps;
             }
             items.push(connection);
         }
@@ -1325,9 +1446,12 @@ impl Db {
         params.push(Value::Integer(offset as i64));
 
         let mut statement = self.conn.prepare(&sql)?;
-        let items = statement
+        let mut items = statement
             .query_map(params_from_iter(params), flow_dto_from_row)?
             .collect::<rusqlite::Result<Vec<_>>>()?;
+        for item in &mut items {
+            self.apply_flow_rate(item);
+        }
         Ok((items, total))
     }
 
@@ -1501,7 +1625,7 @@ impl Db {
         params.push(Value::Integer(offset as i64));
 
         let mut statement = self.conn.prepare(&sql)?;
-        let items = statement
+        let mut items = statement
             .query_map(params_from_iter(params), |row| {
                 let scope: String = row.get(1)?;
                 Ok(EndpointSummaryDto {
@@ -1513,6 +1637,8 @@ impl Db {
                     organization: row.get(5)?,
                     packets: row.get::<_, i64>(6)? as u64,
                     bytes: row.get::<_, i64>(7)? as u64,
+                    inbound_bps: 0,
+                    outbound_bps: 0,
                     traffic: DirectionTotalsDto {
                         inbound: CountersDto {
                             packets: row.get::<_, i64>(8)? as u64,
@@ -1529,6 +1655,9 @@ impl Db {
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
+        for item in &mut items {
+            self.apply_endpoint_rate(item);
+        }
         Ok((items, total as usize))
     }
 
@@ -1743,12 +1872,14 @@ impl Db {
         params.push(Value::Integer(offset as i64));
 
         let mut statement = self.conn.prepare(&sql)?;
-        let items = statement
+        let mut items = statement
             .query_map(params_from_iter(params), |row| {
                 Ok(DomainSummaryDto {
                     domain: row.get(0)?,
                     packets: row.get::<_, i64>(1)? as u64,
                     bytes: row.get::<_, i64>(2)? as u64,
+                    inbound_bps: 0,
+                    outbound_bps: 0,
                     traffic: DirectionTotalsDto {
                         inbound: CountersDto {
                             packets: row.get::<_, i64>(3)? as u64,
@@ -1766,6 +1897,9 @@ impl Db {
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
+        for item in &mut items {
+            self.apply_domain_rate(item);
+        }
         Ok((items, total as usize))
     }
 
@@ -1793,7 +1927,7 @@ impl Db {
              FROM flows WHERE remote_addr IN (SELECT value FROM json_each(?1)) \
              GROUP BY remote_addr ORDER BY total_bytes DESC, remote_addr LIMIT ?2",
         )?;
-        let items = statement
+        let mut items = statement
             .query_map(params![keys, TICK_AGGREGATE_LIMIT as i64], |row| {
                 let scope: String = row.get(1)?;
                 Ok(EndpointSummaryDto {
@@ -1805,6 +1939,8 @@ impl Db {
                     organization: row.get(5)?,
                     packets: row.get::<_, i64>(6)? as u64,
                     bytes: row.get::<_, i64>(7)? as u64,
+                    inbound_bps: 0,
+                    outbound_bps: 0,
                     traffic: DirectionTotalsDto {
                         inbound: CountersDto {
                             packets: row.get::<_, i64>(8)? as u64,
@@ -1821,6 +1957,9 @@ impl Db {
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
+        for item in &mut items {
+            self.apply_endpoint_rate(item);
+        }
         Ok(items)
     }
 
@@ -1851,12 +1990,14 @@ impl Db {
              WHERE je.value->>'domain' IN (SELECT value FROM json_each(?1)) \
              GROUP BY 1 ORDER BY total_bytes DESC, domain LIMIT ?2",
         )?;
-        let items = statement
+        let mut items = statement
             .query_map(params![keys, TICK_AGGREGATE_LIMIT as i64], |row| {
                 Ok(DomainSummaryDto {
                     domain: row.get(0)?,
                     packets: row.get::<_, i64>(1)? as u64,
                     bytes: row.get::<_, i64>(2)? as u64,
+                    inbound_bps: 0,
+                    outbound_bps: 0,
                     traffic: DirectionTotalsDto {
                         inbound: CountersDto {
                             packets: row.get::<_, i64>(3)? as u64,
@@ -1874,6 +2015,9 @@ impl Db {
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
+        for item in &mut items {
+            self.apply_domain_rate(item);
+        }
         Ok(items)
     }
 
@@ -2400,7 +2544,12 @@ impl Db {
         if let Err(error) = result {
             self.database_error = Some(error.to_string());
         }
-        self.rates = Rates::default();
+        self.rates = EntityRates::default();
+        self.rates_by_flow.clear();
+        self.rates_by_connection.clear();
+        self.rates_by_endpoint.clear();
+        self.rates_by_domain.clear();
+        self.rates_by_application.clear();
         self.audit("history.clear", "completed");
     }
 
@@ -3144,6 +3293,8 @@ fn flow_dto_from_row(row: &Row<'_>) -> rusqlite::Result<FlowDto> {
         interface: row.get(8)?,
         packets: row.get::<_, i64>(9)? as u64,
         bytes: row.get::<_, i64>(10)? as u64,
+        inbound_bps: 0,
+        outbound_bps: 0,
         first_seen,
         last_seen,
         duration_ms: (last_seen - first_seen).max(0) as u64,
@@ -3184,6 +3335,8 @@ fn application_summary_from_row(row: &Row<'_>) -> rusqlite::Result<ApplicationSu
         container_id: row.get(6)?,
         packets: row.get::<_, i64>(7)? as u64,
         bytes: row.get::<_, i64>(8)? as u64,
+        inbound_bps: 0,
+        outbound_bps: 0,
         traffic: DirectionTotalsDto {
             inbound: CountersDto {
                 packets: row.get::<_, i64>(9)? as u64,
@@ -3398,6 +3551,22 @@ fn connection_id(protocol: Protocol, ifindex: i64, pair_lo: &str, pair_hi: &str)
         hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
     }
     format!("{hash:016x}")
+}
+
+/// Canonical unordered endpoint pair of a Flow, matching the `MIN`/`MAX`
+/// expressions ([`PAIR_LO`], [`PAIR_HI`]) the connection queries group by.
+fn connection_pair(key: &FlowKey) -> (String, String) {
+    let side = |endpoint: &Endpoint| match endpoint.port {
+        Some(port) => format!("{}:{}", endpoint.address, port),
+        None => format!("{}:-1", endpoint.address),
+    };
+    let source = side(&key.source);
+    let destination = side(&key.destination);
+    if source <= destination {
+        (source, destination)
+    } else {
+        (destination, source)
+    }
 }
 
 fn unsupported_sort(field: &str) -> ApiError {
