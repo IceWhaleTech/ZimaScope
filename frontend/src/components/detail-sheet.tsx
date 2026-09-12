@@ -887,22 +887,18 @@ function ApplicationDetailBody({ detail }: { detail: ApplicationDetail }) {
           )}
 
           {tab === "identity" && (
-            <TabSection caption="Observed evidence for this Application">
+            <TabSection caption="Observed from socket ownership; location is best-effort">
               <DefList
                 rows={[
+                  { label: "Process name", value: detail.comm ?? detail.name },
                   {
-                    label: "Key",
-                    value: (
-                      <span className="font-mono text-xs" title={detail.id}>
-                        {detail.id}
-                      </span>
+                    label: "Location",
+                    value: detail.exe ? (
+                      <span className="font-mono text-xs">{detail.exe}</span>
+                    ) : (
+                      <span className="text-muted-foreground">—</span>
                     ),
                   },
-                  {
-                    label: "Executable",
-                    value: detail.exe ? <span className="font-mono text-xs">{detail.exe}</span> : "—",
-                  },
-                  { label: "Process name", value: detail.comm ?? "—" },
                   { label: "UID", value: detail.uid !== null ? String(detail.uid) : "—" },
                   ...(detail.container_id
                     ? [
@@ -914,10 +910,6 @@ function ApplicationDetailBody({ detail }: { detail: ApplicationDetail }) {
                     : []),
                 ]}
               />
-              <p className="text-2xs text-muted-foreground">
-                Attribution comes from observed socket ownership; the executable path is best-effort
-                and a process that exited before resolution keeps its captured name.
-              </p>
             </TabSection>
           )}
         </motion.div>
