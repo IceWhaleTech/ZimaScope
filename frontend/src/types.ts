@@ -447,13 +447,11 @@ export interface EnforcementStatus {
   last_error: string | null;
 }
 
-export interface TrafficRuleMatch {
-  kind: "endpoint" | "cidr" | "application";
-  address: string | null;
-  prefix_len: number | null;
-  port: number | null;
-  application_id: string | null;
-}
+/** What a Traffic Rule targets; mirrors the backend selector IR. */
+export type TrafficRuleSelector =
+  | { kind: "endpoint"; address: string; port?: number | null }
+  | { kind: "cidr"; address: string; prefix_len: number }
+  | { kind: "application"; id: string };
 
 export interface TrafficRuleCounters {
   matched_packets: number;
@@ -466,7 +464,7 @@ export interface TrafficRule {
   id: number;
   action: RuleAction;
   direction: RuleDirection;
-  match: TrafficRuleMatch;
+  selector: TrafficRuleSelector;
   rate_bytes_per_s: number;
   burst_bytes: number;
   enabled: boolean;
@@ -477,18 +475,10 @@ export interface TrafficRule {
   counters: TrafficRuleCounters | null;
 }
 
-export interface TrafficRuleMatchInput {
-  kind: "endpoint" | "cidr" | "application";
-  address?: string;
-  prefix_len?: number;
-  port?: number;
-  application_id?: string;
-}
-
 export interface CreateTrafficRuleRequest {
   action: RuleAction;
   direction: RuleDirection;
-  match: TrafficRuleMatchInput;
+  selector: TrafficRuleSelector;
   rate_bytes_per_s?: number;
   enabled?: boolean;
 }
@@ -496,9 +486,33 @@ export interface CreateTrafficRuleRequest {
 export interface UpdateTrafficRuleRequest {
   action?: RuleAction;
   direction?: RuleDirection;
-  match?: TrafficRuleMatchInput;
+  selector?: TrafficRuleSelector;
   rate_bytes_per_s?: number;
   enabled?: boolean;
+}
+
+export interface ResolveTrafficRuleRequest {
+  direction: RuleDirection;
+  selector: TrafficRuleSelector;
+}
+
+/** One kernel-matchable target the selector resolves to. */
+export interface ResolvedTarget {
+  kind: "endpoint" | "cidr" | "application_cgroup" | "application_comm";
+  address: string | null;
+  port: number | null;
+  prefix_len: number | null;
+  cgroup_id: number | null;
+  comm: string | null;
+}
+
+/** Preflight result for a selector, without creating a rule. */
+export interface ResolveTrafficRuleResponse {
+  plan: "direct" | "resolved" | "unsupported";
+  targets: ResolvedTarget[];
+  coverage: "complete" | "unresolved";
+  reason: string | null;
+  expires_at: number | null;
 }
 
 export interface BoundarySettings {

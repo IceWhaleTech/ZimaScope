@@ -114,7 +114,7 @@ export function RowContextMenu({ children }: { children: ReactElement }) {
       setPreset({
         action,
         label: row.name,
-        match: { kind: "application", application_id: row.id },
+        selector: { kind: "application", id: row.id },
       });
       return;
     }
@@ -122,7 +122,7 @@ export function RowContextMenu({ children }: { children: ReactElement }) {
       setPreset({
         action,
         label: row.address,
-        match: {
+        selector: {
           kind: "endpoint",
           address: row.address,
           port: row.port ?? undefined,
@@ -131,7 +131,11 @@ export function RowContextMenu({ children }: { children: ReactElement }) {
       return;
     }
     if (row.kind === "endpoint") {
-      setPreset({ action, label: row.address, match: { kind: "endpoint", address: row.address } });
+      setPreset({
+        action,
+        label: row.address,
+        selector: { kind: "endpoint", address: row.address },
+      });
     }
   };
 

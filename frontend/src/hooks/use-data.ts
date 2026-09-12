@@ -10,6 +10,7 @@ import { data, onResync } from "@/store";
 import type { FlowQuery } from "@/api";
 import type {
   CreateTrafficRuleRequest,
+  ResolveTrafficRuleRequest,
   SettingsPatch,
   TimeRange,
   UpdateTrafficRuleRequest,
@@ -256,6 +257,12 @@ export function useDeleteTrafficRule() {
   return useMutation({
     mutationFn: (id: number) => data.deleteTrafficRule(id),
     onSuccess: () => invalidateTrafficRules(queryClient),
+  });
+}
+
+export function useResolveTrafficRule() {
+  return useMutation({
+    mutationFn: (rule: ResolveTrafficRuleRequest) => data.resolveTrafficRule(rule),
   });
 }
 

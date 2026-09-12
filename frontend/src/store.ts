@@ -21,6 +21,8 @@ import type {
   Flow,
   Overview,
   Page,
+  ResolveTrafficRuleRequest,
+  ResolveTrafficRuleResponse,
   ServiceStatus,
   Settings,
   SettingsPatch,
@@ -114,6 +116,8 @@ export const data = {
     api.createTrafficRule(rule),
   updateTrafficRule: (id: number, rule: UpdateTrafficRuleRequest): Promise<TrafficRule> =>
     api.updateTrafficRule(id, rule),
+  resolveTrafficRule: (rule: ResolveTrafficRuleRequest): Promise<ResolveTrafficRuleResponse> =>
+    api.resolveTrafficRule(rule),
   deleteTrafficRule: (id: number): Promise<void> => api.deleteTrafficRule(id),
   clearHistory: (): Promise<void> => api.clearHistory(),
   exports: (): Promise<ExportTask[]> => api.fetchExports(),

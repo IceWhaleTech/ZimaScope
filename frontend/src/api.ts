@@ -17,6 +17,8 @@ import type {
   Overview,
   Page,
   CreateTrafficRuleRequest,
+  ResolveTrafficRuleRequest,
+  ResolveTrafficRuleResponse,
   ServiceStatus,
   Settings,
   SettingsPatch,
@@ -227,6 +229,12 @@ export function createTrafficRule(rule: CreateTrafficRuleRequest): Promise<Traff
 
 export function updateTrafficRule(id: number, rule: UpdateTrafficRuleRequest): Promise<TrafficRule> {
   return request(`/v1/traffic-rules/${id}`, json("PATCH", rule));
+}
+
+export function resolveTrafficRule(
+  rule: ResolveTrafficRuleRequest,
+): Promise<ResolveTrafficRuleResponse> {
+  return request("/v1/traffic-rules/resolve", json("POST", rule));
 }
 
 export function deleteTrafficRule(id: number): Promise<void> {

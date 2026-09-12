@@ -2,8 +2,10 @@
  * Creates one Traffic Rule from an Explorer row. The dialog is honest about
  * what will happen: a limit drops over-limit packets, a block drops every
  * matching packet, and the direction decides which side of the Device
- * Boundary is affected. Domain rows never reach this dialog because domain
- * matching is not supported.
+ * Boundary is affected. The selector is resolved through the preflight before
+ * confirmation, so unresolved resources are disclosed instead of silently
+ * enforced. Domain rows never reach this dialog because domain matching is
+ * not supported.
  */
 
 import { useEffect, useState } from "react";
@@ -19,15 +21,18 @@ import {
 } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Segmented } from "@/components/segmented";
-import { useCreateTrafficRule } from "@/hooks/use-data";
-import type { RuleAction, RuleDirection } from "@/types";
+import { useCreateTrafficRule, useResolveTrafficRule } from "@/hooks/use-data";
+import type {
+  ResolvedTarget,
+  RuleAction,
+  RuleDirection,
+  TrafficRuleSelector,
+} from "@/types";
 
 export interface TrafficRulePreset {
   action: RuleAction;
   label: string;
-  match:
-    | { kind: "endpoint"; address: string; port?: number }
-    | { kind: "application"; application_id: string };
+  selector: TrafficRuleSelector;
 }
 
 const MBPS_TO_BYTES_PER_S = 125_000;
@@ -38,6 +43,19 @@ const DIRECTION_OPTIONS = [
   { value: "both", label: "Both" },
 ];
 
+function targetLabel(target: ResolvedTarget): string {
+  switch (target.kind) {
+    case "endpoint":
+      return target.port ? `${target.address}:${target.port}` : (target.address ?? "endpoint");
+    case "cidr":
+      return `${target.address}/${target.prefix_len}`;
+    case "application_comm":
+      return target.comm ?? "process";
+    default:
+      return `cgroup ${target.cgroup_id}`;
+  }
+}
+
 export function TrafficRuleDialog({
   preset,
   onClose,
@@ -46,6 +64,13 @@ export function TrafficRuleDialog({
   onClose: () => void;
 }) {
   const createRule = useCreateTrafficRule();
+  const {
+    mutate: resolve,
+    reset: resetResolve,
+    data: resolution,
+    error: resolveError,
+    isPending: resolving,
+  } = useResolveTrafficRule();
   const [direction, setDirection] = useState<RuleDirection>("outbound");
   const [rateMbps, setRateMbps] = useState("50");
 
@@ -53,10 +78,19 @@ export function TrafficRuleDialog({
     if (preset) {
       setDirection("outbound");
       setRateMbps("50");
+    } else {
+      resetResolve();
     }
-  }, [preset]);
+  }, [preset, resetResolve]);
+
+  useEffect(() => {
+    if (!preset) return;
+    resolve({ direction, selector: preset.selector });
+  }, [preset, direction, resolve]);
 
   const blocking = preset?.action === "block";
+  const targets = resolution?.targets ?? [];
+  const unresolved = resolution?.coverage === "unresolved";
 
   const submit = () => {
     if (!preset) return;
@@ -70,7 +104,7 @@ export function TrafficRuleDialog({
       {
         action: preset.action,
         direction,
-        match: preset.match,
+        selector: preset.selector,
         rate_bytes_per_s: blocking ? undefined : rate,
       },
       {
@@ -131,6 +165,39 @@ export function TrafficRuleDialog({
               />
             </label>
           )}
+
+          <div className="grid gap-1 text-2xs text-muted-foreground">
+            {resolving && <p>Resolving what this matches…</p>}
+            {resolveError && (
+              <p className="text-destructive">
+                {resolveError instanceof Error
+                  ? resolveError.message
+                  : "This selector cannot be enforced"}
+              </p>
+            )}
+            {resolution?.coverage === "complete" && (
+              <>
+                <p>
+                  Matches {targets.length} kernel target{targets.length === 1 ? "" : "s"}
+                  {resolution.plan === "resolved" ? ", re-resolved as evidence changes" : ""}.
+                </p>
+                <p className="truncate font-mono">
+                  {targets
+                    .slice(0, 3)
+                    .map(targetLabel)
+                    .join(", ")}
+                  {targets.length > 3 ? ` +${targets.length - 3} more` : ""}
+                </p>
+              </>
+            )}
+            {unresolved && (
+              <p className="text-amber-500">
+                No matching resources right now
+                {resolution.reason ? `: ${resolution.reason}` : ""}. The rule is stored but stays
+                inactive until evidence appears.
+              </p>
+            )}
+          </div>
         </div>
 
         <DialogFooter>
@@ -140,7 +207,7 @@ export function TrafficRuleDialog({
           <Button
             variant={blocking ? "destructive" : "default"}
             onClick={submit}
-            disabled={createRule.isPending}
+            disabled={createRule.isPending || resolveError !== null}
           >
             {blocking ? "Block traffic" : "Apply limit"}
           </Button>

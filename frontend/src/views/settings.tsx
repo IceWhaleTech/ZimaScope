@@ -707,11 +707,10 @@ function TrafficRulesCard({
 }
 
 function ruleTarget(rule: TrafficRule): string {
-  if (rule.match.kind === "application") return rule.match.application_id ?? "application";
-  if (rule.match.kind === "cidr") return `${rule.match.address}/${rule.match.prefix_len}`;
-  return rule.match.port
-    ? `${rule.match.address}:${rule.match.port}`
-    : (rule.match.address ?? "endpoint");
+  const { selector } = rule;
+  if (selector.kind === "application") return selector.id;
+  if (selector.kind === "cidr") return `${selector.address}/${selector.prefix_len}`;
+  return selector.port ? `${selector.address}:${selector.port}` : selector.address;
 }
 
 function stateLabel(state: TrafficRule["state"]): string {
