@@ -14,22 +14,30 @@ use std::{
 };
 
 use hashbrown::{HashMap, HashSet};
-use rusqlite::{Connection, OptionalExtension, Row, params, params_from_iter, types::Value};
+use rusqlite::{
+    Connection, OptionalExtension, Row, functions::FunctionFlags, params, params_from_iter,
+    types::Value,
+};
 use zimascope_common::model::{
     AddressScope, AssociationConfidence, CollectionBatch, CollectorHealth, DomainEvidence,
-    DomainObservation, Endpoint, FlowDirection, FlowKey, FlowState, FlowUpdate, TrafficCounters,
+    DomainObservation, Endpoint, FlowDirection, FlowKey, FlowState, FlowUpdate, Protocol,
+    TrafficCounters,
 };
 
 #[cfg(test)]
 use crate::enrichment::GeoIpDatabase;
 use crate::enrichment::{DEFAULT_CACHE_CAPACITY, Enricher, EnrichmentStats};
 
+use crate::SharedFingerprints;
+use crate::proxy::{ProxyKey, ProxyResolver};
+
 use super::dto::{
-    AsnCountDto, CollectorHealthDto, CountersDto, CountryCountDto, CreateExportRequest,
-    DirectionTotalsDto, DomainAddressDto, DomainDetailDto, DomainObservationDto, DomainRefDto,
-    DomainSummaryDto, DomainVisibilityDto, EndpointDetailDto, EndpointDto, EndpointSummaryDto,
-    EvidenceCountDto, ExportFormat, ExportTaskDto, FlowDto, FlowQuery, IpProfileDto, OverviewDto,
-    Page, PortUsageDto, RateDto, TickDto, TickTrafficDto, TimeRange, TimelineDto, TimelinePointDto,
+    AsnCountDto, CollectorHealthDto, ConnectionDto, CountersDto, CountryCountDto,
+    CreateExportRequest, DirectionTotalsDto, DomainAddressDto, DomainDetailDto,
+    DomainObservationDto, DomainRefDto, DomainSummaryDto, DomainVisibilityDto, EndpointDetailDto,
+    EndpointDto, EndpointSummaryDto, EvidenceCountDto, ExportFormat, ExportTaskDto, FlowDto,
+    FlowQuery, FlowStateParam, IpProfileDto, OverviewDto, Page, PortUsageDto, ProxiedTrafficDto,
+    RateDto, TickDto, TickOverviewDto, TickTrafficDto, TimeRange, TimelineDto, TimelinePointDto,
     enum_from_value, enum_value, flow_state_name, unix_millis,
 };
 use super::error::ApiError;
@@ -44,12 +52,15 @@ impl From<rusqlite::Error> for ApiError {
 const EXPORT_MAX_RECORDS: usize = 10_000;
 const MAX_DOMAIN_CANDIDATES: usize = 8;
 const TOP_LIST_LIMIT: usize = 10;
+/// Upper bound on aggregate rows embedded in one SSE tick. Overflow is
+/// recovered by the client's periodic full refresh.
+const TICK_AGGREGATE_LIMIT: usize = 256;
 const AUDIT_CAPACITY: usize = 32;
 const MINUTE_BUCKET_RETENTION_MS: i64 = 2 * 60 * 60 * 1000;
 const HOUR_BUCKET_RETENTION_MS: i64 = 8 * 24 * 60 * 60 * 1000;
 const MS_PER_DAY: i64 = 24 * 60 * 60 * 1000;
 
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 3;
 
 const SCHEMA_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS flows (
@@ -78,7 +89,8 @@ CREATE TABLE IF NOT EXISTS flows (
     remote_org TEXT,
     remote_db_version TEXT,
     remote_enriched_at_ms INTEGER NOT NULL,
-    domains_json TEXT NOT NULL DEFAULT '[]'
+    domains_json TEXT NOT NULL DEFAULT '[]',
+    service TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_flows_last_seen ON flows(last_seen_ms);
 CREATE INDEX IF NOT EXISTS idx_flows_remote ON flows(remote_addr);
@@ -106,6 +118,18 @@ CREATE TABLE IF NOT EXISTS traffic_buckets (
     PRIMARY KEY (resolution, start_ms)
 );
 
+CREATE TABLE IF NOT EXISTS entity_buckets (
+    kind TEXT NOT NULL,
+    key TEXT NOT NULL,
+    resolution TEXT NOT NULL,
+    start_ms INTEGER NOT NULL,
+    in_packets INTEGER NOT NULL,
+    in_bytes INTEGER NOT NULL,
+    out_packets INTEGER NOT NULL,
+    out_bytes INTEGER NOT NULL,
+    PRIMARY KEY (kind, key, resolution, start_ms)
+);
+
 CREATE TABLE IF NOT EXISTS settings (
     id INTEGER PRIMARY KEY CHECK (id = 1),
     json TEXT NOT NULL,
@@ -128,7 +152,13 @@ CREATE TABLE IF NOT EXISTS exports (
 const FLOW_COLUMNS: &str = "id, direction, protocol, src_addr, src_port, dst_addr, dst_port, \
      ifindex, interface, packets, bytes, first_seen_ms, last_seen_ms, state, end_reason, \
      remote_addr, remote_port, remote_scope, remote_country, remote_region, remote_city, \
-     remote_asn, remote_org, remote_db_version, remote_enriched_at_ms, domains_json";
+     remote_asn, remote_org, remote_db_version, remote_enriched_at_ms, domains_json, service";
+
+/// Canonical unordered endpoint pair of a connection, as SQL expressions.
+const PAIR_LO: &str =
+    "MIN(src_addr || ':' || COALESCE(src_port, -1), dst_addr || ':' || COALESCE(dst_port, -1))";
+const PAIR_HI: &str =
+    "MAX(src_addr || ':' || COALESCE(src_port, -1), dst_addr || ':' || COALESCE(dst_port, -1))";
 
 /// Runtime configuration for the API state.
 #[derive(Clone, Debug)]
@@ -139,6 +169,10 @@ pub struct ApiConfig {
     pub geoip_database: Option<PathBuf>,
     /// SQLite file; `None` keeps a private in-memory database.
     pub database: Option<PathBuf>,
+    /// Fingerprint library shared with the collector.
+    pub fingerprints: SharedFingerprints,
+    /// Where uploaded fingerprints are persisted; `None` keeps them in memory.
+    pub fingerprints_path: Option<PathBuf>,
 }
 
 impl Default for ApiConfig {
@@ -149,6 +183,8 @@ impl Default for ApiConfig {
             export_ttl: Duration::from_secs(24 * 60 * 60),
             geoip_database: None,
             database: None,
+            fingerprints: crate::collector::fingerprint::shared_default(),
+            fingerprints_path: None,
         }
     }
 }
@@ -176,13 +212,52 @@ pub(crate) struct StreamEvent {
     pub inbound_bps: u64,
     pub outbound_bps: u64,
     pub flows: Vec<FlowDto>,
-    pub domains: Vec<DomainObservationDto>,
+    /// Refreshed aggregates for every remote peer touched by this interval.
+    pub endpoints: Vec<EndpointSummaryDto>,
+    /// Refreshed aggregates for every Associated Domain touched by this
+    /// interval.
+    pub domain_summaries: Vec<DomainSummaryDto>,
+    /// New or refreshed domain associations observed in the interval.
+    pub observations: Vec<DomainObservationDto>,
+    pub overview: TickOverviewDto,
     pub health: CollectorHealthDto,
 }
 
 impl StreamEvent {
     /// Projects the interval into a filtered `tick` payload.
+    ///
+    /// Aggregate lists are keyed by the filtered Flows: a subscriber only
+    /// receives endpoint and domain summaries that its filter can observe.
     pub(crate) fn tick(&self, filter: &super::dto::StreamFilter) -> TickDto {
+        let flows: Vec<FlowDto> = self
+            .flows
+            .iter()
+            .filter(|flow| filter.matches(flow))
+            .cloned()
+            .collect();
+        let endpoints: Vec<EndpointSummaryDto> = {
+            let keys: HashSet<&str> = flows
+                .iter()
+                .map(|flow| flow.remote.address.as_str())
+                .collect();
+            self.endpoints
+                .iter()
+                .filter(|endpoint| keys.contains(endpoint.address.as_str()))
+                .cloned()
+                .collect()
+        };
+        let domain_summaries: Vec<DomainSummaryDto> = {
+            let keys: HashSet<&str> = flows
+                .iter()
+                .flat_map(|flow| flow.domains.iter().map(|domain| domain.domain.as_str()))
+                .collect();
+            self.domain_summaries
+                .iter()
+                .filter(|domain| keys.contains(domain.domain.as_str()))
+                .cloned()
+                .collect()
+        };
+
         TickDto {
             sequence: self.sequence,
             collected_at: unix_millis(self.collected_at),
@@ -199,18 +274,16 @@ impl StreamEvent {
                     bytes: self.outbound.bytes,
                 },
             },
-            flows: self
-                .flows
+            flows,
+            endpoints,
+            domains: domain_summaries,
+            observations: self
+                .observations
                 .iter()
-                .filter(|flow| filter.matches(flow))
+                .filter(|observation| filter.matches_domain(&observation.domain))
                 .cloned()
                 .collect(),
-            domains: self
-                .domains
-                .iter()
-                .filter(|domain| filter.matches_domain(&domain.domain))
-                .cloned()
-                .collect(),
+            overview: self.overview,
             health: Some(self.health.clone()),
         }
     }
@@ -251,17 +324,25 @@ impl Db {
             }
             None => Connection::open_in_memory()?,
         };
-        Self::from_connection(conn, config)
+        let mut db = Self::from_connection(conn, config)?;
+        if let Err(error) = db.backfill_enrichment() {
+            db.enrichment_error = Some(format!("geoip backfill failed: {error}"));
+        }
+        Ok(db)
     }
 
     fn from_connection(conn: Connection, config: &ApiConfig) -> anyhow::Result<Self> {
         let _: String = conn.query_row("PRAGMA journal_mode = WAL", [], |row| row.get(0))?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         conn.pragma_update(None, "busy_timeout", 5_000)?;
+        register_functions(&conn)?;
 
         let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
         if version < SCHEMA_VERSION {
             conn.execute_batch(SCHEMA_SQL)?;
+            // Upgraded databases keep their rows: new columns are added in
+            // place instead of recreating tables.
+            add_column_if_missing(&conn, "flows", "service", "TEXT")?;
             conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         }
 
@@ -294,12 +375,17 @@ impl Db {
 
     // ----------------------------------------------------------------- ingest
 
-    pub(crate) fn ingest(&mut self, batch: CollectionBatch, settings: &Settings) -> StreamEvent {
+    pub(crate) fn ingest(
+        &mut self,
+        batch: CollectionBatch,
+        settings: &Settings,
+        proxy: &ProxyResolver,
+    ) -> StreamEvent {
         let sequence = batch.sequence;
         let collected_at = batch.collected_at;
         let interval = batch.interval;
         let health = CollectorHealthDto::from_health(&batch.health);
-        match self.try_ingest(batch, settings) {
+        match self.try_ingest(batch, settings, proxy) {
             Ok(event) => event,
             Err(error) => {
                 eprintln!("zimascope-agent: storage ingest failed: {error}");
@@ -313,7 +399,10 @@ impl Db {
                     inbound_bps: self.rates.inbound_bps,
                     outbound_bps: self.rates.outbound_bps,
                     flows: Vec::new(),
-                    domains: Vec::new(),
+                    endpoints: Vec::new(),
+                    domain_summaries: Vec::new(),
+                    observations: Vec::new(),
+                    overview: TickOverviewDto::default(),
                     health,
                 }
             }
@@ -324,6 +413,7 @@ impl Db {
         &mut self,
         batch: CollectionBatch,
         settings: &Settings,
+        proxy: &ProxyResolver,
     ) -> Result<StreamEvent, ApiError> {
         let now_instant = Instant::now();
         let now_system = SystemTime::now();
@@ -364,6 +454,7 @@ impl Db {
         let mut touched: Vec<u64> = Vec::new();
         let mut domain_events: Vec<DomainObservationDto> = Vec::new();
         let mut changed_addresses: HashSet<IpAddr> = HashSet::new();
+        let mut flow_deltas: HashMap<u64, (FlowDirection, TrafficCounters)> = HashMap::new();
 
         {
             let tx = self.conn.transaction()?;
@@ -384,8 +475,8 @@ impl Db {
                 }
             }
 
-            for address in changed_addresses {
-                let domains_json = associate_address(&tx, address, now_system)?;
+            for address in &changed_addresses {
+                let domains_json = associate_address(&tx, *address, now_system)?;
                 tx.execute(
                     "UPDATE flows SET domains_json = ?1 WHERE remote_addr = ?2",
                     params![domains_json, address.to_string()],
@@ -397,17 +488,15 @@ impl Db {
                 touched.extend(ids.into_iter().map(|id| id as u64));
             }
 
+            let mut writer = FlowWriter {
+                enricher: &mut self.enricher,
+                interfaces: &self.interfaces,
+                proxy,
+            };
             for update in flows {
                 let id = flow_id(&update.key);
-                upsert_flow(
-                    &tx,
-                    id,
-                    &update,
-                    now_instant,
-                    now_system,
-                    &mut self.enricher,
-                    &self.interfaces,
-                )?;
+                flow_deltas.insert(id, (update.key.direction, update.delta));
+                upsert_flow(&tx, id, &update, now_instant, now_system, &mut writer)?;
                 touched.push(id);
             }
 
@@ -432,12 +521,66 @@ impl Db {
 
         touched.sort_unstable();
         touched.dedup();
-        let mut updated = Vec::new();
+        let mut updated: Vec<(u64, FlowDto)> = Vec::new();
         for id in touched {
             if let Some(dto) = self.flow_by_id(id)? {
-                updated.push(dto);
+                updated.push((id, dto));
             }
         }
+
+        if !flow_deltas.is_empty() {
+            let tx = self.conn.transaction()?;
+            let minute = truncate_time(collected_at, 60);
+            let hour = truncate_time(collected_at, 3600);
+            for (id, dto) in &updated {
+                let Some((direction, delta)) = flow_deltas.get(id) else {
+                    continue;
+                };
+                if delta.packets == 0 && delta.bytes == 0 {
+                    continue;
+                }
+                for (resolution, start) in [("minute", minute), ("hour", hour)] {
+                    add_entity_bucket(
+                        &tx,
+                        "endpoint",
+                        &dto.remote.address,
+                        resolution,
+                        start,
+                        *direction,
+                        *delta,
+                    )?;
+                    for domain in &dto.domains {
+                        add_entity_bucket(
+                            &tx,
+                            "domain",
+                            &domain.domain,
+                            resolution,
+                            start,
+                            *direction,
+                            *delta,
+                        )?;
+                    }
+                }
+            }
+            tx.commit()?;
+        }
+
+        let mut touched_addresses: HashSet<String> =
+            changed_addresses.iter().map(ToString::to_string).collect();
+        let mut touched_domains: HashSet<String> = domain_events
+            .iter()
+            .map(|event| event.domain.clone())
+            .collect();
+        for (_, flow) in &updated {
+            touched_addresses.insert(flow.remote.address.clone());
+            for domain in &flow.domains {
+                touched_domains.insert(domain.domain.clone());
+            }
+        }
+
+        let endpoints = self.endpoint_summaries_for(&touched_addresses)?;
+        let domain_summaries = self.domain_summaries_for(&touched_domains)?;
+        let overview = self.tick_overview()?;
 
         Ok(StreamEvent {
             sequence,
@@ -447,8 +590,11 @@ impl Db {
             outbound,
             inbound_bps: self.rates.inbound_bps,
             outbound_bps: self.rates.outbound_bps,
-            flows: updated,
-            domains: domain_events,
+            flows: updated.into_iter().map(|(_, dto)| dto).collect(),
+            endpoints,
+            domain_summaries,
+            observations: domain_events,
+            overview,
             health: health_dto,
         })
     }
@@ -489,6 +635,14 @@ impl Db {
             "DELETE FROM traffic_buckets WHERE resolution = 'hour' AND start_ms < ?1",
             [now_ms - HOUR_BUCKET_RETENTION_MS],
         )?;
+        self.conn.execute(
+            "DELETE FROM entity_buckets WHERE resolution = 'minute' AND start_ms < ?1",
+            [now_ms - MINUTE_BUCKET_RETENTION_MS],
+        )?;
+        self.conn.execute(
+            "DELETE FROM entity_buckets WHERE resolution = 'hour' AND start_ms < ?1",
+            [now_ms - HOUR_BUCKET_RETENTION_MS],
+        )?;
         Ok(())
     }
 
@@ -519,6 +673,206 @@ impl Db {
             .query_row(&sql, [id as i64], flow_dto_from_row)
             .optional()
             .map_err(Into::into)
+    }
+
+    // ------------------------------------------------------------ connections
+
+    /// Merges directional Flows into one record per unordered endpoint pair.
+    ///
+    /// `direction` is ignored (a connection has no single direction) and
+    /// `state` is evaluated on the aggregate. `hide_noise` drops DNS pairs
+    /// and sub-second chatter.
+    pub(crate) fn list_connections(
+        &self,
+        query: &FlowQuery,
+    ) -> Result<Page<ConnectionDto>, ApiError> {
+        let limit = page_limit(query.limit)?;
+        let offset = query.offset.unwrap_or(0);
+        let now = SystemTime::now();
+
+        let mut row_query = query.clone();
+        row_query.direction = None;
+        row_query.state = None;
+        let (clauses, params) = self.flow_clauses(&row_query, now, "", true);
+        let where_clause = where_sql(&clauses);
+
+        let mut havings: Vec<String> = Vec::new();
+        match query.state {
+            Some(FlowStateParam::Active) => {
+                havings.push("SUM(CASE WHEN state = 'active' THEN 1 ELSE 0 END) > 0".to_owned())
+            }
+            Some(FlowStateParam::Ended) => {
+                havings.push("SUM(CASE WHEN state = 'active' THEN 1 ELSE 0 END) = 0".to_owned())
+            }
+            None => {}
+        }
+        if query.hide_noise.unwrap_or(false) {
+            havings.push(
+                "SUM(CASE WHEN src_port = 53 OR dst_port = 53 THEN 1 ELSE 0 END) = 0".to_owned(),
+            );
+            havings.push("(MAX(last_seen_ms) - MIN(first_seen_ms)) >= 1000".to_owned());
+        }
+        let having_clause = if havings.is_empty() {
+            String::new()
+        } else {
+            format!("HAVING {}", havings.join(" AND "))
+        };
+
+        let total: i64 = self.conn.query_row(
+            &format!(
+                "SELECT COUNT(*) FROM (SELECT 1 FROM flows {where_clause} \
+                 GROUP BY protocol, ifindex, {PAIR_LO}, {PAIR_HI} {having_clause})"
+            ),
+            params_from_iter(params.clone()),
+            |row| row.get(0),
+        )?;
+
+        let order = connection_order(query.sort.as_deref())?;
+        let sql = format!(
+            "SELECT protocol, ifindex, {PAIR_LO} AS pair_lo, {PAIR_HI} AS pair_hi, \
+             MAX(interface), MAX(remote_addr) AS remote_addr, MAX(remote_port), \
+             MAX(remote_scope), \
+             MAX(remote_country), MAX(remote_region), MAX(remote_city), MAX(remote_asn), \
+             MAX(remote_org), MAX(remote_db_version), MAX(remote_enriched_at_ms), \
+             MAX(CASE WHEN direction = 'outbound' THEN src_addr ELSE dst_addr END) AS host_addr, \
+             MAX(CASE WHEN direction = 'outbound' THEN src_port ELSE dst_port END) AS host_port, \
+             SUM(packets) AS total_packets, SUM(bytes) AS total_bytes, \
+             SUM(CASE WHEN direction = 'inbound' THEN packets ELSE 0 END) AS in_packets, \
+             SUM(CASE WHEN direction = 'inbound' THEN bytes ELSE 0 END) AS in_bytes, \
+             SUM(CASE WHEN direction = 'outbound' THEN packets ELSE 0 END) AS out_packets, \
+             SUM(CASE WHEN direction = 'outbound' THEN bytes ELSE 0 END) AS out_bytes, \
+             MAX(end_reason), \
+             SUM(CASE WHEN state = 'active' THEN 1 ELSE 0 END) AS active_rows, \
+             MIN(first_seen_ms) AS first_seen_ms, MAX(last_seen_ms) AS last_seen_ms, \
+             (MAX(last_seen_ms) - MIN(first_seen_ms)) AS duration_ms, \
+             MAX(service) AS service, \
+             MIN(json_extract(domains_json, '$[0].domain')) AS first_domain \
+             FROM flows {where_clause} \
+             GROUP BY protocol, ifindex, pair_lo, pair_hi {having_clause} \
+             ORDER BY {order} LIMIT ?{} OFFSET ?{}",
+            params.len() + 1,
+            params.len() + 2
+        );
+        let mut params = params;
+        params.push(Value::Integer(limit as i64));
+        params.push(Value::Integer(offset as i64));
+
+        let mut statement = self.conn.prepare(&sql)?;
+        let rows = statement
+            .query_map(params_from_iter(params), |row| {
+                let protocol: String = row.get(0)?;
+                let ifindex: i64 = row.get(1)?;
+                let pair_lo: String = row.get(2)?;
+                let pair_hi: String = row.get(3)?;
+                let scope: String = row.get(7)?;
+                let active_rows: i64 = row.get(24)?;
+                let protocol: Protocol =
+                    enum_from_value(&protocol).ok_or_else(|| invalid_enum("protocol"))?;
+                let state = if active_rows > 0 { "active" } else { "ended" };
+                let remote_address: String = row.get(5)?;
+                let host_port = row.get::<_, Option<i64>>(16)?.map(|port| port as u16);
+                let remote_port = row.get::<_, Option<i64>>(6)?.map(|port| port as u16);
+                Ok((
+                    ConnectionDto {
+                        id: connection_id(protocol, ifindex, &pair_lo, &pair_hi),
+                        protocol,
+                        service: row.get(28)?,
+                        state,
+                        end_reason: row
+                            .get::<_, Option<String>>(23)?
+                            .as_deref()
+                            .and_then(enum_from_value),
+                        host: EndpointDto {
+                            address: row.get(15)?,
+                            port: host_port,
+                        },
+                        remote: EndpointDto {
+                            address: remote_address.clone(),
+                            port: remote_port,
+                        },
+                        remote_profile: IpProfileDto {
+                            address: remote_address,
+                            scope: enum_from_value(&scope).unwrap_or(AddressScope::Reserved),
+                            country: row.get(8)?,
+                            region: row.get(9)?,
+                            city_approximate: row.get(10)?,
+                            asn: row.get(11)?,
+                            organization: row.get(12)?,
+                            database_version: row.get(13)?,
+                            enriched_at: row.get(14)?,
+                        },
+                        interface: row.get(4)?,
+                        packets: row.get::<_, i64>(17)? as u64,
+                        bytes: row.get::<_, i64>(18)? as u64,
+                        traffic: DirectionTotalsDto {
+                            inbound: CountersDto {
+                                packets: row.get::<_, i64>(19)? as u64,
+                                bytes: row.get::<_, i64>(20)? as u64,
+                            },
+                            outbound: CountersDto {
+                                packets: row.get::<_, i64>(21)? as u64,
+                                bytes: row.get::<_, i64>(22)? as u64,
+                            },
+                        },
+                        first_seen: row.get(25)?,
+                        last_seen: row.get(26)?,
+                        duration_ms: row.get::<_, i64>(27)?.max(0) as u64,
+                        domains: Vec::new(),
+                    },
+                    ifindex,
+                    pair_lo,
+                    pair_hi,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+
+        let mut items = Vec::with_capacity(rows.len());
+        for (mut connection, ifindex, pair_lo, pair_hi) in rows {
+            connection.domains =
+                self.connection_domains(connection.protocol, ifindex, &pair_lo, &pair_hi)?;
+            if connection.service.is_none() {
+                // Historical rows predate fingerprinting: Domain Evidence from
+                // a parsed TLS/HTTP handshake still names the protocol.
+                connection.service = evidence_service(&connection.domains).map(ToOwned::to_owned);
+            }
+            items.push(connection);
+        }
+
+        Ok(Page {
+            items,
+            total: total as usize,
+            limit,
+            offset,
+        })
+    }
+
+    /// Merged Associated Domains of both directional members of a connection.
+    fn connection_domains(
+        &self,
+        protocol: Protocol,
+        ifindex: i64,
+        pair_lo: &str,
+        pair_hi: &str,
+    ) -> Result<Vec<DomainRefDto>, ApiError> {
+        let mut statement = self.conn.prepare(
+            "SELECT domains_json FROM flows WHERE protocol = ?1 AND ifindex = ?2 \
+             AND (((src_addr || ':' || COALESCE(src_port, -1)) = ?3 \
+                AND (dst_addr || ':' || COALESCE(dst_port, -1)) = ?4) \
+               OR ((src_addr || ':' || COALESCE(src_port, -1)) = ?4 \
+                AND (dst_addr || ':' || COALESCE(dst_port, -1)) = ?3))",
+        )?;
+        let mut domains: Vec<DomainRefDto> = Vec::new();
+        for row in statement.query_map(
+            params![enum_value(protocol), ifindex, pair_lo, pair_hi],
+            |row| row.get::<_, String>(0),
+        )? {
+            let parsed: Vec<DomainRefDto> = serde_json::from_str(&row?).unwrap_or_default();
+            for association in parsed {
+                push_domain(&mut domains, &association);
+            }
+        }
+        domains.sort_by(|left, right| left.domain.cmp(&right.domain));
+        Ok(domains)
     }
 
     fn flows_page(
@@ -700,9 +1054,14 @@ impl Db {
 
         let order = endpoint_order(query.sort.as_deref())?;
         let sql = format!(
-            "SELECT remote_addr, MAX(remote_scope), MAX(remote_country), MAX(remote_region), \
-             MAX(remote_asn), MAX(remote_org), SUM(packets) AS total_packets, \
-             SUM(bytes) AS total_bytes, COUNT(*), MIN(first_seen_ms), MAX(last_seen_ms) \
+            "SELECT remote_addr, MAX(remote_scope), MAX(remote_country) AS country, \
+             MAX(remote_region), MAX(remote_asn) AS asn, MAX(remote_org) AS organization, \
+             SUM(packets) AS total_packets, SUM(bytes) AS total_bytes, \
+             COALESCE(SUM(CASE WHEN direction = 'inbound' THEN packets ELSE 0 END), 0) AS in_packets, \
+             COALESCE(SUM(CASE WHEN direction = 'inbound' THEN bytes ELSE 0 END), 0) AS in_bytes, \
+             COALESCE(SUM(CASE WHEN direction = 'outbound' THEN packets ELSE 0 END), 0) AS out_packets, \
+             COALESCE(SUM(CASE WHEN direction = 'outbound' THEN bytes ELSE 0 END), 0) AS out_bytes, \
+             COUNT(*), MIN(first_seen_ms), MAX(last_seen_ms) \
              FROM flows {where_clause} GROUP BY remote_addr ORDER BY {order} \
              LIMIT ?{} OFFSET ?{}",
             params.len() + 1,
@@ -725,9 +1084,19 @@ impl Db {
                     organization: row.get(5)?,
                     packets: row.get::<_, i64>(6)? as u64,
                     bytes: row.get::<_, i64>(7)? as u64,
-                    flow_count: row.get::<_, i64>(8)? as u64,
-                    first_seen: row.get(9)?,
-                    last_seen: row.get(10)?,
+                    traffic: DirectionTotalsDto {
+                        inbound: CountersDto {
+                            packets: row.get::<_, i64>(8)? as u64,
+                            bytes: row.get::<_, i64>(9)? as u64,
+                        },
+                        outbound: CountersDto {
+                            packets: row.get::<_, i64>(10)? as u64,
+                            bytes: row.get::<_, i64>(11)? as u64,
+                        },
+                    },
+                    flow_count: row.get::<_, i64>(12)? as u64,
+                    first_seen: row.get(13)?,
+                    last_seen: row.get(14)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -787,7 +1156,8 @@ impl Db {
         let mut addresses_statement = self.conn.prepare(
             "SELECT o.address, MAX(o.confidence), GROUP_CONCAT(DISTINCT o.evidence), \
              MAX(f.remote_country), MAX(f.remote_asn), MAX(f.remote_org), \
-             COALESCE(SUM(f.bytes), 0), COALESCE(MAX(f.last_seen_ms), 0) \
+             COALESCE(SUM(f.bytes), 0), COALESCE(MIN(f.first_seen_ms), 0), \
+             COALESCE(MAX(f.last_seen_ms), 0) \
              FROM observations o \
              LEFT JOIN flows f ON f.remote_addr = o.address AND instr(f.domains_json, ?2) > 0 \
              WHERE o.domain = ?1 GROUP BY o.address ORDER BY 7 DESC, o.address",
@@ -803,12 +1173,23 @@ impl Db {
                     row.get::<_, Option<String>>(5)?,
                     row.get::<_, i64>(6)?,
                     row.get::<_, i64>(7)?,
+                    row.get::<_, i64>(8)?,
                 ))
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?
             .into_iter()
             .filter_map(
-                |(address, confidence, evidence, country, asn, organization, bytes, last_seen)| {
+                |(
+                    address,
+                    confidence,
+                    evidence,
+                    country,
+                    asn,
+                    organization,
+                    bytes,
+                    first_seen,
+                    last_seen,
+                )| {
                     Some(DomainAddressDto {
                         address,
                         evidence: split_enum_list(&evidence),
@@ -817,6 +1198,7 @@ impl Db {
                         asn,
                         organization,
                         bytes: bytes as u64,
+                        first_seen,
                         last_seen,
                     })
                 },
@@ -906,8 +1288,16 @@ impl Db {
         let order = domain_order(query.sort.as_deref())?;
         let sql = format!(
             "SELECT je.value->>'domain' AS domain, SUM(flows.packets) AS total_packets, \
-             SUM(flows.bytes) AS total_bytes, COUNT(*) AS flow_count, \
-             MIN(flows.first_seen_ms), MAX(flows.last_seen_ms), \
+             SUM(flows.bytes) AS total_bytes, \
+             COALESCE(SUM(CASE WHEN flows.direction = 'inbound' THEN flows.packets ELSE 0 END), 0) \
+                 AS in_packets, \
+             COALESCE(SUM(CASE WHEN flows.direction = 'inbound' THEN flows.bytes ELSE 0 END), 0) \
+                 AS in_bytes, \
+             COALESCE(SUM(CASE WHEN flows.direction = 'outbound' THEN flows.packets ELSE 0 END), 0) \
+                 AS out_packets, \
+             COALESCE(SUM(CASE WHEN flows.direction = 'outbound' THEN flows.bytes ELSE 0 END), 0) \
+                 AS out_bytes, \
+             COUNT(*) AS flow_count, MIN(flows.first_seen_ms), MAX(flows.last_seen_ms), \
              GROUP_CONCAT(DISTINCT je.value->>'evidence') AS evidences \
              FROM flows, json_each(flows.domains_json) je {where_clause} GROUP BY 1 \
              ORDER BY {order} LIMIT ?{} OFFSET ?{}",
@@ -924,14 +1314,153 @@ impl Db {
                     domain: row.get(0)?,
                     packets: row.get::<_, i64>(1)? as u64,
                     bytes: row.get::<_, i64>(2)? as u64,
-                    flow_count: row.get::<_, i64>(3)? as u64,
-                    first_seen: row.get(4)?,
-                    last_seen: row.get(5)?,
-                    evidence: split_enum_list(&row.get::<_, String>(6)?),
+                    traffic: DirectionTotalsDto {
+                        inbound: CountersDto {
+                            packets: row.get::<_, i64>(3)? as u64,
+                            bytes: row.get::<_, i64>(4)? as u64,
+                        },
+                        outbound: CountersDto {
+                            packets: row.get::<_, i64>(5)? as u64,
+                            bytes: row.get::<_, i64>(6)? as u64,
+                        },
+                    },
+                    flow_count: row.get::<_, i64>(7)? as u64,
+                    first_seen: row.get(8)?,
+                    last_seen: row.get(9)?,
+                    evidence: split_enum_list(&row.get::<_, String>(10)?),
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok((items, total as usize))
+    }
+
+    // ------------------------------------------------------- tick aggregates
+
+    /// Refreshed endpoint summaries for the given remote addresses, used by
+    /// the SSE tick so Endpoint lists update without polling.
+    fn endpoint_summaries_for(
+        &self,
+        addresses: &HashSet<String>,
+    ) -> Result<Vec<EndpointSummaryDto>, ApiError> {
+        if addresses.is_empty() {
+            return Ok(Vec::new());
+        }
+        let keys = json_key_list(addresses.iter())?;
+        let mut statement = self.conn.prepare(
+            "SELECT remote_addr, MAX(remote_scope), MAX(remote_country) AS country, \
+             MAX(remote_region), MAX(remote_asn) AS asn, MAX(remote_org) AS organization, \
+             SUM(packets) AS total_packets, SUM(bytes) AS total_bytes, \
+             COALESCE(SUM(CASE WHEN direction = 'inbound' THEN packets ELSE 0 END), 0) AS in_packets, \
+             COALESCE(SUM(CASE WHEN direction = 'inbound' THEN bytes ELSE 0 END), 0) AS in_bytes, \
+             COALESCE(SUM(CASE WHEN direction = 'outbound' THEN packets ELSE 0 END), 0) AS out_packets, \
+             COALESCE(SUM(CASE WHEN direction = 'outbound' THEN bytes ELSE 0 END), 0) AS out_bytes, \
+             COUNT(*), MIN(first_seen_ms), MAX(last_seen_ms) \
+             FROM flows WHERE remote_addr IN (SELECT value FROM json_each(?1)) \
+             GROUP BY remote_addr ORDER BY total_bytes DESC, remote_addr LIMIT ?2",
+        )?;
+        let items = statement
+            .query_map(params![keys, TICK_AGGREGATE_LIMIT as i64], |row| {
+                let scope: String = row.get(1)?;
+                Ok(EndpointSummaryDto {
+                    address: row.get(0)?,
+                    scope: enum_from_value(&scope).unwrap_or(AddressScope::Reserved),
+                    country: row.get(2)?,
+                    region: row.get(3)?,
+                    asn: row.get(4)?,
+                    organization: row.get(5)?,
+                    packets: row.get::<_, i64>(6)? as u64,
+                    bytes: row.get::<_, i64>(7)? as u64,
+                    traffic: DirectionTotalsDto {
+                        inbound: CountersDto {
+                            packets: row.get::<_, i64>(8)? as u64,
+                            bytes: row.get::<_, i64>(9)? as u64,
+                        },
+                        outbound: CountersDto {
+                            packets: row.get::<_, i64>(10)? as u64,
+                            bytes: row.get::<_, i64>(11)? as u64,
+                        },
+                    },
+                    flow_count: row.get::<_, i64>(12)? as u64,
+                    first_seen: row.get(13)?,
+                    last_seen: row.get(14)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(items)
+    }
+
+    /// Refreshed Associated Domain summaries for the given domains, used by
+    /// the SSE tick so Domain lists update without polling.
+    fn domain_summaries_for(
+        &self,
+        domains: &HashSet<String>,
+    ) -> Result<Vec<DomainSummaryDto>, ApiError> {
+        if domains.is_empty() {
+            return Ok(Vec::new());
+        }
+        let keys = json_key_list(domains.iter())?;
+        let mut statement = self.conn.prepare(
+            "SELECT je.value->>'domain' AS domain, SUM(flows.packets) AS total_packets, \
+             SUM(flows.bytes) AS total_bytes, \
+             COALESCE(SUM(CASE WHEN flows.direction = 'inbound' THEN flows.packets ELSE 0 END), 0) \
+                 AS in_packets, \
+             COALESCE(SUM(CASE WHEN flows.direction = 'inbound' THEN flows.bytes ELSE 0 END), 0) \
+                 AS in_bytes, \
+             COALESCE(SUM(CASE WHEN flows.direction = 'outbound' THEN flows.packets ELSE 0 END), 0) \
+                 AS out_packets, \
+             COALESCE(SUM(CASE WHEN flows.direction = 'outbound' THEN flows.bytes ELSE 0 END), 0) \
+                 AS out_bytes, \
+             COUNT(*) AS flow_count, MIN(flows.first_seen_ms), MAX(flows.last_seen_ms), \
+             GROUP_CONCAT(DISTINCT je.value->>'evidence') \
+             FROM flows, json_each(flows.domains_json) je \
+             WHERE je.value->>'domain' IN (SELECT value FROM json_each(?1)) \
+             GROUP BY 1 ORDER BY total_bytes DESC, domain LIMIT ?2",
+        )?;
+        let items = statement
+            .query_map(params![keys, TICK_AGGREGATE_LIMIT as i64], |row| {
+                Ok(DomainSummaryDto {
+                    domain: row.get(0)?,
+                    packets: row.get::<_, i64>(1)? as u64,
+                    bytes: row.get::<_, i64>(2)? as u64,
+                    traffic: DirectionTotalsDto {
+                        inbound: CountersDto {
+                            packets: row.get::<_, i64>(3)? as u64,
+                            bytes: row.get::<_, i64>(4)? as u64,
+                        },
+                        outbound: CountersDto {
+                            packets: row.get::<_, i64>(5)? as u64,
+                            bytes: row.get::<_, i64>(6)? as u64,
+                        },
+                    },
+                    flow_count: row.get::<_, i64>(7)? as u64,
+                    first_seen: row.get(8)?,
+                    last_seen: row.get(9)?,
+                    evidence: split_enum_list(&row.get::<_, String>(10)?),
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(items)
+    }
+
+    /// Live counters over the whole retained history.
+    fn tick_overview(&self) -> Result<TickOverviewDto, ApiError> {
+        let (flows_total, flows_with_domain, active_flows): (i64, i64, i64) = self.conn.query_row(
+            "SELECT COUNT(*), COALESCE(SUM(domains_json <> '[]'), 0), \
+                 COALESCE(SUM(state = 'active'), 0) FROM flows",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+        let ratio = if flows_total == 0 {
+            0.0
+        } else {
+            flows_with_domain as f64 / flows_total as f64
+        };
+        Ok(TickOverviewDto {
+            active_flows: active_flows as u64,
+            flows_total: flows_total as u64,
+            flows_with_domain: flows_with_domain as u64,
+            ratio,
+        })
     }
 
     // --------------------------------------------------------------- overview
@@ -939,11 +1468,13 @@ impl Db {
     pub(crate) fn overview(
         &self,
         range: TimeRange,
+        exclude_scope: &[AddressScope],
         now: SystemTime,
     ) -> Result<OverviewDto, ApiError> {
         let query = FlowQuery {
             range: Some(range),
             limit: Some(TOP_LIST_LIMIT),
+            exclude_scope: exclude_scope.to_vec(),
             ..FlowQuery::default()
         };
         let (clauses, params) = self.flow_clauses(&query, now, "", true);
@@ -991,6 +1522,8 @@ impl Db {
 
         let top_countries = self.aggregate_countries(&query, now)?;
         let top_asns = self.aggregate_asns(&query, now)?;
+        let by_evidence = self.aggregate_evidence(&query, now)?;
+        let proxied = self.aggregate_proxied(&query, now)?;
 
         Ok(OverviewDto {
             range: range.as_str(),
@@ -1014,9 +1547,68 @@ impl Db {
                 flows_with_domain: flows_with_domain as u64,
                 flows_total: flows_total as u64,
                 ratio,
+                by_evidence,
             },
+            proxied,
             health: self.health.as_ref().map(CollectorHealthDto::from_health),
         })
+    }
+
+    /// Fake-IP traffic totals: present at the boundary, but terminated by the
+    /// local proxy, so geography cannot be attributed.
+    fn aggregate_proxied(
+        &self,
+        query: &FlowQuery,
+        now: SystemTime,
+    ) -> Result<ProxiedTrafficDto, ApiError> {
+        let (mut clauses, params) = self.flow_clauses(query, now, "", true);
+        clauses.push("remote_scope = 'fake_ip'".to_owned());
+        let sql = format!(
+            "SELECT COUNT(*), COALESCE(SUM(bytes), 0), \
+             COALESCE(SUM(domains_json <> '[]'), 0), \
+             COALESCE(SUM(remote_country IS NOT NULL), 0) FROM flows {}",
+            where_sql(&clauses)
+        );
+        let (flows, bytes, flows_with_domain, resolved_flows): (i64, i64, i64, i64) =
+            self.conn.query_row(&sql, params_from_iter(params), |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })?;
+        Ok(ProxiedTrafficDto {
+            flows: flows as u64,
+            bytes: bytes as u64,
+            flows_with_domain: flows_with_domain as u64,
+            resolved_flows: resolved_flows as u64,
+        })
+    }
+
+    /// Flow counts per Domain Evidence inside the overview range.
+    fn aggregate_evidence(
+        &self,
+        query: &FlowQuery,
+        now: SystemTime,
+    ) -> Result<Vec<EvidenceCountDto>, ApiError> {
+        let (mut clauses, params) = self.flow_clauses(query, now, "flows.", true);
+        clauses.push("je.value->>'evidence' IS NOT NULL".to_owned());
+        let sql = format!(
+            "SELECT je.value->>'evidence', COUNT(DISTINCT flows.id) FROM flows, \
+             json_each(flows.domains_json) je {} GROUP BY 1 ORDER BY 2 DESC",
+            where_sql(&clauses)
+        );
+        let mut statement = self.conn.prepare(&sql)?;
+        let items = statement
+            .query_map(params_from_iter(params), |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+            .into_iter()
+            .filter_map(|(kind, flows)| {
+                Some(EvidenceCountDto {
+                    evidence: enum_from_value(&kind)?,
+                    flows: flows as u64,
+                })
+            })
+            .collect();
+        Ok(items)
     }
 
     fn aggregate_countries(
@@ -1071,6 +1663,42 @@ impl Db {
     }
 
     fn timeline(&self, range: TimeRange, now: SystemTime) -> Result<TimelineDto, ApiError> {
+        self.buckets_timeline(range, now, None)
+    }
+
+    /// Boundary traffic timeline for one Endpoint (remote address).
+    pub(crate) fn endpoint_timeline(
+        &self,
+        address: &str,
+        range: TimeRange,
+        now: SystemTime,
+    ) -> Result<TimelineDto, ApiError> {
+        let address: IpAddr = address
+            .parse()
+            .map_err(|_| ApiError::bad_request(format!("invalid IP address: {address}")))?;
+        self.buckets_timeline(range, now, Some(("endpoint", &address.to_string())))
+    }
+
+    /// Boundary traffic timeline for one Associated Domain.
+    pub(crate) fn domain_timeline(
+        &self,
+        domain: &str,
+        range: TimeRange,
+        now: SystemTime,
+    ) -> Result<TimelineDto, ApiError> {
+        let domain = normalize_domain(domain);
+        if domain.is_empty() {
+            return Err(ApiError::bad_request("domain must not be empty"));
+        }
+        self.buckets_timeline(range, now, Some(("domain", &domain)))
+    }
+
+    fn buckets_timeline(
+        &self,
+        range: TimeRange,
+        now: SystemTime,
+        entity: Option<(&str, &str)>,
+    ) -> Result<TimelineDto, ApiError> {
         let (resolution, step_ms) = match range {
             TimeRange::Minute15 | TimeRange::Hour1 => ("minute", 60_000i64),
             TimeRange::Hour24 | TimeRange::Day7 => ("hour", 3_600_000i64),
@@ -1078,13 +1706,33 @@ impl Db {
         let end = unix_millis(now).div_euclid(step_ms) * step_ms;
         let start = unix_millis(range.cutoff(now)).div_euclid(step_ms) * step_ms;
 
+        let mut sql =
+            String::from("SELECT start_ms, in_packets, in_bytes, out_packets, out_bytes FROM ");
+        let mut params = vec![
+            Value::Text(resolution.to_owned()),
+            Value::Integer(start),
+            Value::Integer(end),
+        ];
+        match entity {
+            Some((kind, key)) => {
+                sql.push_str(
+                    "entity_buckets WHERE resolution = ?1 AND start_ms BETWEEN ?2 AND ?3 \
+                     AND kind = ?4 AND key = ?5 ORDER BY start_ms",
+                );
+                params.push(Value::Text(kind.to_owned()));
+                params.push(Value::Text(key.to_owned()));
+            }
+            None => {
+                sql.push_str(
+                    "traffic_buckets WHERE resolution = ?1 AND start_ms BETWEEN ?2 AND ?3 \
+                     ORDER BY start_ms",
+                );
+            }
+        }
+
         let mut points: HashMap<i64, TimelinePointDto> = HashMap::new();
-        let mut statement = self.conn.prepare(
-            "SELECT start_ms, in_packets, in_bytes, out_packets, out_bytes \
-             FROM traffic_buckets WHERE resolution = ?1 AND start_ms BETWEEN ?2 AND ?3 \
-             ORDER BY start_ms",
-        )?;
-        for row in statement.query_map(params![resolution, start, end], |row| {
+        let mut statement = self.conn.prepare(&sql)?;
+        for row in statement.query_map(params_from_iter(params), |row| {
             Ok((
                 row.get::<_, i64>(0)?,
                 row.get::<_, i64>(1)?,
@@ -1301,7 +1949,7 @@ impl Db {
         let result = (|| -> Result<(), ApiError> {
             self.conn.execute_batch(
                 "DELETE FROM flows; DELETE FROM observations; DELETE FROM traffic_buckets; \
-                 DELETE FROM exports;",
+                 DELETE FROM entity_buckets; DELETE FROM exports;",
             )?;
             Ok(())
         })();
@@ -1371,8 +2019,61 @@ impl Db {
             .map(|entry| (entry.action, entry.outcome, entry.at))
     }
 
+    /// Records one local operation in the audit ring (PRD 8.10).
+    pub(crate) fn record_operation(&mut self, action: &'static str, outcome: &'static str) {
+        self.audit(action, outcome);
+    }
+
     pub(crate) fn enrichment_status(&self) -> (EnrichmentStats, Option<String>) {
         (self.enricher.stats(), self.enrichment_error.clone())
+    }
+
+    /// Enriches stored public addresses that were not covered by the current
+    /// GeoIP database. Idempotent: rows already carrying the active database
+    /// version are skipped, so a later database swap refreshes them on the
+    /// next start while restarts with the same file do nothing.
+    pub(crate) fn backfill_enrichment(&mut self) -> Result<usize, ApiError> {
+        let Some(version) = self.enricher.stats().database_version else {
+            return Ok(0);
+        };
+        let addresses = {
+            let mut statement = self.conn.prepare(
+                "SELECT DISTINCT remote_addr FROM flows WHERE remote_scope = 'public' \
+                 AND (remote_db_version IS NULL OR remote_db_version != ?1)",
+            )?;
+            statement
+                .query_map([version.as_ref()], |row| row.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+
+        let mut updated = 0;
+        for address in addresses {
+            let Ok(address) = address.parse::<IpAddr>() else {
+                continue;
+            };
+            let profile = self.enricher.profile(address);
+            if profile.country.is_none() && profile.asn.is_none() && profile.organization.is_none()
+            {
+                continue;
+            }
+            updated += self.conn.execute(
+                "UPDATE flows SET remote_country = ?1, remote_region = ?2, remote_city = ?3, \
+                 remote_asn = ?4, remote_org = ?5, remote_db_version = ?6, \
+                 remote_enriched_at_ms = ?7 \
+                 WHERE remote_addr = ?8 AND remote_scope = 'public'",
+                params![
+                    profile.country.as_deref(),
+                    profile.region.as_deref(),
+                    profile.city_approximate.as_deref(),
+                    profile.asn.map(i64::from),
+                    profile.organization.as_deref(),
+                    profile.database_version.as_deref(),
+                    unix_millis(profile.enriched_at),
+                    address.to_string(),
+                ],
+            )?;
+        }
+        Ok(updated)
     }
 
     #[cfg(test)]
@@ -1501,6 +2202,13 @@ impl Db {
             clauses.push(format!("{prefix}remote_scope = ?"));
             params.push(Value::Text(enum_value(scope)));
         }
+        if !query.exclude_scope.is_empty() {
+            let placeholders = vec!["?"; query.exclude_scope.len()].join(", ");
+            clauses.push(format!("{prefix}remote_scope NOT IN ({placeholders})"));
+            for scope in &query.exclude_scope {
+                params.push(Value::Text(enum_value(*scope)));
+            }
+        }
         if let Some(state) = query.state {
             clauses.push(format!("{prefix}state = ?"));
             params.push(Value::Text(state.as_str().to_owned()));
@@ -1615,17 +2323,23 @@ fn associate_address(
         .map_err(|error| ApiError::internal(format!("serialize domains: {error}")))
 }
 
+/// Collaborators shared by every upsert of one collection interval.
+struct FlowWriter<'a> {
+    enricher: &'a mut Enricher,
+    interfaces: &'a HashMap<u32, Box<str>>,
+    proxy: &'a ProxyResolver,
+}
+
 fn upsert_flow(
     tx: &rusqlite::Transaction<'_>,
     id: u64,
     update: &FlowUpdate,
     now_instant: Instant,
     now_system: SystemTime,
-    enricher: &mut Enricher,
-    interfaces: &HashMap<u32, Box<str>>,
+    writer: &mut FlowWriter<'_>,
 ) -> Result<(), ApiError> {
     let remote = remote_endpoint(&update.key);
-    let profile = enricher.profile(remote.address);
+    let profile = resolved_profile(update, remote, writer.enricher, writer.proxy);
     let domains_json = associate_address(tx, remote.address, now_system)?;
     let first_seen = instant_to_system(update.first_seen, now_instant, now_system);
     let last_seen = instant_to_system(update.last_seen, now_instant, now_system);
@@ -1633,26 +2347,47 @@ fn upsert_flow(
         FlowState::Ended(reason) => Some(enum_value(reason)),
         FlowState::Active => None,
     };
-    let interface = interfaces.get(&update.key.interface_index.get());
+    let interface = writer.interfaces.get(&update.key.interface_index.get());
 
     tx.execute(
         "INSERT INTO flows (id, direction, protocol, src_addr, src_port, dst_addr, dst_port, \
          ifindex, interface, packets, bytes, first_seen_ms, last_seen_ms, state, end_reason, \
          remote_addr, remote_port, remote_scope, remote_country, remote_region, remote_city, \
-         remote_asn, remote_org, remote_db_version, remote_enriched_at_ms, domains_json) \
+         remote_asn, remote_org, remote_db_version, remote_enriched_at_ms, domains_json, \
+         service) \
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, \
-         ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26) \
+         ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27) \
          ON CONFLICT(id) DO UPDATE SET \
          packets = excluded.packets, bytes = excluded.bytes, \
          first_seen_ms = MIN(flows.first_seen_ms, excluded.first_seen_ms), \
          last_seen_ms = MAX(flows.last_seen_ms, excluded.last_seen_ms), \
          state = excluded.state, end_reason = excluded.end_reason, \
          interface = excluded.interface, domains_json = excluded.domains_json, \
-         remote_scope = excluded.remote_scope, remote_country = excluded.remote_country, \
-         remote_region = excluded.remote_region, remote_city = excluded.remote_city, \
-         remote_asn = excluded.remote_asn, remote_org = excluded.remote_org, \
-         remote_db_version = excluded.remote_db_version, \
-         remote_enriched_at_ms = excluded.remote_enriched_at_ms",
+         service = COALESCE(excluded.service, flows.service), \
+         remote_scope = excluded.remote_scope, \
+         remote_country = CASE WHEN excluded.remote_scope = 'fake_ip' \
+             THEN COALESCE(excluded.remote_country, flows.remote_country) \
+             ELSE excluded.remote_country END, \
+         remote_region = CASE WHEN excluded.remote_scope = 'fake_ip' \
+             THEN COALESCE(excluded.remote_region, flows.remote_region) \
+             ELSE excluded.remote_region END, \
+         remote_city = CASE WHEN excluded.remote_scope = 'fake_ip' \
+             THEN COALESCE(excluded.remote_city, flows.remote_city) \
+             ELSE excluded.remote_city END, \
+         remote_asn = CASE WHEN excluded.remote_scope = 'fake_ip' \
+             THEN COALESCE(excluded.remote_asn, flows.remote_asn) \
+             ELSE excluded.remote_asn END, \
+         remote_org = CASE WHEN excluded.remote_scope = 'fake_ip' \
+             THEN COALESCE(excluded.remote_org, flows.remote_org) \
+             ELSE excluded.remote_org END, \
+         remote_db_version = CASE WHEN excluded.remote_scope = 'fake_ip' \
+             THEN COALESCE(excluded.remote_db_version, flows.remote_db_version) \
+             ELSE excluded.remote_db_version END, \
+         remote_enriched_at_ms = CASE WHEN excluded.remote_scope = 'fake_ip' \
+             AND excluded.remote_country IS NULL AND excluded.remote_asn IS NULL \
+             AND excluded.remote_db_version IS NULL \
+             THEN flows.remote_enriched_at_ms \
+             ELSE excluded.remote_enriched_at_ms END",
         params![
             id as i64,
             enum_value(update.key.direction),
@@ -1680,6 +2415,7 @@ fn upsert_flow(
             profile.database_version.as_ref().map(Box::as_ref),
             unix_millis(profile.enriched_at),
             domains_json,
+            update.service.as_deref(),
         ],
     )?;
     Ok(())
@@ -1707,6 +2443,42 @@ fn add_bucket(
             inbound.bytes as i64,
             outbound.packets as i64,
             outbound.bytes as i64,
+        ],
+    )?;
+    Ok(())
+}
+
+/// Adds one Flow delta to an entity (Endpoint or Domain) time bucket.
+fn add_entity_bucket(
+    tx: &rusqlite::Transaction<'_>,
+    kind: &str,
+    key: &str,
+    resolution: &str,
+    start: SystemTime,
+    direction: FlowDirection,
+    delta: TrafficCounters,
+) -> Result<(), ApiError> {
+    let (in_packets, in_bytes, out_packets, out_bytes) = match direction {
+        FlowDirection::Inbound => (delta.packets as i64, delta.bytes as i64, 0, 0),
+        FlowDirection::Outbound => (0, 0, delta.packets as i64, delta.bytes as i64),
+    };
+    tx.execute(
+        "INSERT INTO entity_buckets (kind, key, resolution, start_ms, in_packets, in_bytes, \
+         out_packets, out_bytes) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) \
+         ON CONFLICT(kind, key, resolution, start_ms) DO UPDATE SET \
+         in_packets = entity_buckets.in_packets + excluded.in_packets, \
+         in_bytes = entity_buckets.in_bytes + excluded.in_bytes, \
+         out_packets = entity_buckets.out_packets + excluded.out_packets, \
+         out_bytes = entity_buckets.out_bytes + excluded.out_bytes",
+        params![
+            kind,
+            key,
+            resolution,
+            unix_millis(start),
+            in_packets,
+            in_bytes,
+            out_packets,
+            out_bytes,
         ],
     )?;
     Ok(())
@@ -1857,6 +2629,9 @@ fn flow_order(sort: Option<&str>) -> Result<String, ApiError> {
         "first_seen" => "first_seen_ms",
         "bytes" => "bytes",
         "packets" => "packets",
+        "direction" => "direction",
+        "remote" => "ip_sort_key(remote_addr)",
+        "domain" => "domain_sort_key(json_extract(domains_json, '$[0].domain'))",
         _ => return Err(unsupported_sort(field)),
     };
     let direction = if descending { "DESC" } else { "ASC" };
@@ -1868,7 +2643,13 @@ fn endpoint_order(sort: Option<&str>) -> Result<String, ApiError> {
     let column = match field {
         "bytes" => "total_bytes",
         "packets" => "total_packets",
+        "in_bytes" => "in_bytes",
+        "out_bytes" => "out_bytes",
         "last_seen" => "last_seen_ms",
+        "address" => "ip_sort_key(remote_addr)",
+        "country" => "country",
+        "organization" => "organization",
+        "asn" => "asn",
         _ => return Err(unsupported_sort(field)),
     };
     let direction = if descending { "DESC" } else { "ASC" };
@@ -1880,12 +2661,52 @@ fn domain_order(sort: Option<&str>) -> Result<String, ApiError> {
     let column = match field {
         "bytes" => "total_bytes",
         "packets" => "total_packets",
+        "in_bytes" => "in_bytes",
+        "out_bytes" => "out_bytes",
         "last_seen" => "last_seen_ms",
-        "domain" => "domain",
+        "domain" => "domain_sort_key(je.value->>'domain')",
+        "evidence" => "evidences",
         _ => return Err(unsupported_sort(field)),
     };
     let direction = if descending { "DESC" } else { "ASC" };
     Ok(format!("{column} {direction}, domain {direction}"))
+}
+
+fn connection_order(sort: Option<&str>) -> Result<String, ApiError> {
+    let (field, descending) = split_sort(sort, "-last_seen");
+    let column = match field {
+        "last_seen" => "last_seen_ms",
+        "first_seen" => "first_seen_ms",
+        "duration_ms" => "duration_ms",
+        "bytes" => "total_bytes",
+        "packets" => "total_packets",
+        "in_bytes" => "in_bytes",
+        "out_bytes" => "out_bytes",
+        "service" => "service",
+        "remote" => "ip_sort_key(MAX(remote_addr))",
+        "domain" => "domain_sort_key(MIN(json_extract(domains_json, '$[0].domain')))",
+        _ => return Err(unsupported_sort(field)),
+    };
+    let direction = if descending { "DESC" } else { "ASC" };
+    Ok(format!(
+        "{column} {direction}, pair_lo {direction}, pair_hi {direction}"
+    ))
+}
+
+/// Stable derived id for an unordered endpoint pair (FNV-1a 64).
+fn connection_id(protocol: Protocol, ifindex: i64, pair_lo: &str, pair_hi: &str) -> String {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in enum_value(protocol)
+        .bytes()
+        .chain(ifindex.to_le_bytes())
+        .chain(pair_lo.bytes())
+        .chain([0u8])
+        .chain(pair_hi.bytes())
+    {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("{hash:016x}")
 }
 
 fn unsupported_sort(field: &str) -> ApiError {
@@ -1900,11 +2721,143 @@ fn where_sql(clauses: &[String]) -> String {
     }
 }
 
+/// Registers the SQLite scalar helpers used by ordering expressions.
+fn register_functions(conn: &Connection) -> Result<(), ApiError> {
+    let flags = FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC;
+    conn.create_scalar_function("ip_sort_key", 1, flags, |context| {
+        let text: Option<String> = context.get(0)?;
+        Ok(text.as_deref().and_then(ip_sort_key))
+    })?;
+    conn.create_scalar_function("domain_sort_key", 1, flags, |context| {
+        let text: Option<String> = context.get(0)?;
+        Ok(text.as_deref().map(domain_sort_key))
+    })?;
+    Ok(())
+}
+
+/// Numeric sort key for an IP address so `2.2.2.2` orders before `10.0.0.1`.
+/// IPv6 keys are offset past every IPv4 value.
+fn ip_sort_key(text: &str) -> Option<f64> {
+    match text.parse::<IpAddr>().ok()? {
+        IpAddr::V4(address) => Some(f64::from(u32::from(address))),
+        IpAddr::V6(address) => Some(4_294_967_296.0 + (u128::from(address) >> 64) as f64),
+    }
+}
+
+/// RFC 4034 style canonical key: labels compared from the root up. The
+/// separator is below every legal label byte so a shorter name sorts before
+/// its own subdomains (`example.com` < `api.example.com`).
+fn domain_sort_key(domain: &str) -> String {
+    let mut labels: Vec<&str> = domain
+        .split('.')
+        .filter(|label| !label.is_empty())
+        .collect();
+    labels.reverse();
+    labels.join("\u{0}")
+}
+
+/// Adds a column to an existing table when the schema upgrade needs it.
+fn add_column_if_missing(
+    conn: &rusqlite::Connection,
+    table: &str,
+    column: &str,
+    definition: &str,
+) -> Result<(), ApiError> {
+    let mut statement = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let existing = statement
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    if existing.iter().any(|name| name == column) {
+        return Ok(());
+    }
+    conn.execute_batch(&format!(
+        "ALTER TABLE {table} ADD COLUMN {column} {definition}"
+    ))?;
+    Ok(())
+}
+
 fn split_enum_list(value: &str) -> Vec<DomainEvidence> {
     value
         .split(',')
         .filter_map(|kind| enum_from_value(kind.trim()))
         .collect()
+}
+
+/// Sorted, deduplicated JSON array used as a `json_each` key list.
+fn json_key_list<'a>(keys: impl Iterator<Item = &'a String>) -> Result<String, ApiError> {
+    let mut keys: Vec<&str> = keys.map(String::as_str).collect();
+    keys.sort_unstable();
+    keys.dedup();
+    serde_json::to_string(&keys)
+        .map_err(|error| ApiError::internal(format!("serialize aggregate keys: {error}")))
+}
+
+/// Overrides a fake-IP profile with the real destination resolved through
+/// the proxy control API; keeps demo/GeoIP attribution honest by only using
+/// values the proxy itself reported or our own offline GeoIP lookup.
+fn resolved_profile(
+    update: &FlowUpdate,
+    remote: &Endpoint,
+    enricher: &mut Enricher,
+    proxy: &ProxyResolver,
+) -> std::sync::Arc<zimascope_common::model::IpProfile> {
+    let profile = enricher.profile(remote.address);
+    if profile.scope != AddressScope::FakeIp {
+        return profile;
+    }
+    let (client_address, client_port) = if update.key.source.address == remote.address {
+        (update.key.destination.address, update.key.destination.port)
+    } else {
+        (update.key.source.address, update.key.source.port)
+    };
+    let Some(key) = ProxyKey::for_fake_flow(client_address, client_port, remote.port) else {
+        return profile;
+    };
+    let Some(resolution) = proxy.lookup(&key) else {
+        return profile;
+    };
+
+    if let Some(real) = resolution.real_address {
+        let real_profile = enricher.profile(real);
+        return std::sync::Arc::new(zimascope_common::model::IpProfile {
+            address: remote.address,
+            scope: profile.scope,
+            country: real_profile.country.clone(),
+            region: real_profile.region.clone(),
+            city_approximate: real_profile.city_approximate.clone(),
+            asn: real_profile.asn,
+            organization: real_profile.organization.clone(),
+            database_version: real_profile.database_version.clone(),
+            enriched_at: real_profile.enriched_at,
+        });
+    }
+
+    if resolution.country.is_some() || resolution.asn.is_some() {
+        return std::sync::Arc::new(zimascope_common::model::IpProfile {
+            address: remote.address,
+            scope: profile.scope,
+            country: resolution.country.map(Box::from),
+            region: None,
+            city_approximate: None,
+            asn: resolution.asn,
+            organization: None,
+            database_version: Some(Box::from("proxy")),
+            enriched_at: SystemTime::now(),
+        });
+    }
+    profile
+}
+
+/// Names a protocol from parsed TLS/HTTP evidence, for Flows stored before
+/// fingerprinting existed.
+fn evidence_service(domains: &[DomainRefDto]) -> Option<&'static str> {
+    domains
+        .iter()
+        .find_map(|association| match association.evidence {
+            DomainEvidence::TlsSni => Some("TLS"),
+            DomainEvidence::HttpHost => Some("HTTP"),
+            DomainEvidence::Dns => None,
+        })
 }
 
 fn push_domain(domains: &mut Vec<DomainRefDto>, association: &DomainRefDto) {

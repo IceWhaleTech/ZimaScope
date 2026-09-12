@@ -28,6 +28,8 @@ fn build_ebpf() -> Result<()> {
             "bpfel-unknown-none",
             "-Z",
             "build-std=core",
+            "-Z",
+            "build-std-features=compiler-builtins-mem",
             "--features",
             "bpf",
         ])

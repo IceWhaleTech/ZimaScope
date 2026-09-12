@@ -143,14 +143,39 @@ pub struct FlowQuery {
     pub asn: Option<u32>,
     pub organization: Option<String>,
     pub scope: Option<AddressScope>,
+    /// Address scopes to exclude, matched against the Flow's remote address
+    /// scope. `private,link_local,unique_local,loopback` hides local traffic.
+    #[serde(default, deserialize_with = "deserialize_scope_list")]
+    pub exclude_scope: Vec<AddressScope>,
     pub state: Option<FlowStateParam>,
     pub has_domain: Option<bool>,
     pub evidence: Option<DomainEvidence>,
     pub confidence: Option<AssociationConfidence>,
+    /// Connection listings only: collapse DNS and sub-second chatter.
+    pub hide_noise: Option<bool>,
     /// `field` or `-field`; defaults per resource.
     pub sort: Option<String>,
     pub limit: Option<usize>,
     pub offset: Option<usize>,
+}
+
+/// Parses a comma-separated [`AddressScope`] list; unknown scopes are a bad
+/// request rather than a silently partial filter.
+pub(crate) fn deserialize_scope_list<'de, D>(deserializer: D) -> Result<Vec<AddressScope>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = Option::<String>::deserialize(deserializer)?;
+    raw.as_deref()
+        .unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .map(|part| {
+            enum_from_value(part)
+                .ok_or_else(|| serde::de::Error::custom(format!("unknown address scope: {part:?}")))
+        })
+        .collect()
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -196,6 +221,40 @@ pub struct FlowDto {
     pub domains: Vec<DomainRefDto>,
 }
 
+/// One connection: both directions of a Flow merged into a single record.
+///
+/// Connection identity is the unordered endpoint pair (plus protocol and
+/// interface), so a TCP exchange appears once with directional counters
+/// instead of twice as directional Flows. Derived at query time from the
+/// stored directional rows; nothing extra is persisted.
+#[derive(Clone, Debug, Serialize)]
+pub struct ConnectionDto {
+    /// Stable derived id for the unordered endpoint pair.
+    pub id: String,
+    pub protocol: Protocol,
+    /// Fingerprinted application protocol (`SSH`, `MySQL`, `TLS`, …); `None`
+    /// when no signature matched, in which case the UI shows TCP/UDP.
+    pub service: Option<String>,
+    pub state: &'static str,
+    pub end_reason: Option<EndReason>,
+    /// The device's side of the connection.
+    pub host: EndpointDto,
+    /// The peer side: the remote for the device's own outbound connections,
+    /// or the client for connections that entered the Device Boundary.
+    pub remote: EndpointDto,
+    /// Locally enriched profile of `remote.address`.
+    pub remote_profile: IpProfileDto,
+    pub interface: Option<String>,
+    pub packets: u64,
+    pub bytes: u64,
+    /// Directional counters relative to the Device Boundary.
+    pub traffic: DirectionTotalsDto,
+    pub first_seen: i64,
+    pub last_seen: i64,
+    pub duration_ms: u64,
+    pub domains: Vec<DomainRefDto>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct IpProfileDto {
     pub address: String,
@@ -219,6 +278,8 @@ pub struct EndpointSummaryDto {
     pub organization: Option<String>,
     pub packets: u64,
     pub bytes: u64,
+    /// Directional split relative to the Device Boundary.
+    pub traffic: DirectionTotalsDto,
     pub flow_count: u64,
     pub first_seen: i64,
     pub last_seen: i64,
@@ -259,6 +320,8 @@ pub struct DomainSummaryDto {
     pub domain: String,
     pub packets: u64,
     pub bytes: u64,
+    /// Directional split relative to the Device Boundary.
+    pub traffic: DirectionTotalsDto,
     pub flow_count: u64,
     pub first_seen: i64,
     pub last_seen: i64,
@@ -274,6 +337,7 @@ pub struct DomainAddressDto {
     pub asn: Option<u32>,
     pub organization: Option<String>,
     pub bytes: u64,
+    pub first_seen: i64,
     pub last_seen: i64,
 }
 
@@ -338,11 +402,25 @@ pub struct TimelineDto {
     pub points: Vec<TimelinePointDto>,
 }
 
-#[derive(Clone, Copy, Debug, Default, Serialize)]
+#[derive(Clone, Debug, Default, Serialize)]
 pub struct DomainVisibilityDto {
     pub flows_with_domain: u64,
     pub flows_total: u64,
     pub ratio: f64,
+    /// Flow counts per Domain Evidence, ordered by count.
+    pub by_evidence: Vec<EvidenceCountDto>,
+}
+
+/// Fake-IP traffic observed at the boundary: the local proxy terminates these
+/// connections, so their real destinations are not observable here.
+#[derive(Clone, Copy, Debug, Default, Serialize)]
+pub struct ProxiedTrafficDto {
+    pub flows: u64,
+    pub bytes: u64,
+    pub flows_with_domain: u64,
+    /// Fake-IP flows whose real destination was resolved through the proxy
+    /// control API and therefore carry a country.
+    pub resolved_flows: u64,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -358,6 +436,7 @@ pub struct OverviewDto {
     pub top_asns: Vec<AsnCountDto>,
     pub active_flows: u64,
     pub domain_visibility: DomainVisibilityDto,
+    pub proxied: ProxiedTrafficDto,
     pub health: Option<CollectorHealthDto>,
 }
 
@@ -385,6 +464,8 @@ pub struct KernelCountersDto {
     pub flow_evictions: u64,
     pub domain_events_emitted: u64,
     pub domain_events_dropped: u64,
+    pub service_events_emitted: u64,
+    pub service_events_dropped: u64,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -431,6 +512,8 @@ impl CollectorHealthDto {
                 flow_evictions: health.kernel.flow_evictions,
                 domain_events_emitted: health.kernel.domain_events_emitted,
                 domain_events_dropped: health.kernel.domain_events_dropped,
+                service_events_emitted: health.kernel.service_events_emitted,
+                service_events_dropped: health.kernel.service_events_dropped,
             },
             gaps: health
                 .gaps
@@ -477,6 +560,22 @@ pub struct SettingsSummaryDto {
     pub retention_days: u16,
 }
 
+#[derive(Clone, Copy, Debug, Serialize)]
+pub struct FingerprintStatusDto {
+    pub rules: usize,
+    /// Whether the active library came from a file or an upload rather than
+    /// the embedded default.
+    pub custom: bool,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct ProxyStatusDto {
+    pub enabled: bool,
+    pub reachable: bool,
+    pub mapped: usize,
+    pub last_error: Option<String>,
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct ServiceStatusDto {
     pub service: &'static str,
@@ -490,6 +589,8 @@ pub struct ServiceStatusDto {
     pub database_error: Option<String>,
     pub collector: Option<CollectorHealthDto>,
     pub enrichment: EnrichmentStatusDto,
+    pub fingerprints: FingerprintStatusDto,
+    pub proxy: ProxyStatusDto,
     pub settings: SettingsSummaryDto,
     pub recent_operations: Vec<AuditEntryDto>,
 }
@@ -560,7 +661,11 @@ pub struct ExportTaskDto {
 ///
 /// One `tick` describes a single collection interval. `flows` are complete
 /// upserts keyed by `id`: replace any locally known Flow with the same id.
-/// `domains` are new or refreshed associations observed in the interval.
+/// `endpoints` and `domains` are refreshed aggregates for every remote peer
+/// and Associated Domain touched by this interval, so aggregate lists can be
+/// patched in place instead of polled. `observations` are new or refreshed
+/// associations observed in the interval. `overview` is a counters snapshot
+/// over the whole retained history (not a time range).
 #[derive(Clone, Debug, Serialize)]
 pub struct TickDto {
     pub sequence: u64,
@@ -568,8 +673,20 @@ pub struct TickDto {
     pub interval_ms: u64,
     pub traffic: TickTrafficDto,
     pub flows: Vec<FlowDto>,
-    pub domains: Vec<DomainObservationDto>,
+    pub endpoints: Vec<EndpointSummaryDto>,
+    pub domains: Vec<DomainSummaryDto>,
+    pub observations: Vec<DomainObservationDto>,
+    pub overview: TickOverviewDto,
     pub health: Option<CollectorHealthDto>,
+}
+
+/// Live counters over all retained history, updated every interval.
+#[derive(Clone, Copy, Debug, Default, Serialize)]
+pub struct TickOverviewDto {
+    pub active_flows: u64,
+    pub flows_total: u64,
+    pub flows_with_domain: u64,
+    pub ratio: f64,
 }
 
 #[derive(Clone, Copy, Debug, Default, Serialize)]
@@ -607,6 +724,8 @@ pub struct StreamQuery {
     pub dst_ip: Option<std::net::IpAddr>,
     pub port: Option<u16>,
     pub domain: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_scope_list")]
+    pub exclude_scope: Vec<AddressScope>,
     pub state: Option<FlowStateParam>,
     pub has_domain: Option<bool>,
 }
@@ -629,6 +748,7 @@ impl StreamQuery {
                 .domain
                 .as_deref()
                 .map(|domain| domain.trim().trim_end_matches('.').to_ascii_lowercase()),
+            exclude_scope: self.exclude_scope.clone(),
             state: self.state,
             has_domain: self.has_domain,
         }
@@ -646,12 +766,17 @@ pub struct StreamFilter {
     dst_ip: Option<String>,
     port: Option<u16>,
     domain: Option<String>,
+    exclude_scope: Vec<AddressScope>,
     state: Option<FlowStateParam>,
     has_domain: Option<bool>,
 }
 
 impl StreamFilter {
     pub fn matches(&self, flow: &FlowDto) -> bool {
+        if !self.exclude_scope.is_empty() && self.exclude_scope.contains(&flow.remote_profile.scope)
+        {
+            return false;
+        }
         if let Some(q) = &self.q {
             if !flow_search_text(flow).contains(q.as_str()) {
                 return false;

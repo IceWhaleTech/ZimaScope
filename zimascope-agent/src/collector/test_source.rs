@@ -8,7 +8,9 @@ use std::{
 
 use anyhow::{Result, bail};
 use zimascope_common::{
-    kernel_abi::{self, Direction, FlowKey, FlowValue, IpFamily, KernelStats},
+    kernel_abi::{
+        self, Direction, FlowKey, FlowValue, IpFamily, KernelStats, SampleKind, TransportProtocol,
+    },
     model::InterfaceHealth,
 };
 
@@ -17,11 +19,13 @@ use super::KernelSource;
 #[derive(Default)]
 struct State {
     flows: Vec<(FlowKey, Vec<FlowValue>)>,
-    events: Vec<kernel_abi::DomainEvent>,
+    events: Vec<kernel_abi::DomainSample>,
+    services: Vec<kernel_abi::ServiceSample>,
     stats: KernelStats,
     interfaces: Vec<InterfaceHealth>,
     fail_flow_read: bool,
     fail_domain_read: bool,
+    fail_service_read: bool,
     fail_stats_read: bool,
 }
 
@@ -50,8 +54,13 @@ impl InMemoryKernelSource {
         self
     }
 
-    pub fn with_event(self, event: kernel_abi::DomainEvent) -> Self {
-        self.handle().push_event(event);
+    pub fn with_event(self, sample: kernel_abi::DomainSample) -> Self {
+        self.handle().push_event(sample);
+        self
+    }
+
+    pub fn with_service(self, sample: kernel_abi::ServiceSample) -> Self {
+        self.handle().push_service(sample);
         self
     }
 
@@ -93,8 +102,12 @@ impl InMemoryHandle {
         state.flows.push((key, values));
     }
 
-    pub fn push_event(&self, event: kernel_abi::DomainEvent) {
-        self.state.lock().expect("test state").events.push(event);
+    pub fn push_event(&self, sample: kernel_abi::DomainSample) {
+        self.state.lock().expect("test state").events.push(sample);
+    }
+
+    pub fn push_service(&self, sample: kernel_abi::ServiceSample) {
+        self.state.lock().expect("test state").services.push(sample);
     }
 
     pub fn set_flows_failing(&self, fail: bool) {
@@ -107,6 +120,10 @@ impl InMemoryHandle {
 
     pub fn set_domains_failing(&self, fail: bool) {
         self.state.lock().expect("test state").fail_domain_read = fail;
+    }
+
+    pub fn set_services_failing(&self, fail: bool) {
+        self.state.lock().expect("test state").fail_service_read = fail;
     }
 
     pub fn set_stats_failing(&self, fail: bool) {
@@ -154,13 +171,28 @@ impl KernelSource for InMemoryKernelSource {
 
     fn drain_domain_events(
         &mut self,
-        visitor: &mut dyn FnMut(&kernel_abi::DomainEvent),
+        visitor: &mut dyn FnMut(&kernel_abi::DomainSample),
     ) -> Result<()> {
         let mut state = self.state.lock().expect("test state");
         if state.fail_domain_read {
             bail!("injected domain event read failure");
         }
         let events = core::mem::take(&mut state.events);
+        for event in &events {
+            visitor(event);
+        }
+        Ok(())
+    }
+
+    fn drain_service_events(
+        &mut self,
+        visitor: &mut dyn FnMut(&kernel_abi::ServiceSample),
+    ) -> Result<()> {
+        let mut state = self.state.lock().expect("test state");
+        if state.fail_service_read {
+            bail!("injected service event read failure");
+        }
+        let events = core::mem::take(&mut state.services);
         for event in &events {
             visitor(event);
         }
@@ -225,33 +257,119 @@ pub(crate) fn abi_value(
         last_seen_mono_ns: last_seen_ns,
         tcp_flags,
         parse_flags: 0,
+        service_flags: 0,
         reserved: 0,
     }
 }
 
-pub(crate) fn abi_domain_event(
-    evidence: u8,
-    domain: &str,
+pub(crate) fn abi_domain_sample(
+    kind: u8,
+    transport: u8,
     address: [u8; 4],
     observed_mono_ns: u64,
-    expires_mono_ns: u64,
-    client_context: u64,
-) -> kernel_abi::DomainEvent {
-    let mut event = kernel_abi::DomainEvent {
+    payload: &[u8],
+) -> kernel_abi::DomainSample {
+    let length = payload.len().min(kernel_abi::DOMAIN_SAMPLE_MAX);
+    let mut sample = kernel_abi::DomainSample {
         observed_mono_ns,
-        expires_mono_ns,
-        client_context,
-        address: [0u8; 16],
         ifindex: 7,
-        domain_len: domain.len() as u16,
-        evidence,
+        payload_len: length as u16,
+        kind,
+        transport,
         ip_family: IpFamily::V4 as u8,
         direction: Direction::Outbound as u8,
-        reserved: 0,
-        domain: [0u8; kernel_abi::DOMAIN_MAX_LEN],
-        padding: 0,
+        reserved: [0; 6],
+        address: [0; 16],
+        payload: [0; kernel_abi::DOMAIN_SAMPLE_MAX],
     };
-    event.address[12..].copy_from_slice(&address);
-    event.domain[..domain.len()].copy_from_slice(domain.as_bytes());
-    event
+    sample.address[12..].copy_from_slice(&address);
+    sample.payload[..length].copy_from_slice(&payload[..length]);
+    sample
+}
+
+/// Builds a DNS response sample carrying one A record.
+pub(crate) fn abi_dns_sample(
+    domain: &str,
+    address: [u8; 4],
+    ttl_secs: u32,
+) -> kernel_abi::DomainSample {
+    let mut message = Vec::new();
+    message.extend_from_slice(&0x1234u16.to_be_bytes());
+    message.extend_from_slice(&0x8180u16.to_be_bytes());
+    message.extend_from_slice(&1u16.to_be_bytes());
+    message.extend_from_slice(&1u16.to_be_bytes());
+    message.extend_from_slice(&0u16.to_be_bytes());
+    message.extend_from_slice(&0u16.to_be_bytes());
+    for label in domain.split('.') {
+        message.push(label.len() as u8);
+        message.extend_from_slice(label.as_bytes());
+    }
+    message.push(0);
+    message.extend_from_slice(&1u16.to_be_bytes());
+    message.extend_from_slice(&1u16.to_be_bytes());
+    message.push(0xC0);
+    message.push(0x0C);
+    message.extend_from_slice(&1u16.to_be_bytes());
+    message.extend_from_slice(&1u16.to_be_bytes());
+    message.extend_from_slice(&ttl_secs.to_be_bytes());
+    message.extend_from_slice(&4u16.to_be_bytes());
+    message.extend_from_slice(&address);
+
+    abi_domain_sample(
+        SampleKind::Dns as u8,
+        TransportProtocol::Udp as u8,
+        [8, 8, 8, 8],
+        1_000,
+        &message,
+    )
+}
+
+/// Builds a TLS ClientHello sample carrying one SNI value.
+pub(crate) fn abi_tls_sample(sni: &str, address: [u8; 4]) -> kernel_abi::DomainSample {
+    let mut body = Vec::new();
+    body.extend_from_slice(&[0x03, 0x03]);
+    body.extend_from_slice(&[0u8; 32]);
+    body.push(0);
+    body.extend_from_slice(&2u16.to_be_bytes());
+    body.extend_from_slice(&[0x13, 0x01]);
+    body.push(1);
+    body.push(0);
+
+    let entry_len = 1 + 2 + sni.len();
+    let mut server_name = Vec::new();
+    server_name.extend_from_slice(&(entry_len as u16).to_be_bytes());
+    server_name.push(0);
+    server_name.extend_from_slice(&(sni.len() as u16).to_be_bytes());
+    server_name.extend_from_slice(sni.as_bytes());
+
+    let mut extensions = Vec::new();
+    extensions.extend_from_slice(&0u16.to_be_bytes());
+    extensions.extend_from_slice(&(server_name.len() as u16).to_be_bytes());
+    extensions.extend_from_slice(&server_name);
+
+    body.extend_from_slice(&(extensions.len() as u16).to_be_bytes());
+    body.extend_from_slice(&extensions);
+
+    let mut handshake = Vec::new();
+    handshake.push(0x01);
+    handshake.extend_from_slice(&[
+        (body.len() >> 16) as u8,
+        (body.len() >> 8) as u8,
+        body.len() as u8,
+    ]);
+    handshake.extend_from_slice(&body);
+
+    let mut record = Vec::new();
+    record.push(0x16);
+    record.extend_from_slice(&[0x03, 0x01]);
+    record.extend_from_slice(&(handshake.len() as u16).to_be_bytes());
+    record.extend_from_slice(&handshake);
+
+    abi_domain_sample(
+        SampleKind::TlsClientHello as u8,
+        TransportProtocol::Tcp as u8,
+        address,
+        1_000,
+        &record,
+    )
 }

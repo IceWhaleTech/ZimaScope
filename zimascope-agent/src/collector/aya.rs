@@ -22,8 +22,8 @@ use aya::{
 };
 use zimascope_common::{
     kernel_abi::{
-        self, ABI_METADATA_MAP, AbiMetadata, DOMAIN_EVENTS_MAP, DomainEvent, FLOW_MAP, FlowKey,
-        FlowValue, KERNEL_STATS_MAP, KernelStats,
+        self, ABI_METADATA_MAP, AbiMetadata, DOMAIN_EVENTS_MAP, DomainSample, FLOW_MAP, FlowKey,
+        FlowValue, KERNEL_STATS_MAP, KernelStats, SERVICE_EVENTS_MAP, ServiceSample,
     },
     model::InterfaceHealth,
 };
@@ -68,6 +68,7 @@ pub(crate) struct AyaKernelSource {
     flows: PerCpuHashMap<MapData, PodFlowKey, PodFlowValue>,
     stats: PerCpuArray<MapData, PodKernelStats>,
     domains: RingBuf<MapData>,
+    services: RingBuf<MapData>,
     attached: Vec<AttachedInterface>,
 }
 
@@ -119,6 +120,12 @@ impl AyaKernelSource {
         )
         .context("convert domain event ring buffer")?;
 
+        let services = RingBuf::try_from(
+            ebpf.take_map(SERVICE_EVENTS_MAP)
+                .with_context(|| format!("eBPF map {SERVICE_EVENTS_MAP:?} is missing"))?,
+        )
+        .context("convert service event ring buffer")?;
+
         load_programs(&mut ebpf)?;
 
         let interfaces = resolve_interfaces(&config.interfaces)?;
@@ -130,6 +137,7 @@ impl AyaKernelSource {
             flows,
             stats,
             domains,
+            services,
             attached,
         })
     }
@@ -151,14 +159,26 @@ impl KernelSource for AyaKernelSource {
         Ok(entries)
     }
 
-    fn drain_domain_events(&mut self, visitor: &mut dyn FnMut(&DomainEvent)) -> Result<()> {
+    fn drain_domain_events(&mut self, visitor: &mut dyn FnMut(&DomainSample)) -> Result<()> {
         while let Some(item) = self.domains.next() {
             let bytes: &[u8] = &item;
-            if bytes.len() < core::mem::size_of::<DomainEvent>() {
+            if bytes.len() < core::mem::size_of::<DomainSample>() {
                 continue;
             }
-            let event = unsafe { ptr::read_unaligned(bytes.as_ptr().cast::<DomainEvent>()) };
-            visitor(&event);
+            let sample = unsafe { ptr::read_unaligned(bytes.as_ptr().cast::<DomainSample>()) };
+            visitor(&sample);
+        }
+        Ok(())
+    }
+
+    fn drain_service_events(&mut self, visitor: &mut dyn FnMut(&ServiceSample)) -> Result<()> {
+        while let Some(item) = self.services.next() {
+            let bytes: &[u8] = &item;
+            if bytes.len() < core::mem::size_of::<ServiceSample>() {
+                continue;
+            }
+            let sample = unsafe { ptr::read_unaligned(bytes.as_ptr().cast::<ServiceSample>()) };
+            visitor(&sample);
         }
         Ok(())
     }
@@ -284,7 +304,7 @@ fn verify_abi(ebpf: &mut Ebpf) -> Result<()> {
     let expected = AbiMetadata::CURRENT;
     if published.flow_key_size != expected.flow_key_size
         || published.flow_value_size != expected.flow_value_size
-        || published.domain_event_size != expected.domain_event_size
+        || published.domain_sample_size != expected.domain_sample_size
         || published.kernel_stats_size != expected.kernel_stats_size
     {
         bail!("eBPF ABI mismatch: recorded struct sizes do not match user space");

@@ -77,6 +77,8 @@ pub struct FlowUpdate {
     pub first_seen: Instant,
     pub last_seen: Instant,
     pub state: FlowState,
+    /// Fingerprint library match for this Flow, once a sample is classified.
+    pub service: Option<Box<str>>,
 }
 
 /// An Association between a domain and an Endpoint.
@@ -117,6 +119,7 @@ pub enum AddressScope {
     Public,
     Private,
     Shared,
+    FakeIp,
     Loopback,
     LinkLocal,
     UniqueLocal,
@@ -190,6 +193,8 @@ pub struct KernelCounters {
     pub flow_evictions: u64,
     pub domain_events_emitted: u64,
     pub domain_events_dropped: u64,
+    pub service_events_emitted: u64,
+    pub service_events_dropped: u64,
 }
 
 /// A known interval in which ZimaScope could not observe complete metadata.
@@ -225,18 +230,6 @@ impl FlowDirection {
         match kernel_abi::Direction::from_abi(value) {
             Some(kernel_abi::Direction::Inbound) => Some(Self::Inbound),
             Some(kernel_abi::Direction::Outbound) => Some(Self::Outbound),
-            None => None,
-        }
-    }
-}
-
-impl DomainEvidence {
-    /// Converts a validated kernel ABI discriminant.
-    pub const fn from_abi(value: u8) -> Option<Self> {
-        match kernel_abi::DomainEvidenceKind::from_abi(value) {
-            Some(kernel_abi::DomainEvidenceKind::Dns) => Some(Self::Dns),
-            Some(kernel_abi::DomainEvidenceKind::TlsSni) => Some(Self::TlsSni),
-            Some(kernel_abi::DomainEvidenceKind::HttpHost) => Some(Self::HttpHost),
             None => None,
         }
     }
@@ -280,12 +273,17 @@ impl AddressScope {
             // 100.64.0.0/10, RFC 6598 carrier-grade NAT.
             return Self::Shared;
         }
+        if value & 0xFFFE_0000 == 0xC612_0000 {
+            // 198.18.0.0/15, RFC 2544 benchmarking. Local proxies commonly
+            // hand these out in fake-IP mode; the true destination never
+            // appears at the device boundary.
+            return Self::FakeIp;
+        }
         if value & 0xFFFFFF00 == 0xC000_0000
-            || value & 0xFFFE_0000 == 0xC612_0000
             || value & 0xF000_0000 == 0xF000_0000
             || value & 0xFF00_0000 == 0x0000_0000
         {
-            // 192.0.0.0/24, 198.18.0.0/15, 240.0.0.0/4, 0.0.0.0/8.
+            // 192.0.0.0/24, 240.0.0.0/4, 0.0.0.0/8.
             return Self::Reserved;
         }
 
@@ -350,7 +348,9 @@ mod tests {
         assert_eq!(classify("192.0.2.10"), AddressScope::Documentation);
         assert_eq!(classify("198.51.100.10"), AddressScope::Documentation);
         assert_eq!(classify("203.0.113.10"), AddressScope::Documentation);
-        assert_eq!(classify("198.18.0.1"), AddressScope::Reserved);
+        assert_eq!(classify("198.18.0.1"), AddressScope::FakeIp);
+        assert_eq!(classify("198.19.255.255"), AddressScope::FakeIp);
+        assert_eq!(classify("198.20.0.1"), AddressScope::Public);
         assert_eq!(classify("240.0.0.1"), AddressScope::Reserved);
         assert_eq!(classify("0.0.0.0"), AddressScope::Unspecified);
         assert_eq!(classify("0.1.2.3"), AddressScope::Reserved);

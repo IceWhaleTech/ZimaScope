@@ -15,6 +15,7 @@ pub(crate) enum GapKey {
     FlowMapReadFailed,
     KernelStatsReadFailed,
     DomainEventsReadFailed,
+    ServiceEventsReadFailed,
     InterfaceDetached(u32),
 }
 
@@ -45,7 +46,8 @@ impl HealthTracker {
         let reason = match key {
             GapKey::FlowMapReadFailed
             | GapKey::KernelStatsReadFailed
-            | GapKey::DomainEventsReadFailed => GapReason::MapReadFailed,
+            | GapKey::DomainEventsReadFailed
+            | GapKey::ServiceEventsReadFailed => GapReason::MapReadFailed,
             GapKey::InterfaceDetached(ifindex) => GapReason::InterfaceDetached { ifindex },
         };
         self.open_gaps.insert(
@@ -88,6 +90,8 @@ impl HealthTracker {
             flow_evictions: stats.flow_evictions,
             domain_events_emitted: stats.domain_events_emitted,
             domain_events_dropped: stats.domain_events_dropped,
+            service_events_emitted: stats.service_events_emitted,
+            service_events_dropped: stats.service_events_dropped,
         };
 
         let delta = if self.kernel_seen && is_monotonic(self.last_kernel, current) {
@@ -102,6 +106,10 @@ impl HealthTracker {
                     - self.last_kernel.domain_events_emitted,
                 domain_events_dropped: current.domain_events_dropped
                     - self.last_kernel.domain_events_dropped,
+                service_events_emitted: current.service_events_emitted
+                    - self.last_kernel.service_events_emitted,
+                service_events_dropped: current.service_events_dropped
+                    - self.last_kernel.service_events_dropped,
             }
         } else {
             current
@@ -142,4 +150,6 @@ fn is_monotonic(previous: KernelCounters, current: KernelCounters) -> bool {
         && current.flow_evictions >= previous.flow_evictions
         && current.domain_events_emitted >= previous.domain_events_emitted
         && current.domain_events_dropped >= previous.domain_events_dropped
+        && current.service_events_emitted >= previous.service_events_emitted
+        && current.service_events_dropped >= previous.service_events_dropped
 }

@@ -27,6 +27,19 @@ pub struct Settings {
     pub domains: DomainObservationSettings,
     pub history: HistorySettings,
     pub resources: ResourceSettings,
+    /// mihomo/Clash external-controller integration (fake-IP resolution).
+    pub proxy: ProxySettings,
+}
+
+/// Resolves fake-IP destinations through a local/remote proxy control API.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ProxySettings {
+    pub enabled: bool,
+    /// e.g. `http://192.168.100.3:9090`; http only for now.
+    pub controller_url: String,
+    /// mihomo `secret`.
+    pub secret: String,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -67,6 +80,7 @@ impl Default for Settings {
             domains: DomainObservationSettings::default(),
             history: HistorySettings::default(),
             resources: ResourceSettings::default(),
+            proxy: ProxySettings::default(),
         }
     }
 }
@@ -115,6 +129,17 @@ impl Settings {
             self.domains.tls_sni = false;
             self.domains.http_host = false;
         }
+
+        self.proxy.controller_url = self
+            .proxy
+            .controller_url
+            .trim()
+            .trim_end_matches('/')
+            .to_owned();
+        self.proxy.secret = self.proxy.secret.trim().to_owned();
+        if !self.proxy.enabled {
+            self.proxy.secret.clear();
+        }
     }
 
     pub fn validate(&self) -> Result<(), ApiError> {
@@ -145,6 +170,20 @@ impl Settings {
                 "resources.disk_quota_mb must be between {MIN_DISK_QUOTA_MB} and {MAX_DISK_QUOTA_MB}"
             )));
         }
+        if self.proxy.enabled {
+            if !self.proxy.controller_url.starts_with("http://")
+                || self.proxy.controller_url.len() > 200
+            {
+                return Err(ApiError::unprocessable(
+                    "proxy.controller_url must be an http:// URL (https is not supported yet)",
+                ));
+            }
+            if self.proxy.secret.len() > 128 {
+                return Err(ApiError::unprocessable(
+                    "proxy.secret must be at most 128 characters",
+                ));
+            }
+        }
         Ok(())
     }
 }
@@ -158,6 +197,7 @@ pub struct SettingsPatch {
     pub domains: Option<DomainObservationPatch>,
     pub history: Option<HistoryPatch>,
     pub resources: Option<ResourcePatch>,
+    pub proxy: Option<ProxyPatch>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -187,6 +227,14 @@ pub struct HistoryPatch {
 pub struct ResourcePatch {
     pub max_flow_entries: Option<u32>,
     pub disk_quota_mb: Option<u32>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ProxyPatch {
+    pub enabled: Option<bool>,
+    pub controller_url: Option<String>,
+    pub secret: Option<String>,
 }
 
 impl SettingsPatch {
@@ -227,6 +275,17 @@ impl SettingsPatch {
             }
             if let Some(disk_quota_mb) = resources.disk_quota_mb {
                 settings.resources.disk_quota_mb = disk_quota_mb;
+            }
+        }
+        if let Some(proxy) = self.proxy {
+            if let Some(enabled) = proxy.enabled {
+                settings.proxy.enabled = enabled;
+            }
+            if let Some(controller_url) = proxy.controller_url {
+                settings.proxy.controller_url = controller_url;
+            }
+            if let Some(secret) = proxy.secret {
+                settings.proxy.secret = secret;
             }
         }
     }

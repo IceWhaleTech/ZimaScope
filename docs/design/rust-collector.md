@@ -34,6 +34,7 @@ Kernel ABI structs contain no `String`, `Vec`, embedded Rust enums, pointers, re
 
 pub const ABI_VERSION: u16 = 1;
 pub const DOMAIN_MAX_LEN: usize = 253;
+pub const DOMAIN_SAMPLE_MAX: usize = 512;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
@@ -41,7 +42,7 @@ pub struct AbiMetadata {
     pub version: u16,
     pub flow_key_size: u16,
     pub flow_value_size: u16,
-    pub domain_event_size: u16,
+    pub domain_sample_size: u16,
     pub kernel_stats_size: u16,
     pub reserved: [u8; 6],
 }
@@ -69,10 +70,10 @@ pub enum TransportProtocol {
 
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum DomainEvidenceKind {
+pub enum SampleKind {
     Dns = 1,
-    TlsSni = 2,
-    HttpHost = 3,
+    TlsClientHello = 2,
+    HttpRequest = 3,
 }
 
 #[repr(C)]
@@ -101,21 +102,22 @@ pub struct FlowValue {
     pub reserved: u32,
 }
 
+/// One bounded payload sample emitted from the packet path. User space parses
+/// DNS responses, TLS ClientHellos and HTTP requests out of `payload`; the
+/// kernel never assembles domain names.
 #[repr(C)]
 #[derive(Clone, Copy)]
-pub struct DomainEvent {
+pub struct DomainSample {
     pub observed_mono_ns: u64,
-    pub expires_mono_ns: u64,
-    pub client_context: u64,
-    pub address: [u8; 16],
     pub ifindex: u32,
-    pub domain_len: u16,
-    pub evidence: u8,
+    pub payload_len: u16,
+    pub kind: u8,
+    pub transport: u8,
     pub ip_family: u8,
     pub direction: u8,
-    pub reserved: u8,
-    pub domain: [u8; DOMAIN_MAX_LEN],
-    pub padding: u8,
+    pub reserved: [u8; 6],
+    pub address: [u8; 16],
+    pub payload: [u8; DOMAIN_SAMPLE_MAX],
 }
 
 #[repr(C)]
@@ -137,7 +139,7 @@ Implementation requirements:
 - Add compile-time size and alignment assertions for every ABI type.
 - Implement the required Aya `Pod` markers only after verifying that every byte, including padding, is initialized.
 - Encode IPv4 in the final four bytes of zero-extended 16-byte storage and retain the family discriminant, so the key layout does not change when IPv6 is added.
-- Emit one DNS event per domain/address association. TLS SNI and HTTP Host use the peer address from the observed Flow.
+- Peek at candidate packets with constant offsets only (TLS ClientHello handshake bytes, DNS response flag, HTTP method) and copy at most `DOMAIN_SAMPLE_MAX` payload bytes through `bpf_skb_load_bytes`. Parse DNS, TLS SNI and HTTP Host in user space, where loops and string handling are free of verifier constraints.
 - Validate enum discriminants, lengths, and UTF-8 in user space before producing domain values.
 
 ## User-space model
@@ -359,7 +361,7 @@ trait KernelSource: Send {
 
     fn drain_domain_events(
         &mut self,
-        visitor: &mut dyn FnMut(&kernel_abi::DomainEvent),
+        visitor: &mut dyn FnMut(&kernel_abi::DomainSample),
     ) -> anyhow::Result<EventSummary>;
 
     fn read_stats(&mut self) -> anyhow::Result<kernel_abi::KernelStats>;
@@ -416,7 +418,7 @@ On each configured interval, private `CollectorCore::poll_once` performs these b
 2. Convert validated ABI keys into user-space `FlowKey` values.
 3. Calculate deltas with saturating subtraction. A lower total indicates eviction/recreation or counter reset and starts a new logical observation.
 4. Mark missing entries as ended only after the configured idle timeout; a failed map read creates an Observation Gap and does not age flows.
-5. Drain at most the configured domain-event budget, validate and normalize domains, then deduplicate by domain, address, evidence, and client context until expiry.
+5. Drain the domain-sample ring buffer, parse DNS/TLS/HTTP payloads in user space, then normalize and deduplicate by domain, address, evidence, and client context until expiry.
 6. Read cumulative kernel statistics and convert them to deltas for health reporting.
 7. Send one `CollectionBatch` through the bounded worker channel; perform no GeoIP lookup, SQLite write, JSON serialization, or UI work inside collection.
 

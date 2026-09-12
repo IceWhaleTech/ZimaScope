@@ -5,5 +5,7 @@ pub mod api;
 mod collector;
 #[allow(dead_code)]
 mod enrichment;
+pub mod proxy;
 
+pub use collector::fingerprint::{FingerprintLibrary, SharedFingerprints, shared_default};
 pub use collector::{BatchReceiver, Collector, CollectorConfig, InterfaceSelector};

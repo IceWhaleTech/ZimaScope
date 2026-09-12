@@ -40,6 +40,10 @@ _Avoid_: Accuracy percentage
 Locally enriched information about an IP address, including address scope, country/region, ASN and organization.
 _Avoid_: Exact IP location
 
+**Fake IP**:
+A synthetic address handed out by a local proxy's fake-IP DNS, where the proxy resolves and dials the real destination. ZimaScope classifies the RFC 2544 range (198.18.0.0/15) and reports it without country or ASN attribution.
+_Avoid_: Proxy IP, virtual server
+
 **Application Identity**:
 The process, ZimaOS application, container or workload associated with a Flow when the system has sufficient evidence.
 _Avoid_: App owner
@@ -47,3 +51,7 @@ _Avoid_: App owner
 **Observation Gap**:
 A known interval or protocol condition in which ZimaScope could not observe, process or retain complete network metadata.
 _Avoid_: No traffic
+
+**Fingerprint**:
+A byte-pattern rule that identifies an application protocol from the first payload of a Flow. Matches are observed evidence; unmatched Flows stay TCP/UDP.
+_Avoid_: Port inference, service guess

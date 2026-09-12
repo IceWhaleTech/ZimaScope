@@ -8,6 +8,7 @@
 #[cfg(target_os = "linux")]
 mod aya;
 mod domain;
+pub(crate) mod fingerprint;
 mod health;
 mod tracker;
 
@@ -31,6 +32,7 @@ use zimascope_common::{
 };
 
 use domain::DomainDecoder;
+use fingerprint::SharedFingerprints;
 use health::{GapKey, HealthTracker};
 use tracker::FlowTracker;
 
@@ -40,6 +42,8 @@ pub struct CollectorConfig {
     pub interfaces: Vec<InterfaceSelector>,
     pub idle_timeout: Duration,
     pub collection_interval: Duration,
+    /// Hot-swappable fingerprint library shared with the local API.
+    pub fingerprints: SharedFingerprints,
 }
 
 #[derive(Clone, Debug)]
@@ -55,6 +59,7 @@ impl Default for CollectorConfig {
             interfaces: vec![InterfaceSelector::DefaultRoute],
             idle_timeout: Duration::from_secs(30),
             collection_interval: Duration::from_secs(1),
+            fingerprints: fingerprint::shared_default(),
         }
     }
 }
@@ -72,7 +77,12 @@ pub(crate) trait KernelSource: Send {
 
     fn drain_domain_events(
         &mut self,
-        visitor: &mut dyn FnMut(&kernel_abi::DomainEvent),
+        visitor: &mut dyn FnMut(&kernel_abi::DomainSample),
+    ) -> Result<()>;
+
+    fn drain_service_events(
+        &mut self,
+        visitor: &mut dyn FnMut(&kernel_abi::ServiceSample),
     ) -> Result<()>;
 
     fn read_stats(&mut self) -> Result<kernel_abi::KernelStats>;
@@ -166,6 +176,7 @@ struct CollectorCore {
     source: Box<dyn KernelSource>,
     tracker: FlowTracker,
     domains: DomainDecoder,
+    fingerprints: SharedFingerprints,
     health: HealthTracker,
     sequence: u64,
     last_poll: Instant,
@@ -194,6 +205,7 @@ impl CollectorCore {
             source,
             tracker: FlowTracker::new(config.idle_timeout),
             domains: DomainDecoder::new(),
+            fingerprints: config.fingerprints,
             health: HealthTracker::new(),
             sequence: 0,
             last_poll: Instant::now(),
@@ -233,6 +245,35 @@ impl CollectorCore {
             })
         };
 
+        let service_result = {
+            let source = &mut self.source;
+            let tracker = &mut self.tracker;
+            let fingerprints = &self.fingerprints;
+            source.drain_service_events(&mut |sample| {
+                let length = usize::from(sample.payload_len).min(kernel_abi::SERVICE_SAMPLE_MAX);
+                let library = fingerprints
+                    .read()
+                    .unwrap_or_else(|error| error.into_inner());
+                if let Some(service) = library.classify(&sample.payload[..length]) {
+                    if let Some(key) = tracker::decode_key(&sample.key) {
+                        tracker.set_service(&key, service.into());
+                    }
+                }
+            })
+        };
+
+        match service_result {
+            Ok(()) => {
+                self.health
+                    .close_gap(GapKey::ServiceEventsReadFailed, collected_at);
+            }
+            Err(_) => {
+                degraded = true;
+                self.health
+                    .open_gap(GapKey::ServiceEventsReadFailed, collected_at);
+            }
+        }
+
         match flow_result {
             Ok(entries) => {
                 self.map_entries = entries;
@@ -251,10 +292,8 @@ impl CollectorCore {
             let source = &mut self.source;
             let decoder = &mut self.domains;
             let clock = self.tracker.clock_mut();
-            source.drain_domain_events(&mut |event| {
-                if let Some(observation) = decoder.decode(event, clock, poll_started) {
-                    domains.push(observation);
-                }
+            source.drain_domain_events(&mut |sample| {
+                decoder.decode(sample, clock, poll_started, &mut domains);
             })
         };
 
@@ -348,7 +387,7 @@ mod tests {
 
     use tokio::time::timeout;
     use zimascope_common::{
-        kernel_abi::{self, Direction, DomainEvidenceKind},
+        kernel_abi::{self, Direction},
         model::{
             AssociationConfidence, CollectorState, DomainEvidence, EndReason, FlowState, GapReason,
         },
@@ -356,10 +395,8 @@ mod tests {
 
     use super::{
         Collector, CollectorConfig, CollectorCore,
-        test_source::{InMemoryKernelSource, abi_domain_event, abi_key, abi_value},
+        test_source::{InMemoryKernelSource, abi_dns_sample, abi_key, abi_tls_sample, abi_value},
     };
-
-    const FAR_FUTURE_NS: u64 = 1_000_000_000_000_000_000;
 
     fn open_collector(source: InMemoryKernelSource, idle_timeout: Duration) -> CollectorCore {
         CollectorCore::from_source(
@@ -650,15 +687,8 @@ mod tests {
 
     #[test]
     fn dns_events_become_inferred_observations_and_deduplicate() {
-        let event = abi_domain_event(
-            DomainEvidenceKind::Dns as u8,
-            "Example.COM.",
-            [93, 184, 216, 34],
-            100,
-            FAR_FUTURE_NS,
-            7,
-        );
-        let source = InMemoryKernelSource::new().with_event(event);
+        let sample = abi_dns_sample("Example.COM", [93, 184, 216, 34], 300);
+        let source = InMemoryKernelSource::new().with_event(sample);
         let handle = source.handle();
         let mut collector = open_collector(source, Duration::from_secs(30));
 
@@ -669,22 +699,15 @@ mod tests {
         assert_eq!(observation.evidence, DomainEvidence::Dns);
         assert_eq!(observation.confidence, AssociationConfidence::Inferred);
 
-        handle.push_event(event);
+        handle.push_event(sample);
         let duplicate = collector.poll_once();
         assert!(duplicate.domains.is_empty());
     }
 
     #[test]
     fn sni_events_are_direct_evidence() {
-        let event = abi_domain_event(
-            DomainEvidenceKind::TlsSni as u8,
-            "cdn.example.com",
-            [93, 184, 216, 34],
-            100,
-            FAR_FUTURE_NS,
-            7,
-        );
-        let source = InMemoryKernelSource::new().with_event(event);
+        let sample = abi_tls_sample("cdn.example.com", [93, 184, 216, 34]);
+        let source = InMemoryKernelSource::new().with_event(sample);
         let mut collector = open_collector(source, Duration::from_secs(30));
 
         let batch = collector.poll_once();
@@ -694,32 +717,31 @@ mod tests {
     }
 
     #[test]
-    fn invalid_domain_events_are_dropped() {
-        let mut event = abi_domain_event(
-            DomainEvidenceKind::Dns as u8,
-            "bad",
-            [93, 184, 216, 34],
-            100,
-            FAR_FUTURE_NS,
-            7,
-        );
-        event.domain[0] = 0xFF;
-        let source = InMemoryKernelSource::new().with_event(event);
+    fn invalid_domain_samples_are_dropped() {
+        let mut sample = abi_dns_sample("example.com", [93, 184, 216, 34], 60);
+        sample.kind = 9;
+        let source = InMemoryKernelSource::new().with_event(sample);
         let mut collector = open_collector(source, Duration::from_secs(30));
 
         let batch = collector.poll_once();
         assert!(batch.domains.is_empty());
         assert_eq!(batch.health.state, CollectorState::Running);
 
-        let mut bad_evidence =
-            abi_domain_event(99, "example.com", [93, 184, 216, 34], 100, FAR_FUTURE_NS, 7);
-        let source = InMemoryKernelSource::new().with_event(bad_evidence);
+        let mut bad_family = abi_dns_sample("example.com", [93, 184, 216, 34], 60);
+        bad_family.ip_family = 6;
+        let source = InMemoryKernelSource::new().with_event(bad_family);
         let mut collector = open_collector(source, Duration::from_secs(30));
         assert!(collector.poll_once().domains.is_empty());
 
-        bad_evidence.evidence = DomainEvidenceKind::Dns as u8;
-        bad_evidence.ip_family = 6;
-        let source = InMemoryKernelSource::new().with_event(bad_evidence);
+        let mut bad_transport = abi_dns_sample("example.com", [93, 184, 216, 34], 60);
+        bad_transport.transport = 1;
+        let source = InMemoryKernelSource::new().with_event(bad_transport);
+        let mut collector = open_collector(source, Duration::from_secs(30));
+        assert!(collector.poll_once().domains.is_empty());
+
+        let mut empty = abi_dns_sample("example.com", [93, 184, 216, 34], 60);
+        empty.payload_len = 0;
+        let source = InMemoryKernelSource::new().with_event(empty);
         let mut collector = open_collector(source, Duration::from_secs(30));
         assert!(collector.poll_once().domains.is_empty());
     }
@@ -727,22 +749,8 @@ mod tests {
     #[test]
     fn shared_addresses_yield_multiple_domain_candidates() {
         let source = InMemoryKernelSource::new()
-            .with_event(abi_domain_event(
-                DomainEvidenceKind::Dns as u8,
-                "one.example",
-                [203, 0, 113, 9],
-                100,
-                FAR_FUTURE_NS,
-                1,
-            ))
-            .with_event(abi_domain_event(
-                DomainEvidenceKind::Dns as u8,
-                "two.example",
-                [203, 0, 113, 9],
-                100,
-                FAR_FUTURE_NS,
-                2,
-            ));
+            .with_event(abi_dns_sample("one.example", [203, 0, 113, 9], 60))
+            .with_event(abi_dns_sample("two.example", [203, 0, 113, 9], 60));
         let mut collector = open_collector(source, Duration::from_secs(30));
 
         let batch = collector.poll_once();

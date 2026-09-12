@@ -77,9 +77,76 @@ pub trait PacketCursor {
     fn read_u16_be(&self, offset: usize) -> Option<u16>;
     fn read_u32_be(&self, offset: usize) -> Option<u32>;
 
+    /// Copies `len` bytes at `offset` into `destination`. Returns `false` when
+    /// any byte is outside the captured packet.
+    ///
+    /// Implementations should override this with a bulk copy; the default
+    /// exists for in-memory cursors.
+    fn read_bytes(&self, offset: usize, destination: &mut [u8]) -> bool {
+        for (index, byte) in destination.iter_mut().enumerate() {
+            match self.read_u8(offset + index) {
+                Some(value) => *byte = value,
+                None => return false,
+            }
+        }
+        true
+    }
+
     /// Whether `len` bytes at `offset` are present in the captured packet.
     fn has(&self, offset: usize, len: usize) -> bool {
         len == 0 || self.read_u8(offset + len - 1).is_some()
+    }
+}
+
+/// Packet cursor over a captured byte slice.
+///
+/// Used by user space to parse the bounded payload samples emitted by the
+/// kernel, and by the host unit tests.
+pub struct MemoryCursor<'a> {
+    data: &'a [u8],
+}
+
+impl<'a> MemoryCursor<'a> {
+    pub const fn new(data: &'a [u8]) -> Self {
+        Self { data }
+    }
+
+    pub const fn len(&self) -> usize {
+        self.data.len()
+    }
+
+    pub const fn is_empty(&self) -> bool {
+        self.data.is_empty()
+    }
+}
+
+impl PacketCursor for MemoryCursor<'_> {
+    #[inline(always)]
+    fn read_u8(&self, offset: usize) -> Option<u8> {
+        self.data.get(offset).copied()
+    }
+
+    #[inline(always)]
+    fn read_u16_be(&self, offset: usize) -> Option<u16> {
+        let bytes = self.data.get(offset..offset + 2)?;
+        Some(u16::from_be_bytes([bytes[0], bytes[1]]))
+    }
+
+    #[inline(always)]
+    fn read_u32_be(&self, offset: usize) -> Option<u32> {
+        let bytes = self.data.get(offset..offset + 4)?;
+        Some(u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+    }
+
+    #[inline(always)]
+    fn read_bytes(&self, offset: usize, destination: &mut [u8]) -> bool {
+        match self.data.get(offset..offset + destination.len()) {
+            Some(bytes) => {
+                destination.copy_from_slice(bytes);
+                true
+            }
+            None => false,
+        }
     }
 }
 

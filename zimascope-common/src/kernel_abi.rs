@@ -7,10 +7,22 @@
 
 /// Version of the kernel/user-space contract. Bump this whenever the layout of
 /// any type in this module changes.
-pub const ABI_VERSION: u16 = 1;
+pub const ABI_VERSION: u16 = 2;
 
 /// Maximum normalized domain length. A DNS name is at most 253 characters.
 pub const DOMAIN_MAX_LEN: usize = 253;
+
+/// Maximum L4 payload bytes copied for one domain sample. DNS, TLS SNI and
+/// HTTP Host evidence all live near the start of the payload.
+pub const DOMAIN_SAMPLE_MAX: usize = 512;
+
+/// Maximum L4 payload bytes copied for one service-fingerprint sample. Every
+/// supported signature lives in the first few dozen bytes.
+pub const SERVICE_SAMPLE_MAX: usize = 64;
+
+/// `FlowValue::service_flags`: the first payload of this direction has been
+/// sampled for protocol fingerprinting.
+pub const SERVICE_SAMPLED_FLAG: u16 = 1 << 0;
 
 /// Default number of Flow entries the eBPF map is compiled with.
 ///
@@ -27,6 +39,7 @@ pub const ABI_METADATA_MAP: &str = "abi_metadata";
 pub const FLOW_MAP: &str = "flow_map";
 pub const KERNEL_STATS_MAP: &str = "kernel_stats";
 pub const DOMAIN_EVENTS_MAP: &str = "domain_events";
+pub const SERVICE_EVENTS_MAP: &str = "service_events";
 
 /// Compile-time description of the ABI layout, stored in the eBPF object so a
 /// version mismatch can be rejected before any collection starts.
@@ -36,9 +49,10 @@ pub struct AbiMetadata {
     pub version: u16,
     pub flow_key_size: u16,
     pub flow_value_size: u16,
-    pub domain_event_size: u16,
+    pub domain_sample_size: u16,
     pub kernel_stats_size: u16,
-    pub reserved: [u8; 6],
+    pub service_sample_size: u16,
+    pub reserved: [u8; 4],
 }
 
 #[repr(u8)]
@@ -64,10 +78,10 @@ pub enum TransportProtocol {
 
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum DomainEvidenceKind {
+pub enum SampleKind {
     Dns = 1,
-    TlsSni = 2,
-    HttpHost = 3,
+    TlsClientHello = 2,
+    HttpRequest = 3,
 }
 
 impl AbiMetadata {
@@ -76,9 +90,10 @@ impl AbiMetadata {
         version: ABI_VERSION,
         flow_key_size: core::mem::size_of::<FlowKey>() as u16,
         flow_value_size: core::mem::size_of::<FlowValue>() as u16,
-        domain_event_size: core::mem::size_of::<DomainEvent>() as u16,
+        domain_sample_size: core::mem::size_of::<DomainSample>() as u16,
         kernel_stats_size: core::mem::size_of::<KernelStats>() as u16,
-        reserved: [0; 6],
+        service_sample_size: core::mem::size_of::<ServiceSample>() as u16,
+        reserved: [0; 4],
     };
 }
 
@@ -115,13 +130,13 @@ impl TransportProtocol {
     }
 }
 
-impl DomainEvidenceKind {
+impl SampleKind {
     /// Validates a raw ABI discriminant.
     pub const fn from_abi(value: u8) -> Option<Self> {
         match value {
             1 => Some(Self::Dns),
-            2 => Some(Self::TlsSni),
-            3 => Some(Self::HttpHost),
+            2 => Some(Self::TlsClientHello),
+            3 => Some(Self::HttpRequest),
             _ => None,
         }
     }
@@ -155,29 +170,45 @@ pub struct FlowValue {
     pub last_seen_mono_ns: u64,
     pub tcp_flags: u16,
     pub parse_flags: u16,
-    pub reserved: u32,
+    /// Collection-side flags such as [`SERVICE_SAMPLED_FLAG`].
+    pub service_flags: u16,
+    pub reserved: u16,
 }
 
-/// One bounded domain-evidence event emitted from the packet path.
+/// One bounded payload sample emitted from the packet path.
 ///
-/// `direction`, `address` and `ifindex` refer to the observed Flow so user
-/// space can associate the domain with an Endpoint. DNS events carry the
-/// resolved address; TLS SNI and HTTP Host events carry the peer address.
+/// User space parses DNS responses, TLS ClientHellos and HTTP requests out of
+/// `payload`; the kernel never assembles domain names. `direction`, `address`
+/// and `ifindex` refer to the observed Flow, where `address` is the
+/// direction-relative peer.
 #[repr(C)]
 #[derive(Clone, Copy)]
-pub struct DomainEvent {
+pub struct DomainSample {
     pub observed_mono_ns: u64,
-    pub expires_mono_ns: u64,
-    pub client_context: u64,
-    pub address: [u8; 16],
     pub ifindex: u32,
-    pub domain_len: u16,
-    pub evidence: u8,
+    pub payload_len: u16,
+    pub kind: u8,
+    pub transport: u8,
     pub ip_family: u8,
     pub direction: u8,
-    pub reserved: u8,
-    pub domain: [u8; DOMAIN_MAX_LEN],
-    pub padding: u8,
+    pub reserved: [u8; 6],
+    pub address: [u8; 16],
+    pub payload: [u8; DOMAIN_SAMPLE_MAX],
+}
+
+/// One bounded first-payload sample emitted once per Flow direction.
+///
+/// User space matches protocol signatures (SSH banners, database handshakes,
+/// TLS records, …) out of `payload`; the kernel never decides what the
+/// protocol is and raw bytes are discarded after classification.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct ServiceSample {
+    pub observed_mono_ns: u64,
+    pub key: FlowKey,
+    pub payload_len: u16,
+    pub reserved: [u8; 6],
+    pub payload: [u8; SERVICE_SAMPLE_MAX],
 }
 
 /// Cumulative kernel-side counters. One value is kept per CPU and summed by
@@ -192,6 +223,8 @@ pub struct KernelStats {
     pub flow_evictions: u64,
     pub domain_events_emitted: u64,
     pub domain_events_dropped: u64,
+    pub service_events_emitted: u64,
+    pub service_events_dropped: u64,
 }
 
 const _: () = {
@@ -204,10 +237,13 @@ const _: () = {
     assert!(core::mem::size_of::<FlowValue>() == 40);
     assert!(core::mem::align_of::<FlowValue>() == 8);
 
-    assert!(core::mem::size_of::<DomainEvent>() == 304);
-    assert!(core::mem::align_of::<DomainEvent>() == 8);
+    assert!(core::mem::size_of::<DomainSample>() == 552);
+    assert!(core::mem::align_of::<DomainSample>() == 8);
 
-    assert!(core::mem::size_of::<KernelStats>() == 56);
+    assert!(core::mem::size_of::<ServiceSample>() == 128);
+    assert!(core::mem::align_of::<ServiceSample>() == 8);
+
+    assert!(core::mem::size_of::<KernelStats>() == 72);
     assert!(core::mem::align_of::<KernelStats>() == 8);
 
     assert!(core::mem::offset_of!(FlowKey, src_addr) == 0);
@@ -220,11 +256,16 @@ const _: () = {
     assert!(core::mem::offset_of!(FlowKey, ip_family) == 42);
     assert!(core::mem::offset_of!(FlowKey, reserved) == 43);
 
-    assert!(core::mem::offset_of!(DomainEvent, domain) == 50);
-    assert!(core::mem::offset_of!(DomainEvent, padding) == 303);
+    assert!(core::mem::offset_of!(DomainSample, address) == 24);
+    assert!(core::mem::offset_of!(DomainSample, payload) == 40);
+
+    assert!(core::mem::offset_of!(ServiceSample, key) == 8);
+    assert!(core::mem::offset_of!(ServiceSample, payload_len) == 52);
+    assert!(core::mem::offset_of!(ServiceSample, payload) == 60);
 
     assert!(core::mem::offset_of!(FlowValue, tcp_flags) == 32);
     assert!(core::mem::offset_of!(FlowValue, parse_flags) == 34);
+    assert!(core::mem::offset_of!(FlowValue, service_flags) == 36);
 };
 
 #[cfg(test)]
@@ -238,8 +279,12 @@ mod tests {
         assert_eq!(metadata.flow_key_size as usize, size_of::<FlowKey>());
         assert_eq!(metadata.flow_value_size as usize, size_of::<FlowValue>());
         assert_eq!(
-            metadata.domain_event_size as usize,
-            size_of::<DomainEvent>()
+            metadata.domain_sample_size as usize,
+            size_of::<DomainSample>()
+        );
+        assert_eq!(
+            metadata.service_sample_size as usize,
+            size_of::<ServiceSample>()
         );
         assert_eq!(
             metadata.kernel_stats_size as usize,
@@ -264,19 +309,10 @@ mod tests {
         );
         assert_eq!(TransportProtocol::from_abi(1), None);
 
-        assert_eq!(
-            DomainEvidenceKind::from_abi(1),
-            Some(DomainEvidenceKind::Dns)
-        );
-        assert_eq!(
-            DomainEvidenceKind::from_abi(2),
-            Some(DomainEvidenceKind::TlsSni)
-        );
-        assert_eq!(
-            DomainEvidenceKind::from_abi(3),
-            Some(DomainEvidenceKind::HttpHost)
-        );
-        assert_eq!(DomainEvidenceKind::from_abi(4), None);
+        assert_eq!(SampleKind::from_abi(1), Some(SampleKind::Dns));
+        assert_eq!(SampleKind::from_abi(2), Some(SampleKind::TlsClientHello));
+        assert_eq!(SampleKind::from_abi(3), Some(SampleKind::HttpRequest));
+        assert_eq!(SampleKind::from_abi(4), None);
     }
 
     #[test]

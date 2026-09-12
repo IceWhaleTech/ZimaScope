@@ -56,7 +56,7 @@ pub(crate) struct MergedFlow {
     pub tcp_flags: u16,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 struct PreviousFlow {
     total: TrafficCounters,
     first_seen: Instant,
@@ -65,6 +65,7 @@ struct PreviousFlow {
     tcp_flags: u16,
     state: FlowState,
     generation: u64,
+    service: Option<Box<str>>,
 }
 
 const TCP_FIN: u16 = 0x001;
@@ -73,6 +74,9 @@ const TCP_RST: u16 = 0x004;
 /// Tracks deltas and lifecycle for every Flow seen so far.
 pub(crate) struct FlowTracker {
     previous: HashMap<FlowKey, PreviousFlow>,
+    /// Services classified before their Flow's first map snapshot arrived;
+    /// consumed when the Flow is first observed.
+    pending_services: HashMap<FlowKey, Box<str>>,
     idle_timeout: Duration,
     generation: u64,
     clock: MonoClock,
@@ -83,6 +87,7 @@ impl FlowTracker {
     pub fn new(idle_timeout: Duration) -> Self {
         Self {
             previous: HashMap::new(),
+            pending_services: HashMap::new(),
             idle_timeout,
             generation: 0,
             clock: MonoClock::default(),
@@ -173,6 +178,7 @@ impl FlowTracker {
                 first_seen: previous.first_seen,
                 last_seen: previous.last_seen,
                 state: FlowState::Ended(EndReason::EvictedOrUnknown),
+                service: previous.service.clone(),
             });
 
             false
@@ -193,6 +199,9 @@ impl FlowTracker {
         let previous = match self.previous.get_mut(&merged.key) {
             Some(previous) => previous,
             None => {
+                // A fingerprint sample usually arrives in the same poll as the
+                // flow's first map snapshot; carry it through immediately.
+                let service = self.pending_services.remove(&merged.key);
                 self.previous.insert(
                     merged.key.clone(),
                     PreviousFlow {
@@ -203,6 +212,7 @@ impl FlowTracker {
                         tcp_flags: merged.tcp_flags,
                         state: FlowState::Active,
                         generation,
+                        service: service.clone(),
                     },
                 );
                 return Some(FlowUpdate {
@@ -212,6 +222,7 @@ impl FlowTracker {
                     first_seen,
                     last_seen,
                     state: FlowState::Active,
+                    service,
                 });
             }
         };
@@ -270,7 +281,21 @@ impl FlowTracker {
             first_seen,
             last_seen,
             state,
+            service: previous.service.clone(),
         })
+    }
+
+    /// Records a fingerprinted service for a flow. The value rides every later
+    /// update of that flow and disappears with it. Samples that arrive before
+    /// the first map snapshot are stashed until the flow is observed.
+    pub fn set_service(&mut self, key: &FlowKey, service: Box<str>) {
+        if let Some(previous) = self.previous.get_mut(key) {
+            previous.service = Some(service);
+            return;
+        }
+        if self.pending_services.len() < 65_536 {
+            self.pending_services.insert(key.clone(), service);
+        }
     }
 
     /// Reusable buffer for merging a poll's map entries.
@@ -280,7 +305,7 @@ impl FlowTracker {
     }
 }
 
-fn decode_key(key: &kernel_abi::FlowKey) -> Option<FlowKey> {
+pub(crate) fn decode_key(key: &kernel_abi::FlowKey) -> Option<FlowKey> {
     let direction = FlowDirection::from_abi(key.direction)?;
     let protocol = Protocol::from_abi(key.protocol)?;
     if key.ip_family != kernel_abi::IpFamily::V4 as u8 {
@@ -347,6 +372,7 @@ mod tests {
             last_seen_mono_ns: last,
             tcp_flags: flags,
             parse_flags: 0,
+            service_flags: 0,
             reserved: 0,
         }
     }
@@ -403,6 +429,33 @@ mod tests {
         let mut invalid = key();
         invalid.ifindex = 0;
         assert!(FlowTracker::merge_entry(&invalid, &[value(1, 1, 1, 1, 0)]).is_none());
+    }
+
+    #[test]
+    fn service_set_before_first_snapshot_rides_the_first_update() {
+        let mut tracker = FlowTracker::new(Duration::from_secs(30));
+        let now = Instant::now();
+        let kernel_key = key();
+        let key = decode_key(&kernel_key).expect("decodable key");
+
+        // The fingerprint sample can arrive before the flow's first map
+        // snapshot; it must still land on the first update.
+        tracker.set_service(&key, "SSH".into());
+        let updates = observe(
+            &mut tracker,
+            &kernel_key,
+            &[value(3, 300, 100, 200, 0)],
+            now,
+        );
+        assert_eq!(updates[0].service.as_deref(), Some("SSH"));
+
+        let later = observe(
+            &mut tracker,
+            &kernel_key,
+            &[value(4, 400, 100, 300, 0)],
+            now + Duration::from_millis(10),
+        );
+        assert_eq!(later[0].service.as_deref(), Some("SSH"));
     }
 
     #[test]

@@ -21,4 +21,5 @@ ZimaScope will aggregate packet and byte counters in bounded per-CPU eBPF maps a
 - The external collection interface stays small: start a worker, consume its bounded Tokio channel, and shut it down.
 - Kernel ABI structs are fixed-size, versioned, `#[repr(C)]`, and separate from user-facing domain structs.
 - Domain events use a bounded ring buffer and are deduplicated in user space; payload bytes are never retained after parsing.
+- Domain evidence crosses the boundary as bounded payload samples: the packet path only peeks at constant offsets and copies at most 512 bytes, while DNS, TLS SNI and HTTP Host are parsed in user space. This keeps the verifier's state budget small and lets parsing rules evolve without kernel constraints.
 - Storage, enrichment, and UI work occur downstream and cannot block the packet path. Bounded channel backpressure may delay user-space polling, which can increase observable ring-buffer drops without affecting network traffic.

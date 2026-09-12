@@ -14,11 +14,11 @@ pub const DNS_PORT: u16 = 53;
 pub const TLS_PORT: u16 = 443;
 pub const HTTP_PORT: u16 = 80;
 
-pub const MAX_DNS_ANSWERS: usize = 32;
-pub const MAX_DNS_LABELS: usize = 128;
-pub const MAX_TLS_EXTENSIONS: usize = 32;
-pub const MAX_HTTP_SCAN: usize = 1024;
-pub const MAX_HTTP_HEADERS: usize = 48;
+pub const MAX_DNS_ANSWERS: usize = 8;
+pub const MAX_DNS_LABELS: usize = 16;
+pub const MAX_TLS_EXTENSIONS: usize = 16;
+pub const MAX_HTTP_SCAN: usize = 512;
+pub const MAX_HTTP_HEADERS: usize = 16;
 pub const MAX_HTTP_HOST_LEN: usize = 253;
 
 /// One A record extracted from a DNS response.
@@ -166,8 +166,8 @@ fn read_question_name<C: PacketCursor + ?Sized>(
             return None;
         }
 
-        for index in 0..label_len {
-            domain_buffer[length + index] = cursor.read_u8(*position + index)?;
+        if !cursor.read_bytes(*position, &mut domain_buffer[length..length + label_len]) {
+            return None;
         }
         length += label_len;
         *position += label_len;
@@ -303,12 +303,8 @@ pub fn extract_tls_sni<C: PacketCursor + ?Sized>(
             {
                 return None;
             }
-            #[allow(clippy::needless_range_loop)]
-            for index in 0..DOMAIN_MAX_LEN {
-                if index >= name_len {
-                    break;
-                }
-                domain_buffer[index] = cursor.read_u8(position + 5 + index)?;
+            if !cursor.read_bytes(position + 5, &mut domain_buffer[..name_len]) {
+                return None;
             }
             return Some(name_len);
         }

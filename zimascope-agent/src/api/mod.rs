@@ -43,16 +43,18 @@ use axum::{
 use tokio::sync::broadcast;
 use tokio_stream::{Stream, StreamExt, wrappers::BroadcastStream};
 
-use zimascope_common::model::CollectionBatch;
+use zimascope_common::model::{AddressScope, CollectionBatch};
+
+use crate::{FingerprintLibrary, SharedFingerprints, proxy::ProxyResolver};
 
 use self::{
     db::{Db, StreamEvent},
     dto::{
-        API_VERSION, AuditEntryDto, ClearHistoryQuery, CollectorHealthDto, CreateExportRequest,
-        DomainDetailDto, DomainSummaryDto, EndpointDetailDto, EndpointSummaryDto,
-        EnrichmentStatusDto, ExportTaskDto, FlowDto, FlowQuery, OverviewDto, Page,
-        ServiceStatusDto, SettingsSummaryDto, StreamQuery, TimeRange, collector_state_name,
-        unix_millis,
+        API_VERSION, AuditEntryDto, ClearHistoryQuery, CollectorHealthDto, ConnectionDto,
+        CreateExportRequest, DomainDetailDto, DomainSummaryDto, EndpointDetailDto,
+        EndpointSummaryDto, EnrichmentStatusDto, ExportTaskDto, FlowDto, FlowQuery, OverviewDto,
+        Page, ServiceStatusDto, SettingsSummaryDto, StreamQuery, TimeRange, TimelineDto,
+        collector_state_name, unix_millis,
     },
     error::ApiError,
     settings::{Settings, SettingsPatch},
@@ -78,6 +80,9 @@ struct Inner {
     collector_error: Option<String>,
     started_at: SystemTime,
     version: String,
+    fingerprints: SharedFingerprints,
+    fingerprints_path: Option<std::path::PathBuf>,
+    proxy: ProxyResolver,
 }
 
 impl ApiState {
@@ -97,6 +102,12 @@ impl ApiState {
             }
         };
         let (settings, settings_version) = db.load_settings().ok().flatten().unwrap_or_default();
+        let proxy = ProxyResolver::start();
+        proxy.configure(
+            settings.proxy.enabled,
+            &settings.proxy.controller_url,
+            &settings.proxy.secret,
+        );
 
         Self {
             inner: Arc::new(Mutex::new(Inner {
@@ -106,6 +117,9 @@ impl ApiState {
                 collector_error: None,
                 started_at: SystemTime::now(),
                 version: config.version,
+                fingerprints: config.fingerprints,
+                fingerprints_path: config.fingerprints_path,
+                proxy,
             })),
             events,
         }
@@ -117,7 +131,7 @@ impl ApiState {
         let event = {
             let mut guard = self.lock();
             let inner = &mut *guard;
-            inner.db.ingest(batch, &inner.settings)
+            inner.db.ingest(batch, &inner.settings, &inner.proxy)
         };
         let _ = self.events.send(Arc::new(event));
     }
@@ -150,6 +164,14 @@ impl Inner {
             }
         };
         let (enrichment, enrichment_error) = self.db.enrichment_status();
+        let (fingerprint_rules, fingerprints_custom) = {
+            let library = self
+                .fingerprints
+                .read()
+                .unwrap_or_else(|error| error.into_inner());
+            (library.rule_count(), library.is_custom())
+        };
+        let proxy = self.proxy.status();
 
         ServiceStatusDto {
             service,
@@ -172,6 +194,16 @@ impl Inner {
                     .map(ToString::to_string),
                 loaded_at: enrichment.database_loaded_at.map(unix_millis),
                 error: enrichment_error,
+            },
+            fingerprints: dto::FingerprintStatusDto {
+                rules: fingerprint_rules,
+                custom: fingerprints_custom,
+            },
+            proxy: dto::ProxyStatusDto {
+                enabled: proxy.enabled,
+                reachable: proxy.reachable,
+                mapped: proxy.mapped,
+                last_error: proxy.last_error,
             },
             settings: SettingsSummaryDto {
                 enabled: self.settings.enabled,
@@ -201,13 +233,22 @@ pub fn router(state: ApiState) -> Router {
         .route("/v1/stream", get(stream))
         .route("/v1/flows", get(list_flows))
         .route("/v1/flows/{id}", get(get_flow))
+        .route("/v1/connections", get(list_connections))
         .route("/v1/endpoints", get(list_endpoints))
         .route("/v1/endpoints/{ip}", get(get_endpoint))
+        .route("/v1/endpoints/{ip}/timeline", get(get_endpoint_timeline))
         .route("/v1/domains", get(list_domains))
         .route("/v1/domains/{domain}", get(get_domain))
+        .route("/v1/domains/{domain}/timeline", get(get_domain_timeline))
         .route(
             "/v1/settings",
             get(get_settings).put(put_settings).patch(patch_settings),
+        )
+        .route(
+            "/v1/fingerprints",
+            get(get_fingerprints)
+                .put(put_fingerprints)
+                .delete(reset_fingerprints),
         )
         .route("/v1/exports", get(list_exports).post(create_export))
         .route("/v1/exports/{id}", get(get_export).delete(delete_export))
@@ -262,6 +303,15 @@ async fn status(State(state): State<ApiState>) -> Json<ServiceStatusDto> {
 #[derive(serde::Deserialize)]
 struct OverviewQuery {
     range: Option<TimeRange>,
+    #[serde(default, deserialize_with = "dto::deserialize_scope_list")]
+    exclude_scope: Vec<AddressScope>,
+}
+
+async fn list_connections(
+    State(state): State<ApiState>,
+    ApiQuery(query): ApiQuery<FlowQuery>,
+) -> Result<Json<Page<ConnectionDto>>, ApiError> {
+    state.lock().db.list_connections(&query).map(Json)
 }
 
 async fn overview(
@@ -269,7 +319,11 @@ async fn overview(
     ApiQuery(query): ApiQuery<OverviewQuery>,
 ) -> Result<Json<OverviewDto>, ApiError> {
     let range = query.range.unwrap_or_default();
-    state.lock().db.overview(range, SystemTime::now()).map(Json)
+    state
+        .lock()
+        .db
+        .overview(range, &query.exclude_scope, SystemTime::now())
+        .map(Json)
 }
 
 /// Streams one `tick` per collection interval over Server-Sent Events.
@@ -347,6 +401,37 @@ async fn get_endpoint(
     state.lock().db.get_endpoint(&ip).map(Json)
 }
 
+#[derive(serde::Deserialize)]
+struct TimelineQuery {
+    range: Option<TimeRange>,
+}
+
+async fn get_endpoint_timeline(
+    State(state): State<ApiState>,
+    AxumPath(ip): AxumPath<String>,
+    ApiQuery(query): ApiQuery<TimelineQuery>,
+) -> Result<Json<TimelineDto>, ApiError> {
+    let range = query.range.unwrap_or_default();
+    state
+        .lock()
+        .db
+        .endpoint_timeline(&ip, range, SystemTime::now())
+        .map(Json)
+}
+
+async fn get_domain_timeline(
+    State(state): State<ApiState>,
+    AxumPath(domain): AxumPath<String>,
+    ApiQuery(query): ApiQuery<TimelineQuery>,
+) -> Result<Json<TimelineDto>, ApiError> {
+    let range = query.range.unwrap_or_default();
+    state
+        .lock()
+        .db
+        .domain_timeline(&domain, range, SystemTime::now())
+        .map(Json)
+}
+
 async fn list_domains(
     State(state): State<ApiState>,
     ApiQuery(query): ApiQuery<FlowQuery>,
@@ -393,8 +478,74 @@ async fn patch_settings(
 fn apply_settings(inner: &mut Inner, settings: Settings) -> Result<(), ApiError> {
     inner.settings_version += 1;
     inner.db.save_settings(&settings, inner.settings_version)?;
+    inner.proxy.configure(
+        settings.proxy.enabled,
+        &settings.proxy.controller_url,
+        &settings.proxy.secret,
+    );
     inner.settings = settings;
     Ok(())
+}
+
+/// Returns the active fingerprint library document.
+async fn get_fingerprints(State(state): State<ApiState>) -> Response {
+    let raw = state
+        .lock()
+        .fingerprints
+        .read()
+        .unwrap_or_else(|error| error.into_inner())
+        .raw()
+        .to_owned();
+    (
+        [(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/json"),
+        )],
+        raw,
+    )
+        .into_response()
+}
+
+/// Replaces the fingerprint library; persists it when a path is configured.
+async fn put_fingerprints(
+    State(state): State<ApiState>,
+    body: String,
+) -> Result<Response, ApiError> {
+    let library = FingerprintLibrary::from_json(&body)
+        .map_err(|error| ApiError::unprocessable(error.to_string()))?;
+    let rules = library.rule_count();
+    let mut inner = state.lock();
+    if let Some(path) = inner.fingerprints_path.clone() {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|error| {
+                ApiError::internal(format!("create fingerprint directory: {error}"))
+            })?;
+        }
+        std::fs::write(&path, &body)
+            .map_err(|error| ApiError::internal(format!("persist fingerprints: {error}")))?;
+    }
+    *inner
+        .fingerprints
+        .write()
+        .unwrap_or_else(|error| error.into_inner()) = library;
+    inner
+        .db
+        .record_operation("fingerprints.update", "completed");
+    Ok((StatusCode::OK, Json(serde_json::json!({ "rules": rules }))).into_response())
+}
+
+/// Restores the embedded default library and removes the persisted file.
+async fn reset_fingerprints(State(state): State<ApiState>) -> StatusCode {
+    let mut inner = state.lock();
+    if let Some(path) = &inner.fingerprints_path {
+        let _ = std::fs::remove_file(path);
+    }
+    *inner
+        .fingerprints
+        .write()
+        .unwrap_or_else(|error| error.into_inner()) = FingerprintLibrary::default_library();
+    inner.db.record_operation("fingerprints.reset", "completed");
+    StatusCode::NO_CONTENT
 }
 
 async fn list_exports(State(state): State<ApiState>) -> Result<Json<Vec<ExportTaskDto>>, ApiError> {
@@ -537,6 +688,7 @@ mod tests {
             export_ttl: Duration::from_secs(3600),
             geoip_database: None,
             database: None,
+            ..ApiConfig::default()
         })
     }
 
@@ -547,6 +699,7 @@ mod tests {
             export_ttl: ttl,
             geoip_database: None,
             database: None,
+            ..ApiConfig::default()
         })
     }
 
@@ -598,6 +751,7 @@ mod tests {
             first_seen: now - age - Duration::from_secs(10),
             last_seen: now - age,
             state: FlowState::Active,
+            service: None,
         }
     }
 
@@ -811,6 +965,75 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn exclude_scope_hides_local_remotes() {
+        let state = state();
+        state.ingest_batch(batch(
+            1,
+            vec![
+                outbound(("1.1.1.1", 443), 10, 1_000, Duration::ZERO),
+                flow(
+                    FlowDirection::Inbound,
+                    ("192.168.1.24", 52_144),
+                    ("10.0.0.2", 443),
+                    5,
+                    500,
+                    Duration::ZERO,
+                ),
+            ],
+        ));
+
+        let body = body_json(call(&state, get("/v1/flows")).await).await;
+        assert_eq!(body["total"], 2);
+
+        let body =
+            body_json(call(&state, get("/v1/flows?exclude_scope=private,link_local")).await).await;
+        assert_eq!(body["total"], 1);
+        assert_eq!(body["items"][0]["remote"]["address"], "1.1.1.1");
+
+        let body = body_json(call(&state, get("/v1/endpoints?exclude_scope=private")).await).await;
+        assert_eq!(body["total"], 1);
+        assert_eq!(body["items"][0]["address"], "1.1.1.1");
+
+        let body =
+            body_json(call(&state, get("/v1/overview?range=15m&exclude_scope=private")).await)
+                .await;
+        assert_eq!(body["domain_visibility"]["flows_total"], 1);
+        assert_eq!(body["totals"]["inbound"]["bytes"], 0);
+        assert_eq!(body["totals"]["outbound"]["bytes"], 1_000);
+
+        let response = call(&state, get("/v1/flows?exclude_scope=mystery")).await;
+        assert_problem(&response, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn stream_excludes_scopes() {
+        let state = state();
+        let response = call(&state, get("/v1/stream?exclude_scope=private")).await;
+        assert_event_stream(&response);
+        let mut body = response.into_body();
+
+        state.ingest_batch(batch(
+            1,
+            vec![
+                outbound(("1.1.1.1", 443), 10, 1_000, Duration::ZERO),
+                flow(
+                    FlowDirection::Inbound,
+                    ("192.168.1.24", 52_144),
+                    ("10.0.0.2", 443),
+                    5,
+                    500,
+                    Duration::ZERO,
+                ),
+            ],
+        ));
+
+        let frame = next_frame(&mut body).await;
+        assert!(frame.contains("event: tick"), "frame: {frame}");
+        assert!(frame.contains("1.1.1.1"), "frame: {frame}");
+        assert!(!frame.contains("192.168.1.24"), "frame: {frame}");
+    }
+
+    #[tokio::test]
     async fn flow_details_use_stable_ids() {
         let state = state();
         state.ingest_batch(batch(
@@ -860,6 +1083,12 @@ mod tests {
 
         let body = body_json(call(&state, get("/v1/domains/example.com")).await).await;
         assert_eq!(body["addresses"][0]["address"], "93.184.216.34");
+        assert!(
+            body["addresses"][0]["first_seen"]
+                .as_i64()
+                .expect("first_seen")
+                > 0
+        );
         assert_eq!(body["flows_url"], "/v1/flows?domain=example.com");
 
         let body = body_json(call(&state, get("/v1/flows?domain=example.com")).await).await;
@@ -871,6 +1100,56 @@ mod tests {
         assert_eq!(body["flows_url"], "/v1/flows?ip=93.184.216.34");
         assert_eq!(body["profile"]["scope"], "public");
         assert_eq!(body["domains"][0]["domain"], "example.com");
+    }
+
+    fn timeline_bytes(body: &serde_json::Value, direction: &str) -> i64 {
+        body["points"]
+            .as_array()
+            .expect("points")
+            .iter()
+            .map(|point| point[direction]["bytes"].as_i64().expect("bytes"))
+            .sum()
+    }
+
+    #[tokio::test]
+    async fn entity_timelines_follow_flow_deltas() {
+        let state = state();
+        let mut incoming = batch(
+            1,
+            vec![
+                outbound(("93.184.216.34", 443), 40, 4_000, Duration::ZERO),
+                outbound(("8.8.8.8", 53), 5, 500, Duration::ZERO),
+            ],
+        );
+        incoming.domains = vec![observation(
+            "example.com",
+            "93.184.216.34",
+            DomainEvidence::Dns,
+            AssociationConfidence::Inferred,
+        )];
+        state.ingest_batch(incoming);
+
+        let response = call(
+            &state,
+            get("/v1/endpoints/93.184.216.34/timeline?range=15m"),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_json(response).await;
+        assert_eq!(body["resolution"], "minute");
+        assert_eq!(timeline_bytes(&body, "outbound"), 4_000);
+        assert_eq!(timeline_bytes(&body, "inbound"), 0);
+
+        let body =
+            body_json(call(&state, get("/v1/domains/example.com/timeline?range=15m")).await).await;
+        assert_eq!(timeline_bytes(&body, "outbound"), 4_000);
+
+        let body =
+            body_json(call(&state, get("/v1/endpoints/8.8.8.8/timeline?range=15m")).await).await;
+        assert_eq!(timeline_bytes(&body, "outbound"), 500);
+
+        let response = call(&state, get("/v1/endpoints/not-an-ip/timeline")).await;
+        assert_problem(&response, StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]
@@ -897,9 +1176,130 @@ mod tests {
         assert_eq!(body["active_flows"], 2);
         assert_eq!(body["domain_visibility"]["flows_with_domain"], 1);
         assert_eq!(body["domain_visibility"]["flows_total"], 2);
+        assert_eq!(
+            body["domain_visibility"]["by_evidence"][0]["evidence"],
+            "tls_sni"
+        );
+        assert_eq!(body["domain_visibility"]["by_evidence"][0]["flows"], 1);
         assert_eq!(body["top_endpoints"][0]["address"], "93.184.216.34");
         assert_eq!(body["top_domains"][0]["domain"], "example.com");
         assert!(body["timeline"]["points"].as_array().expect("points").len() >= 15);
+    }
+
+    #[tokio::test]
+    async fn overview_reports_proxied_fake_ip_traffic() {
+        let state = state();
+        let mut incoming = batch(
+            1,
+            vec![flow(
+                FlowDirection::Inbound,
+                ("198.18.0.5", 443),
+                ("10.0.0.2", 40_000),
+                10,
+                1_000,
+                Duration::ZERO,
+            )],
+        );
+        incoming.domains = vec![observation(
+            "example.com",
+            "198.18.0.5",
+            DomainEvidence::Dns,
+            AssociationConfidence::Inferred,
+        )];
+        state.ingest_batch(incoming);
+
+        let body = body_json(call(&state, get("/v1/overview?range=15m")).await).await;
+        assert_eq!(body["proxied"]["flows"], 1);
+        assert_eq!(body["proxied"]["bytes"], 1_000);
+        assert_eq!(body["proxied"]["flows_with_domain"], 1);
+        // Fake IPs are never attributed to a country.
+        assert_eq!(
+            body["top_countries"].as_array().expect("countries").len(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn proxy_resolution_enriches_fake_ip_flows() {
+        let state = state();
+        state
+            .lock()
+            .db
+            .set_geoip_database(crate::enrichment::database::test_database());
+        state.lock().proxy.insert_resolution(
+            crate::proxy::ProxyKey {
+                client: "10.0.0.2".parse().expect("client"),
+                client_port: 40_000,
+                destination_port: 443,
+            },
+            crate::proxy::ProxyResolution {
+                real_address: Some("8.8.8.8".parse().expect("real")),
+                host: Some("github.com".to_owned()),
+                ..crate::proxy::ProxyResolution::default()
+            },
+        );
+
+        state.ingest_batch(batch(
+            1,
+            vec![outbound(("198.18.0.27", 443), 10, 1_000, Duration::ZERO)],
+        ));
+
+        let body = body_json(call(&state, get("/v1/flows")).await).await;
+        let profile = &body["items"][0]["remote_profile"];
+        assert_eq!(profile["scope"], "fake_ip");
+        assert_eq!(profile["country"], "US");
+        assert_eq!(profile["asn"], 15169);
+
+        let body = body_json(call(&state, get("/v1/overview?range=15m")).await).await;
+        assert_eq!(body["top_countries"][0]["country"], "US");
+        assert_eq!(body["proxied"]["resolved_flows"], 1);
+
+        let status = body_json(call(&state, get("/v1/status")).await).await;
+        assert_eq!(status["proxy"]["enabled"], false);
+    }
+
+    #[tokio::test]
+    async fn fake_ip_enrichment_survives_unresolved_ticks() {
+        let state = state();
+        state
+            .lock()
+            .db
+            .set_geoip_database(crate::enrichment::database::test_database());
+        state.lock().proxy.insert_resolution(
+            crate::proxy::ProxyKey {
+                client: "10.0.0.2".parse().expect("client"),
+                client_port: 40_000,
+                destination_port: 443,
+            },
+            crate::proxy::ProxyResolution {
+                real_address: Some("8.8.8.8".parse().expect("real")),
+                ..crate::proxy::ProxyResolution::default()
+            },
+        );
+
+        state.ingest_batch(batch(
+            1,
+            vec![outbound(("198.18.0.27", 443), 10, 1_000, Duration::ZERO)],
+        ));
+
+        // The proxy mapping disappears (poll gap, restart, disabled): later
+        // ticks must not wipe the attribution already stored.
+        state.lock().proxy.configure(false, "", "");
+        state.ingest_batch(batch(
+            2,
+            vec![outbound(
+                ("198.18.0.27", 443),
+                20,
+                2_000,
+                Duration::from_secs(1),
+            )],
+        ));
+
+        let body = body_json(call(&state, get("/v1/flows")).await).await;
+        let profile = &body["items"][0]["remote_profile"];
+        assert_eq!(profile["scope"], "fake_ip");
+        assert_eq!(profile["country"], "US");
+        assert_eq!(profile["asn"], 15169);
     }
 
     #[tokio::test]
@@ -1099,8 +1499,355 @@ mod tests {
         let body = body_json(call(&state, get("/v1/endpoints?scope=loopback")).await).await;
         assert_eq!(body["total"], 0);
 
+        let body = body_json(call(&state, get("/v1/endpoints?sort=address")).await).await;
+        assert_eq!(body["items"][0]["address"], "1.1.1.1");
+        // Both fixture flows are outbound, so inbound bytes tie at zero.
+        let body = body_json(call(&state, get("/v1/endpoints?sort=-in_bytes")).await).await;
+        assert_eq!(body["total"], 2);
+        let body = body_json(call(&state, get("/v1/endpoints?sort=-organization")).await).await;
+        assert_eq!(body["total"], 2);
+
         let response = call(&state, get("/v1/endpoints?sort=-mystery")).await;
         assert_problem(&response, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn summaries_split_traffic_by_direction() {
+        let state = state();
+        let mut incoming = batch(
+            1,
+            vec![
+                outbound(("9.9.9.9", 443), 10, 1_000, Duration::ZERO),
+                flow(
+                    FlowDirection::Inbound,
+                    ("9.9.9.9", 55_000),
+                    ("10.0.0.2", 443),
+                    30,
+                    3_000,
+                    Duration::ZERO,
+                ),
+            ],
+        );
+        incoming.domains = vec![observation(
+            "example.com",
+            "9.9.9.9",
+            DomainEvidence::TlsSni,
+            AssociationConfidence::Direct,
+        )];
+        state.ingest_batch(incoming);
+
+        let body = body_json(call(&state, get("/v1/endpoints?q=9.9.9.9")).await).await;
+        let endpoint = &body["items"][0];
+        assert_eq!(endpoint["bytes"], 4_000);
+        assert_eq!(endpoint["traffic"]["inbound"]["bytes"], 3_000);
+        assert_eq!(endpoint["traffic"]["outbound"]["bytes"], 1_000);
+
+        let body = body_json(call(&state, get("/v1/domains?q=example.com")).await).await;
+        let domain = &body["items"][0];
+        assert_eq!(domain["traffic"]["inbound"]["bytes"], 3_000);
+        assert_eq!(domain["traffic"]["outbound"]["bytes"], 1_000);
+
+        let body = body_json(call(&state, get("/v1/overview?range=15m")).await).await;
+        assert_eq!(
+            body["top_endpoints"][0]["traffic"]["inbound"]["bytes"],
+            3_000
+        );
+        assert_eq!(
+            body["top_endpoints"][0]["traffic"]["outbound"]["bytes"],
+            1_000
+        );
+    }
+
+    fn instant_flow(
+        direction: FlowDirection,
+        source: (&str, u16),
+        destination: (&str, u16),
+        bytes: u64,
+    ) -> FlowUpdate {
+        let now = Instant::now();
+        FlowUpdate {
+            key: FlowKey {
+                source: Endpoint {
+                    address: source.0.parse().expect("source address"),
+                    port: Some(source.1),
+                },
+                destination: Endpoint {
+                    address: destination.0.parse().expect("destination address"),
+                    port: Some(destination.1),
+                },
+                interface_index: NonZeroU32::new(7).expect("non-zero ifindex"),
+                protocol: Protocol::Tcp,
+                direction,
+            },
+            delta: TrafficCounters { packets: 1, bytes },
+            total: TrafficCounters { packets: 1, bytes },
+            first_seen: now,
+            last_seen: now,
+            state: FlowState::Active,
+            service: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn connections_merge_directions_and_hide_noise() {
+        let state = state();
+        let mut incoming = batch(
+            1,
+            vec![
+                outbound(("1.1.1.1", 443), 10, 1_000, Duration::ZERO),
+                flow(
+                    FlowDirection::Inbound,
+                    ("1.1.1.1", 443),
+                    ("10.0.0.2", 40_000),
+                    20,
+                    2_000,
+                    Duration::ZERO,
+                ),
+                flow_with(
+                    Protocol::Udp,
+                    FlowDirection::Outbound,
+                    ("10.0.0.2", 41_235),
+                    ("8.8.8.8", 53),
+                    1,
+                    100,
+                    Duration::ZERO,
+                ),
+                flow_with(
+                    Protocol::Udp,
+                    FlowDirection::Inbound,
+                    ("8.8.8.8", 53),
+                    ("10.0.0.2", 41_235),
+                    1,
+                    120,
+                    Duration::ZERO,
+                ),
+                instant_flow(
+                    FlowDirection::Outbound,
+                    ("10.0.0.2", 41_236),
+                    ("9.9.9.9", 80),
+                    64,
+                ),
+            ],
+        );
+        incoming.domains = vec![observation(
+            "example.com",
+            "9.9.9.9",
+            DomainEvidence::TlsSni,
+            AssociationConfidence::Direct,
+        )];
+        state.ingest_batch(incoming);
+
+        // Without noise filtering: the TCP pair, the DNS pair and the
+        // sub-second connection are all present.
+        let body = body_json(call(&state, get("/v1/connections?range=15m")).await).await;
+        assert_eq!(body["total"], 3);
+        let items = body["items"].as_array().expect("items");
+        let find = |address: &str| {
+            items
+                .iter()
+                .find(|item| item["remote"]["address"] == address)
+                .expect("connection present")
+        };
+        // No fingerprint was recorded for these flows, so the honest
+        // fallback is NULL (the UI shows TCP/UDP); the TLS association on
+        // 9.9.9.9 still names its protocol through Domain Evidence.
+        assert!(find("1.1.1.1")["service"].is_null());
+        assert!(find("8.8.8.8")["service"].is_null());
+        assert_eq!(find("9.9.9.9")["service"], "TLS");
+
+        let body =
+            body_json(call(&state, get("/v1/connections?range=15m&hide_noise=true")).await).await;
+        assert_eq!(body["total"], 1);
+        let connection = &body["items"][0];
+        assert_eq!(connection["remote"]["address"], "1.1.1.1");
+        assert_eq!(connection["host"]["address"], "10.0.0.2");
+        assert_eq!(connection["bytes"], 3_000);
+        assert_eq!(connection["packets"], 30);
+        assert_eq!(connection["traffic"]["inbound"]["bytes"], 2_000);
+        assert_eq!(connection["traffic"]["outbound"]["bytes"], 1_000);
+        assert_eq!(connection["state"], "active");
+        assert_eq!(connection["id"].as_str().expect("id").len(), 16);
+
+        let body = body_json(call(&state, get("/v1/connections?state=ended")).await).await;
+        assert_eq!(body["total"], 0);
+
+        let body = body_json(call(&state, get("/v1/connections?sort=-bytes")).await).await;
+        assert_eq!(body["total"], 3);
+        assert_eq!(body["items"][0]["remote"]["address"], "1.1.1.1");
+
+        // Column-level sorts: inbound bytes, service and peer address.
+        let body = body_json(call(&state, get("/v1/connections?sort=-in_bytes")).await).await;
+        assert_eq!(body["items"][0]["remote"]["address"], "1.1.1.1");
+        let body = body_json(call(&state, get("/v1/connections?sort=service")).await).await;
+        assert_eq!(body["total"], 3);
+        let body = body_json(call(&state, get("/v1/connections?sort=remote")).await).await;
+        assert_eq!(body["total"], 3);
+        let body = body_json(call(&state, get("/v1/connections?sort=domain")).await).await;
+        assert_eq!(body["total"], 3);
+        let body = body_json(call(&state, get("/v1/flows?sort=domain")).await).await;
+        assert_eq!(body["total"], 5);
+
+        let response = call(&state, get("/v1/connections?sort=-mystery")).await;
+        assert_problem(&response, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn connections_expose_fingerprinted_service() {
+        let state = state();
+        let mut update = outbound(("1.1.1.1", 22), 10, 1_000, Duration::ZERO);
+        update.service = Some("SSH".into());
+        state.ingest_batch(batch(1, vec![update]));
+
+        let body = body_json(call(&state, get("/v1/connections")).await).await;
+        assert_eq!(body["items"][0]["service"], "SSH");
+
+        let status = body_json(call(&state, get("/v1/status")).await).await;
+        assert!(status["fingerprints"]["rules"].as_u64().expect("rules") > 0);
+    }
+
+    #[tokio::test]
+    async fn fingerprints_can_be_read_replaced_and_reset() {
+        let state = state();
+
+        let response = call(&state, get("/v1/fingerprints")).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            body_text(response).await.contains("\"SSH\""),
+            "default library is served"
+        );
+
+        let custom = serde_json::json!({
+            "rules": [{
+                "service": "SOCKS5",
+                "match": [{ "op": "byte", "offset": 0, "compare": { "eq": 5 } }]
+            }]
+        });
+        let response = call(
+            &state,
+            json_request(Method::PUT, "/v1/fingerprints", custom),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = call(&state, get("/v1/fingerprints")).await;
+        let text = body_text(response).await;
+        assert!(text.contains("SOCKS5"));
+        assert!(!text.contains("\"SSH\""));
+
+        let response = call(
+            &state,
+            json_request(
+                Method::PUT,
+                "/v1/fingerprints",
+                serde_json::json!({ "rules": [] }),
+            ),
+        )
+        .await;
+        assert_problem(&response, StatusCode::UNPROCESSABLE_ENTITY);
+
+        let response = call(
+            &state,
+            Request::builder()
+                .method(Method::DELETE)
+                .uri("/v1/fingerprints")
+                .body(Body::empty())
+                .expect("valid request"),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let response = call(&state, get("/v1/fingerprints")).await;
+        assert!(body_text(response).await.contains("\"SSH\""));
+    }
+
+    #[tokio::test]
+    async fn endpoint_address_sort_is_numeric() {
+        let state = state();
+        state.ingest_batch(batch(
+            1,
+            vec![
+                outbound(("192.168.1.1", 445), 1, 100, Duration::ZERO),
+                outbound(("10.0.0.1", 443), 1, 100, Duration::ZERO),
+                outbound(("2.2.2.2", 443), 1, 100, Duration::ZERO),
+            ],
+        ));
+
+        let body = body_json(call(&state, get("/v1/endpoints?sort=address")).await).await;
+        let addresses: Vec<&str> = body["items"]
+            .as_array()
+            .expect("items")
+            .iter()
+            .map(|item| item["address"].as_str().expect("address"))
+            .collect();
+        assert_eq!(addresses, ["2.2.2.2", "10.0.0.1", "192.168.1.1"]);
+
+        let body = body_json(call(&state, get("/v1/endpoints?sort=-address")).await).await;
+        let addresses: Vec<&str> = body["items"]
+            .as_array()
+            .expect("items")
+            .iter()
+            .map(|item| item["address"].as_str().expect("address"))
+            .collect();
+        assert_eq!(addresses, ["192.168.1.1", "10.0.0.1", "2.2.2.2"]);
+
+        // The same helper backs Flow and connection peer ordering.
+        let body = body_json(call(&state, get("/v1/flows?sort=remote")).await).await;
+        assert_eq!(body["total"], 3);
+        let body = body_json(call(&state, get("/v1/connections?sort=remote")).await).await;
+        assert_eq!(body["total"], 3);
+    }
+
+    #[tokio::test]
+    async fn domain_sort_follows_dns_hierarchy() {
+        let state = state();
+        let mut incoming = batch(
+            1,
+            vec![
+                outbound(("1.1.1.1", 443), 1, 100, Duration::ZERO),
+                outbound(("2.2.2.2", 443), 1, 100, Duration::ZERO),
+                outbound(("3.3.3.3", 443), 1, 100, Duration::ZERO),
+            ],
+        );
+        incoming.domains = vec![
+            observation(
+                "api.example.com",
+                "1.1.1.1",
+                DomainEvidence::TlsSni,
+                AssociationConfidence::Direct,
+            ),
+            observation(
+                "example.com",
+                "2.2.2.2",
+                DomainEvidence::TlsSni,
+                AssociationConfidence::Direct,
+            ),
+            observation(
+                "a.other.com",
+                "3.3.3.3",
+                DomainEvidence::TlsSni,
+                AssociationConfidence::Direct,
+            ),
+        ];
+        state.ingest_batch(incoming);
+
+        // Parent domains sort before their own subdomains and TLDs group.
+        let body = body_json(call(&state, get("/v1/domains?sort=domain")).await).await;
+        let domains: Vec<&str> = body["items"]
+            .as_array()
+            .expect("items")
+            .iter()
+            .map(|item| item["domain"].as_str().expect("domain"))
+            .collect();
+        assert_eq!(domains, ["example.com", "api.example.com", "a.other.com"]);
+
+        let body = body_json(call(&state, get("/v1/domains?sort=-domain")).await).await;
+        let domains: Vec<&str> = body["items"]
+            .as_array()
+            .expect("items")
+            .iter()
+            .map(|item| item["domain"].as_str().expect("domain"))
+            .collect();
+        assert_eq!(domains, ["a.other.com", "api.example.com", "example.com"]);
     }
 
     #[tokio::test]
@@ -1129,6 +1876,31 @@ mod tests {
         let body = body_json(call(&state, get("/v1/overview?range=15m")).await).await;
         assert_eq!(body["top_countries"][0]["country"], "US");
         assert_eq!(body["top_asns"][0]["asn"], 15169);
+    }
+
+    #[tokio::test]
+    async fn geoip_backfill_enriches_stored_public_addresses() {
+        let state = state();
+        state.ingest_batch(batch(
+            1,
+            vec![outbound(("8.8.8.8", 53), 5, 500, Duration::ZERO)],
+        ));
+
+        let body = body_json(call(&state, get("/v1/endpoints/8.8.8.8")).await).await;
+        assert!(body["profile"]["country"].is_null());
+
+        state
+            .lock()
+            .db
+            .set_geoip_database(crate::enrichment::database::test_database());
+        assert_eq!(state.lock().db.backfill_enrichment().expect("backfill"), 1);
+
+        let body = body_json(call(&state, get("/v1/endpoints/8.8.8.8")).await).await;
+        assert_eq!(body["profile"]["country"], "US");
+        assert_eq!(body["profile"]["asn"], 15169);
+
+        let body = body_json(call(&state, get("/v1/flows")).await).await;
+        assert_eq!(body["items"][0]["remote_profile"]["country"], "US");
     }
 
     async fn next_frame(body: &mut Body) -> String {
@@ -1182,6 +1954,9 @@ mod tests {
         assert!(frame.contains("\"health\":"), "frame: {frame}");
         assert!(frame.contains("\"remote_profile\":"), "frame: {frame}");
         assert!(frame.contains("\"scope\":\"public\""), "frame: {frame}");
+        assert!(frame.contains("\"observations\":"), "frame: {frame}");
+        assert!(frame.contains("\"active_flows\":2"), "frame: {frame}");
+        assert!(frame.contains("\"flows_total\":2"), "frame: {frame}");
     }
 
     #[tokio::test]
@@ -1210,6 +1985,60 @@ mod tests {
             "frame: {frame}"
         );
         assert!(frame.contains("93.184.216.34"), "frame: {frame}");
+    }
+
+    #[tokio::test]
+    async fn tick_carries_touched_endpoint_and_domain_aggregates() {
+        let state = state();
+        let response = call(&state, get("/v1/stream")).await;
+        assert_event_stream(&response);
+        let mut body = response.into_body();
+
+        let mut incoming = batch(
+            3,
+            vec![
+                outbound(("93.184.216.34", 443), 40, 4_000, Duration::ZERO),
+                outbound(("8.8.8.8", 53), 5, 500, Duration::ZERO),
+            ],
+        );
+        incoming.domains = vec![observation(
+            "example.com",
+            "93.184.216.34",
+            DomainEvidence::TlsSni,
+            AssociationConfidence::Direct,
+        )];
+        state.ingest_batch(incoming);
+
+        let frame = next_frame(&mut body).await;
+        assert!(frame.contains("event: tick"), "frame: {frame}");
+        let payload = frame
+            .lines()
+            .find_map(|line| line.strip_prefix("data: "))
+            .expect("data line");
+        let tick: serde_json::Value = serde_json::from_str(payload).expect("tick JSON");
+
+        let endpoints = tick["endpoints"].as_array().expect("endpoints");
+        assert_eq!(endpoints.len(), 2);
+        let example = endpoints
+            .iter()
+            .find(|endpoint| endpoint["address"] == "93.184.216.34")
+            .expect("touched endpoint");
+        assert_eq!(example["bytes"], 4_000);
+        assert_eq!(example["flow_count"], 1);
+
+        let domains = tick["domains"].as_array().expect("domains");
+        assert_eq!(domains.len(), 1);
+        assert_eq!(domains[0]["domain"], "example.com");
+        assert_eq!(domains[0]["bytes"], 4_000);
+        assert_eq!(domains[0]["evidence"][0], "tls_sni");
+
+        let observations = tick["observations"].as_array().expect("observations");
+        assert_eq!(observations.len(), 1);
+        assert_eq!(observations[0]["address"], "93.184.216.34");
+
+        assert_eq!(tick["overview"]["active_flows"], 2);
+        assert_eq!(tick["overview"]["flows_with_domain"], 1);
+        assert_eq!(tick["overview"]["flows_total"], 2);
     }
 
     #[tokio::test]
@@ -1346,8 +2175,9 @@ mod tests {
         assert_eq!(body["total"], 1);
         assert_eq!(body["items"][0]["domain"], "cdn.example.net");
 
+        // Canonical DNS order groups by TLD first: com before net.
         let body = body_json(call(&state, get("/v1/domains?sort=domain")).await).await;
-        assert_eq!(body["items"][0]["domain"], "cdn.example.net");
+        assert_eq!(body["items"][0]["domain"], "example.com");
     }
 
     #[tokio::test]

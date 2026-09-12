@@ -1,0 +1,123 @@
+{
+  "version": 1,
+  "rules": [
+    {
+      "service": "SSH",
+      "match": [{ "op": "prefix_text", "value": "SSH-" }]
+    },
+    {
+      "service": "TLS",
+      "match": [
+        { "op": "min_len", "value": 3 },
+        { "op": "byte", "offset": 0, "compare": { "eq": 22 } },
+        { "op": "byte", "offset": 1, "compare": { "eq": 3 } },
+        { "op": "byte", "offset": 2, "compare": { "lte": 4 } }
+      ]
+    },
+    {
+      "service": "HTTP",
+      "match": [
+        {
+          "op": "prefix_text_any",
+          "values": ["GET ", "POST ", "HEAD ", "PUT ", "DELETE ", "OPTIONS ", "PATCH ", "CONNECT ", "TRACE "]
+        }
+      ]
+    },
+    {
+      "service": "HTTP",
+      "match": [{ "op": "prefix_text", "value": "HTTP/1." }]
+    },
+    {
+      "service": "DNS",
+      "match": [{ "op": "builtin", "name": "dns_query" }]
+    },
+    {
+      "service": "SMTP",
+      "match": [{ "op": "prefix_text_any", "values": ["EHLO ", "HELO "] }]
+    },
+    {
+      "service": "FTP",
+      "match": [{ "op": "prefix_text_any", "values": ["USER ", "PASS ", "RETR ", "STOR "] }]
+    },
+    {
+      "service": "MySQL",
+      "match": [
+        { "op": "min_len", "value": 5 },
+        { "op": "byte", "offset": 3, "compare": { "eq": 0 } },
+        { "op": "byte", "offset": 4, "compare": { "eq": 10 } },
+        { "op": "int", "offset": 0, "size": 3, "endian": "le", "compare": { "gt": 0 } }
+      ]
+    },
+    {
+      "service": "PostgreSQL",
+      "match": [
+        { "op": "min_len", "value": 8 },
+        { "op": "int", "offset": 0, "size": 4, "endian": "be", "compare": { "eq": 8 } },
+        { "op": "int", "offset": 4, "size": 4, "endian": "be", "compare": { "eq": 80877103 } }
+      ]
+    },
+    {
+      "service": "PostgreSQL",
+      "match": [
+        { "op": "min_len", "value": 8 },
+        { "op": "int", "offset": 4, "size": 4, "endian": "be", "compare": { "eq": 196608 } }
+      ]
+    },
+    {
+      "service": "Redis",
+      "match": [
+        { "op": "min_len", "value": 2 },
+        { "op": "byte", "offset": 0, "compare": { "eq": 42 } },
+        { "op": "byte", "offset": 1, "compare": { "gte": 48, "lte": 57 } }
+      ]
+    },
+    {
+      "service": "Redis",
+      "match": [
+        {
+          "op": "prefix_text_any",
+          "values": ["+PONG", "+OK", "-ERR ", "-NOAUTH", "PING", "ECHO ", "AUTH ", "SELECT ", "CLIENT ", "HELLO ", "INFO", "SUBSCRIBE ", "GET ", "SET "]
+        }
+      ]
+    },
+    {
+      "service": "MongoDB",
+      "match": [
+        { "op": "min_len", "value": 16 },
+        { "op": "int", "offset": 0, "size": 4, "endian": "le", "compare": { "gte": 16 } },
+        {
+          "op": "int",
+          "offset": 12,
+          "size": 4,
+          "endian": "le",
+          "compare": { "in": [2002, 2003, 2004, 2005, 2006, 2007, 2010, 2011, 2012, 2013] }
+        }
+      ]
+    },
+    {
+      "service": "RDP",
+      "match": [
+        { "op": "min_len", "value": 6 },
+        { "op": "byte", "offset": 0, "compare": { "eq": 3 } },
+        { "op": "byte", "offset": 1, "compare": { "eq": 0 } },
+        { "op": "byte", "offset": 5, "compare": { "in": [208, 224] } }
+      ]
+    },
+    {
+      "service": "QUIC",
+      "match": [
+        { "op": "min_len", "value": 7 },
+        { "op": "byte", "offset": 0, "mask": 192, "compare": { "eq": 192 } },
+        { "op": "int", "offset": 1, "size": 4, "endian": "be", "compare": { "in": [0, 1, 1797354991] } }
+      ]
+    },
+    {
+      "service": "WireGuard",
+      "match": [
+        { "op": "min_len", "value": 8 },
+        { "op": "int", "offset": 0, "size": 4, "endian": "le", "compare": { "in": [1, 2, 3, 4] } },
+        { "op": "int", "offset": 4, "size": 4, "endian": "le", "compare": { "eq": 0 } }
+      ]
+    }
+  ]
+}
