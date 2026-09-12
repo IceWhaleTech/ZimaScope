@@ -130,18 +130,30 @@ struct PodEndpointMatchKey(EndpointMatchKey);
 // Safety: `#[repr(transparent)]` over a `#[repr(C)]` POD type with no padding.
 unsafe impl aya::Pod for PodEndpointMatchKey {}
 
+/// A policy map for each direction, so direction dispatch happens in one
+/// place instead of once per map kind.
+struct DirectionPair<T> {
+    ingress: T,
+    egress: T,
+}
+
+impl<T> DirectionPair<T> {
+    fn get_mut(&mut self, direction: Direction) -> &mut T {
+        match direction {
+            Direction::Inbound => &mut self.ingress,
+            Direction::Outbound => &mut self.egress,
+        }
+    }
+}
+
 /// Typed handles for every Traffic Rule map.
 struct PolicyMaps {
     config: Array<MapData, PodPolicyConfig>,
     states: AyaHashMap<MapData, PodBucketKey, PodRuleState>,
-    app_cgroup_ingress: AyaHashMap<MapData, u64, PodRuleRef>,
-    app_cgroup_egress: AyaHashMap<MapData, u64, PodRuleRef>,
-    app_comm_ingress: AyaHashMap<MapData, [u8; 16], PodRuleRef>,
-    app_comm_egress: AyaHashMap<MapData, [u8; 16], PodRuleRef>,
-    endpoint_exact_ingress: AyaHashMap<MapData, PodEndpointMatchKey, PodRuleRef>,
-    endpoint_exact_egress: AyaHashMap<MapData, PodEndpointMatchKey, PodRuleRef>,
-    endpoint_cidr_ingress: LpmTrie<MapData, [u8; 4], PodRuleRef>,
-    endpoint_cidr_egress: LpmTrie<MapData, [u8; 4], PodRuleRef>,
+    app_cgroup: DirectionPair<AyaHashMap<MapData, u64, PodRuleRef>>,
+    app_comm: DirectionPair<AyaHashMap<MapData, [u8; 16], PodRuleRef>>,
+    endpoint_exact: DirectionPair<AyaHashMap<MapData, PodEndpointMatchKey, PodRuleRef>>,
+    endpoint_cidr: DirectionPair<LpmTrie<MapData, [u8; 4], PodRuleRef>>,
 }
 
 /// Owns every Aya object required for one collection session.
@@ -512,15 +524,21 @@ impl AyaKernelSource {
                         direction,
                         cgroup_id,
                     } => self
-                        .cgroup_map_mut(*direction)
+                        .policy
+                        .app_cgroup
+                        .get_mut(*direction)
                         .insert(*cgroup_id, value, 0)
                         .context("insert application cgroup match")?,
                     MatchEntry::AppComm { direction, comm } => self
-                        .comm_map_mut(*direction)
+                        .policy
+                        .app_comm
+                        .get_mut(*direction)
                         .insert(*comm, value, 0)
                         .context("insert application comm match")?,
                     MatchEntry::EndpointExact { direction, key } => self
-                        .exact_map_mut(*direction)
+                        .policy
+                        .endpoint_exact
+                        .get_mut(*direction)
                         .insert(PodEndpointMatchKey(*key), value, 0)
                         .context("insert endpoint match")?,
                     MatchEntry::EndpointCidr {
@@ -528,7 +546,9 @@ impl AyaKernelSource {
                         prefix_len,
                         addr,
                     } => self
-                        .cidr_map_mut(*direction)
+                        .policy
+                        .endpoint_cidr
+                        .get_mut(*direction)
                         .insert(&LpmKey::new(*prefix_len, *addr), value, 0)
                         .context("insert CIDR match")?,
                 }
@@ -538,15 +558,21 @@ impl AyaKernelSource {
                     direction,
                     cgroup_id,
                 } => self
-                    .cgroup_map_mut(*direction)
+                    .policy
+                    .app_cgroup
+                    .get_mut(*direction)
                     .remove(cgroup_id)
                     .context("remove application cgroup match")?,
                 MatchEntry::AppComm { direction, comm } => self
-                    .comm_map_mut(*direction)
+                    .policy
+                    .app_comm
+                    .get_mut(*direction)
                     .remove(comm)
                     .context("remove application comm match")?,
                 MatchEntry::EndpointExact { direction, key } => self
-                    .exact_map_mut(*direction)
+                    .policy
+                    .endpoint_exact
+                    .get_mut(*direction)
                     .remove(&PodEndpointMatchKey(*key))
                     .context("remove endpoint match")?,
                 MatchEntry::EndpointCidr {
@@ -554,49 +580,14 @@ impl AyaKernelSource {
                     prefix_len,
                     addr,
                 } => self
-                    .cidr_map_mut(*direction)
+                    .policy
+                    .endpoint_cidr
+                    .get_mut(*direction)
                     .remove(&LpmKey::new(*prefix_len, *addr))
                     .context("remove CIDR match")?,
             },
         }
         Ok(())
-    }
-
-    fn cgroup_map_mut(
-        &mut self,
-        direction: Direction,
-    ) -> &mut AyaHashMap<MapData, u64, PodRuleRef> {
-        match direction {
-            Direction::Inbound => &mut self.policy.app_cgroup_ingress,
-            Direction::Outbound => &mut self.policy.app_cgroup_egress,
-        }
-    }
-
-    fn comm_map_mut(
-        &mut self,
-        direction: Direction,
-    ) -> &mut AyaHashMap<MapData, [u8; 16], PodRuleRef> {
-        match direction {
-            Direction::Inbound => &mut self.policy.app_comm_ingress,
-            Direction::Outbound => &mut self.policy.app_comm_egress,
-        }
-    }
-
-    fn exact_map_mut(
-        &mut self,
-        direction: Direction,
-    ) -> &mut AyaHashMap<MapData, PodEndpointMatchKey, PodRuleRef> {
-        match direction {
-            Direction::Inbound => &mut self.policy.endpoint_exact_ingress,
-            Direction::Outbound => &mut self.policy.endpoint_exact_egress,
-        }
-    }
-
-    fn cidr_map_mut(&mut self, direction: Direction) -> &mut LpmTrie<MapData, [u8; 4], PodRuleRef> {
-        match direction {
-            Direction::Inbound => &mut self.policy.endpoint_cidr_ingress,
-            Direction::Outbound => &mut self.policy.endpoint_cidr_egress,
-        }
     }
 }
 
@@ -649,14 +640,22 @@ fn take_policy_maps(ebpf: &mut Ebpf) -> Result<PolicyMaps> {
     Ok(PolicyMaps {
         config: take_policy_array(ebpf, POLICY_CONFIG_MAP, 1)?,
         states: take_policy_map(ebpf, RULE_STATES_MAP, rules * 2)?,
-        app_cgroup_ingress: take_policy_map(ebpf, APP_CGROUP_INGRESS_MAP, rules)?,
-        app_cgroup_egress: take_policy_map(ebpf, APP_CGROUP_EGRESS_MAP, rules)?,
-        app_comm_ingress: take_policy_map(ebpf, APP_COMM_INGRESS_MAP, rules)?,
-        app_comm_egress: take_policy_map(ebpf, APP_COMM_EGRESS_MAP, rules)?,
-        endpoint_exact_ingress: take_policy_map(ebpf, ENDPOINT_EXACT_INGRESS_MAP, rules)?,
-        endpoint_exact_egress: take_policy_map(ebpf, ENDPOINT_EXACT_EGRESS_MAP, rules)?,
-        endpoint_cidr_ingress: take_policy_trie(ebpf, ENDPOINT_CIDR_INGRESS_MAP, rules)?,
-        endpoint_cidr_egress: take_policy_trie(ebpf, ENDPOINT_CIDR_EGRESS_MAP, rules)?,
+        app_cgroup: DirectionPair {
+            ingress: take_policy_map(ebpf, APP_CGROUP_INGRESS_MAP, rules)?,
+            egress: take_policy_map(ebpf, APP_CGROUP_EGRESS_MAP, rules)?,
+        },
+        app_comm: DirectionPair {
+            ingress: take_policy_map(ebpf, APP_COMM_INGRESS_MAP, rules)?,
+            egress: take_policy_map(ebpf, APP_COMM_EGRESS_MAP, rules)?,
+        },
+        endpoint_exact: DirectionPair {
+            ingress: take_policy_map(ebpf, ENDPOINT_EXACT_INGRESS_MAP, rules)?,
+            egress: take_policy_map(ebpf, ENDPOINT_EXACT_EGRESS_MAP, rules)?,
+        },
+        endpoint_cidr: DirectionPair {
+            ingress: take_policy_trie(ebpf, ENDPOINT_CIDR_INGRESS_MAP, rules)?,
+            egress: take_policy_trie(ebpf, ENDPOINT_CIDR_EGRESS_MAP, rules)?,
+        },
     })
 }
 

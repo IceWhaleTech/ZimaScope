@@ -5,7 +5,7 @@
 //! verifier constraints.
 
 use std::{
-    net::{IpAddr, Ipv4Addr},
+    net::IpAddr,
     time::{Duration, Instant},
 };
 
@@ -70,7 +70,7 @@ impl DomainDecoder {
         }
 
         let cursor = MemoryCursor::new(&sample.payload[..length]);
-        let peer = ipv4_from_abi(sample.address);
+        let peer = IpAddr::V4(zimascope_common::model::ipv4_from_abi(sample.address));
 
         clock.anchor_if_needed(sample.observed_mono_ns, now);
         let observed_at = clock.to_instant(sample.observed_mono_ns);
@@ -95,7 +95,8 @@ impl DomainDecoder {
                         let Some(domain) = domain_from_buffer(domain, len) else {
                             return;
                         };
-                        let address = ipv4_from_abi(answer.address);
+                        let address =
+                            IpAddr::V4(zimascope_common::model::ipv4_from_abi(answer.address));
                         let expires_at = observed_at + clamp_dns_ttl(answer.ttl_secs);
                         self.push(
                             domain,
@@ -200,10 +201,6 @@ fn clamp_dns_ttl(ttl_secs: u32) -> Duration {
     Duration::from_secs(u64::from(ttl_secs)).clamp(MIN_DNS_TTL, MAX_DNS_TTL)
 }
 
-fn ipv4_from_abi(raw: [u8; 16]) -> IpAddr {
-    IpAddr::V4(Ipv4Addr::new(raw[12], raw[13], raw[14], raw[15]))
-}
-
 fn domain_from_buffer(buffer: &[u8; DOMAIN_MAX_LEN], len: usize) -> Option<Box<str>> {
     if len == 0 || len > DOMAIN_MAX_LEN {
         return None;
@@ -241,97 +238,9 @@ pub(crate) fn normalize_domain(raw: &str) -> Option<Box<str>> {
 mod tests {
     use std::time::{Duration, Instant};
 
-    use zimascope_common::kernel_abi::{DomainSample, SampleKind};
-
     use super::*;
+    use crate::collector::test_source::{abi_dns_sample, abi_domain_sample, abi_tls_sample};
     use crate::collector::tracker::MonoClock;
-
-    fn dns_response(question: &str, answers: &[(u32, [u8; 4])]) -> Vec<u8> {
-        let mut message = Vec::new();
-        message.extend_from_slice(&0x1234u16.to_be_bytes());
-        message.extend_from_slice(&0x8180u16.to_be_bytes());
-        message.extend_from_slice(&1u16.to_be_bytes());
-        message.extend_from_slice(&(answers.len() as u16).to_be_bytes());
-        message.extend_from_slice(&0u16.to_be_bytes());
-        message.extend_from_slice(&0u16.to_be_bytes());
-        for label in question.split('.') {
-            message.push(label.len() as u8);
-            message.extend_from_slice(label.as_bytes());
-        }
-        message.push(0);
-        message.extend_from_slice(&1u16.to_be_bytes());
-        message.extend_from_slice(&1u16.to_be_bytes());
-        for (ttl, address) in answers {
-            message.push(0xC0);
-            message.push(0x0C);
-            message.extend_from_slice(&1u16.to_be_bytes());
-            message.extend_from_slice(&1u16.to_be_bytes());
-            message.extend_from_slice(&ttl.to_be_bytes());
-            message.extend_from_slice(&4u16.to_be_bytes());
-            message.extend_from_slice(address);
-        }
-        message
-    }
-
-    fn client_hello(sni: &str) -> Vec<u8> {
-        let mut body = Vec::new();
-        body.extend_from_slice(&[0x03, 0x03]);
-        body.extend_from_slice(&[0u8; 32]);
-        body.push(0);
-        body.extend_from_slice(&2u16.to_be_bytes());
-        body.extend_from_slice(&[0x13, 0x01]);
-        body.push(1);
-        body.push(0);
-
-        let entry_len = 1 + 2 + sni.len();
-        let mut server_name = Vec::new();
-        server_name.extend_from_slice(&(entry_len as u16).to_be_bytes());
-        server_name.push(0);
-        server_name.extend_from_slice(&(sni.len() as u16).to_be_bytes());
-        server_name.extend_from_slice(sni.as_bytes());
-
-        let mut extensions = Vec::new();
-        extensions.extend_from_slice(&0u16.to_be_bytes());
-        extensions.extend_from_slice(&(server_name.len() as u16).to_be_bytes());
-        extensions.extend_from_slice(&server_name);
-
-        body.extend_from_slice(&(extensions.len() as u16).to_be_bytes());
-        body.extend_from_slice(&extensions);
-
-        let mut handshake = Vec::new();
-        handshake.push(0x01);
-        handshake.extend_from_slice(&[
-            (body.len() >> 16) as u8,
-            (body.len() >> 8) as u8,
-            body.len() as u8,
-        ]);
-        handshake.extend_from_slice(&body);
-
-        let mut record = Vec::new();
-        record.push(0x16);
-        record.extend_from_slice(&[0x03, 0x01]);
-        record.extend_from_slice(&(handshake.len() as u16).to_be_bytes());
-        record.extend_from_slice(&handshake);
-        record
-    }
-
-    fn sample(kind: SampleKind, transport: u8, address: [u8; 4], payload: &[u8]) -> DomainSample {
-        let mut sample = DomainSample {
-            observed_mono_ns: 1_000,
-            ifindex: 7,
-            payload_len: payload.len().min(DOMAIN_SAMPLE_MAX) as u16,
-            kind: kind as u8,
-            transport,
-            ip_family: IpFamily::V4 as u8,
-            direction: Direction::Outbound as u8,
-            reserved: [0; 6],
-            address: [0; 16],
-            payload: [0; DOMAIN_SAMPLE_MAX],
-        };
-        sample.address[12..].copy_from_slice(&address);
-        sample.payload[..sample.payload_len as usize].copy_from_slice(payload);
-        sample
-    }
 
     #[test]
     fn normalizes_ascii_domains() {
@@ -367,13 +276,7 @@ mod tests {
         let mut decoder = DomainDecoder::new();
         let mut clock = MonoClock::default();
         let base = Instant::now();
-        let message = dns_response("Example.COM", &[(300, [93, 184, 216, 34])]);
-        let sample = sample(
-            SampleKind::Dns,
-            TransportProtocol::Udp as u8,
-            [8, 8, 8, 8],
-            &message,
-        );
+        let sample = abi_dns_sample("Example.COM", [93, 184, 216, 34], 300);
 
         let mut observations = Vec::new();
         decoder.decode(&sample, &mut clock, base, &mut observations);
@@ -397,19 +300,9 @@ mod tests {
         let mut clock = MonoClock::default();
         let base = Instant::now();
 
-        let hello = client_hello("cdn.example.com");
+        let hello = abi_tls_sample("cdn.example.com", [203, 0, 113, 9]);
         let mut observations = Vec::new();
-        decoder.decode(
-            &sample(
-                SampleKind::TlsClientHello,
-                TransportProtocol::Tcp as u8,
-                [203, 0, 113, 9],
-                &hello,
-            ),
-            &mut clock,
-            base,
-            &mut observations,
-        );
+        decoder.decode(&hello, &mut clock, base, &mut observations);
         assert_eq!(observations.len(), 1);
         assert_eq!(observations[0].domain.as_ref(), "cdn.example.com");
         assert_eq!(observations[0].address.to_string(), "203.0.113.9");
@@ -417,17 +310,14 @@ mod tests {
 
         let request = b"GET / HTTP/1.1\r\nHost: Example.COM\r\n\r\n";
         let mut observations = Vec::new();
-        decoder.decode(
-            &sample(
-                SampleKind::HttpRequest,
-                TransportProtocol::Tcp as u8,
-                [203, 0, 113, 10],
-                request,
-            ),
-            &mut clock,
-            base,
-            &mut observations,
+        let http = abi_domain_sample(
+            SampleKind::HttpRequest as u8,
+            TransportProtocol::Tcp as u8,
+            [203, 0, 113, 10],
+            1_000,
+            request,
         );
+        decoder.decode(&http, &mut clock, base, &mut observations);
         assert_eq!(observations.len(), 1);
         assert_eq!(observations[0].domain.as_ref(), "example.com");
         assert_eq!(observations[0].evidence, DomainEvidence::HttpHost);
@@ -438,45 +328,25 @@ mod tests {
         let mut decoder = DomainDecoder::new();
         let mut clock = MonoClock::default();
         let base = Instant::now();
-        let message = dns_response("example.com", &[(60, [192, 0, 2, 1])]);
+        let sample = abi_dns_sample("example.com", [192, 0, 2, 1], 60);
 
-        let mut invalid = sample(
-            SampleKind::Dns,
-            TransportProtocol::Udp as u8,
-            [8, 8, 8, 8],
-            &message,
-        );
+        let mut invalid = sample;
         invalid.kind = 9;
         let mut observations = Vec::new();
         decoder.decode(&invalid, &mut clock, base, &mut observations);
         assert!(observations.is_empty());
 
-        let mut invalid = sample(
-            SampleKind::Dns,
-            TransportProtocol::Udp as u8,
-            [8, 8, 8, 8],
-            &message,
-        );
+        let mut invalid = sample;
         invalid.ip_family = 6;
         decoder.decode(&invalid, &mut clock, base, &mut observations);
         assert!(observations.is_empty());
 
-        let mut invalid = sample(
-            SampleKind::Dns,
-            TransportProtocol::Udp as u8,
-            [8, 8, 8, 8],
-            &message,
-        );
+        let mut invalid = sample;
         invalid.payload_len = 0;
         decoder.decode(&invalid, &mut clock, base, &mut observations);
         assert!(observations.is_empty());
 
-        let mut invalid = sample(
-            SampleKind::Dns,
-            TransportProtocol::Udp as u8,
-            [8, 8, 8, 8],
-            &message,
-        );
+        let mut invalid = sample;
         invalid.transport = 1;
         decoder.decode(&invalid, &mut clock, base, &mut observations);
         assert!(observations.is_empty());
@@ -490,18 +360,8 @@ mod tests {
         let mut observations = Vec::new();
 
         for domain in ["one.example", "two.example"] {
-            let message = dns_response(domain, &[(60, [203, 0, 113, 9])]);
-            decoder.decode(
-                &sample(
-                    SampleKind::Dns,
-                    TransportProtocol::Udp as u8,
-                    [8, 8, 8, 8],
-                    &message,
-                ),
-                &mut clock,
-                base,
-                &mut observations,
-            );
+            let sample = abi_dns_sample(domain, [203, 0, 113, 9], 60);
+            decoder.decode(&sample, &mut clock, base, &mut observations);
         }
 
         assert_eq!(observations.len(), 2);

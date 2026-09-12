@@ -136,18 +136,13 @@ fn owner_value(pid: u32) -> Option<OwnerValue> {
         .ok()
         .map(|meta| meta.uid());
 
-    let mut raw = [0u8; 16];
-    let bytes = comm.as_bytes();
-    let length = bytes.len().min(raw.len());
-    raw[..length].copy_from_slice(&bytes[..length]);
-
     Some(OwnerValue {
         tgid: pid,
         pid,
         uid: uid.unwrap_or(0),
         reserved: 0,
         cgroup_id: 0,
-        comm: raw,
+        comm: zimascope_common::model::comm_bytes(&comm),
         observed_mono_ns: 0,
     })
 }

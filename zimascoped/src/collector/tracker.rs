@@ -8,7 +8,7 @@ use std::{
 use hashbrown::HashMap;
 use zimascope_common::{
     kernel_abi,
-    kernel_abi::{IpFamily, OwnerKind, TransportProtocol},
+    kernel_abi::{OwnerKind, TransportProtocol},
     model::{
         ApplicationRef, EndReason, Endpoint, FlowDirection, FlowKey, FlowState, FlowUpdate,
         Protocol, TrafficCounters,
@@ -461,14 +461,8 @@ fn application_ref(value: &kernel_abi::OwnerValue) -> Option<ApplicationRef> {
         tgid: value.tgid,
         uid: value.uid,
         cgroup_id: value.cgroup_id,
-        comm: comm_text(&value.comm),
+        comm: zimascope_common::model::comm_text(&value.comm),
     })
-}
-
-fn comm_text(raw: &[u8; 16]) -> Box<str> {
-    let end = raw.iter().position(|byte| *byte == 0).unwrap_or(raw.len());
-    let text = std::str::from_utf8(&raw[..end]).unwrap_or_default();
-    text.trim().into()
 }
 
 /// Builds the kernel-shaped lookup key for one side of a Flow.
@@ -479,17 +473,7 @@ fn owner_key(
     remote: IpAddr,
     remote_port: Option<u16>,
 ) -> kernel_abi::OwnerKey {
-    let mut remote_addr = [0u8; 16];
-    let ip_family = match remote {
-        IpAddr::V4(address) => {
-            remote_addr[12..].copy_from_slice(&address.octets());
-            IpFamily::V4
-        }
-        IpAddr::V6(address) => {
-            remote_addr.copy_from_slice(&address.octets());
-            IpFamily::V6
-        }
-    };
+    let (remote_addr, ip_family) = zimascope_common::model::ip_storage(remote);
 
     kernel_abi::OwnerKey {
         remote_addr,
@@ -509,18 +493,8 @@ pub(crate) fn decode_key(key: &kernel_abi::FlowKey) -> Option<FlowKey> {
         return None;
     }
 
-    let source = std::net::IpAddr::V4(std::net::Ipv4Addr::new(
-        key.src_addr[12],
-        key.src_addr[13],
-        key.src_addr[14],
-        key.src_addr[15],
-    ));
-    let destination = std::net::IpAddr::V4(std::net::Ipv4Addr::new(
-        key.dst_addr[12],
-        key.dst_addr[13],
-        key.dst_addr[14],
-        key.dst_addr[15],
-    ));
+    let source = IpAddr::V4(zimascope_common::model::ipv4_from_abi(key.src_addr));
+    let destination = IpAddr::V4(zimascope_common::model::ipv4_from_abi(key.dst_addr));
 
     Some(FlowKey {
         source: Endpoint {
@@ -544,13 +518,9 @@ mod tests {
     use super::*;
 
     fn key() -> kernel_abi::FlowKey {
-        let mut src_addr = [0u8; 16];
-        src_addr[12..].copy_from_slice(&[10, 0, 0, 2]);
-        let mut dst_addr = [0u8; 16];
-        dst_addr[12..].copy_from_slice(&[1, 1, 1, 1]);
         kernel_abi::FlowKey {
-            src_addr,
-            dst_addr,
+            src_addr: zimascope_common::model::ipv4_storage([10, 0, 0, 2].into()),
+            dst_addr: zimascope_common::model::ipv4_storage([1, 1, 1, 1].into()),
             src_port_be: 40_000u16.to_be(),
             dst_port_be: 443u16.to_be(),
             ifindex: 7,
@@ -1016,8 +986,6 @@ mod tests {
     }
 
     fn addr(octets: [u8; 4]) -> [u8; 16] {
-        let mut storage = [0u8; 16];
-        storage[12..].copy_from_slice(&octets);
-        storage
+        zimascope_common::model::ipv4_storage(octets.into())
     }
 }

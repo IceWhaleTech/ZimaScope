@@ -142,15 +142,8 @@ enum PolicyCommand {
 impl PolicyHandle {
     /// Applies one compiled program through the worker and reports the result.
     pub async fn apply(&self, program: CompiledPolicy) -> Result<ApplySummary> {
-        let (reply, response) = oneshot::channel();
-        self.commands
-            .send(PolicyCommand::Apply { program, reply })
+        self.request(|reply| PolicyCommand::Apply { program, reply })
             .await
-            .map_err(|_| anyhow::anyhow!("collector worker is not running"))?;
-        response
-            .await
-            .map_err(|_| anyhow::anyhow!("collector worker dropped the policy request"))?
-            .map_err(|error| anyhow::anyhow!(error))
     }
 
     /// Reads the kernel counters for the given rule-direction pairs.
@@ -158,12 +151,18 @@ impl PolicyHandle {
         &self,
         keys: &[kernel_abi::BucketKey],
     ) -> Result<Vec<Option<kernel_abi::RuleState>>> {
+        let keys = keys.to_vec();
+        self.request(move |reply| PolicyCommand::RuleStates { keys, reply })
+            .await
+    }
+
+    async fn request<T>(
+        &self,
+        make: impl FnOnce(oneshot::Sender<Result<T, String>>) -> PolicyCommand,
+    ) -> Result<T> {
         let (reply, response) = oneshot::channel();
         self.commands
-            .send(PolicyCommand::RuleStates {
-                keys: keys.to_vec(),
-                reply,
-            })
+            .send(make(reply))
             .await
             .map_err(|_| anyhow::anyhow!("collector worker is not running"))?;
         response
@@ -388,17 +387,14 @@ impl CollectorCore {
             })
         };
 
-        match service_result {
-            Ok(()) => {
-                self.health
-                    .close_gap(GapKey::ServiceEventsReadFailed, collected_at);
-            }
-            Err(_) => {
-                degraded = true;
-                self.health
-                    .open_gap(GapKey::ServiceEventsReadFailed, collected_at);
-            }
-        }
+        degraded |= self
+            .health
+            .observe(
+                service_result,
+                GapKey::ServiceEventsReadFailed,
+                collected_at,
+            )
+            .is_none();
 
         // Owners are read after Flows so a socket observed in the same poll is
         // already cached when deltas are reconciled.
@@ -410,31 +406,23 @@ impl CollectorCore {
             })
         };
 
-        match owner_result {
-            Ok(entries) => {
-                self.owner_entries = entries;
-                self.health
-                    .close_gap(GapKey::OwnerMapReadFailed, collected_at);
-            }
-            Err(_) => {
-                degraded = true;
-                self.health
-                    .open_gap(GapKey::OwnerMapReadFailed, collected_at);
-            }
+        match self
+            .health
+            .observe(owner_result, GapKey::OwnerMapReadFailed, collected_at)
+        {
+            Some(entries) => self.owner_entries = entries,
+            None => degraded = true,
         }
 
-        match flow_result {
-            Ok(entries) => {
+        match self
+            .health
+            .observe(flow_result, GapKey::FlowMapReadFailed, collected_at)
+        {
+            Some(entries) => {
                 self.map_entries = entries;
-                self.health
-                    .close_gap(GapKey::FlowMapReadFailed, collected_at);
                 flows.extend(self.tracker.reconcile(poll_started));
             }
-            Err(_) => {
-                degraded = true;
-                self.health
-                    .open_gap(GapKey::FlowMapReadFailed, collected_at);
-            }
+            None => degraded = true,
         }
 
         let domain_result = {
@@ -446,31 +434,21 @@ impl CollectorCore {
             })
         };
 
-        match domain_result {
-            Ok(()) => {
-                self.health
-                    .close_gap(GapKey::DomainEventsReadFailed, collected_at);
-            }
-            Err(_) => {
-                degraded = true;
-                self.health
-                    .open_gap(GapKey::DomainEventsReadFailed, collected_at);
-            }
-        }
+        degraded |= self
+            .health
+            .observe(domain_result, GapKey::DomainEventsReadFailed, collected_at)
+            .is_none();
 
         self.domains.purge_expired(poll_started);
 
-        match self.source.read_stats() {
-            Ok(stats) => {
-                self.health.record_kernel(stats);
-                self.health
-                    .close_gap(GapKey::KernelStatsReadFailed, collected_at);
-            }
-            Err(_) => {
-                degraded = true;
-                self.health
-                    .open_gap(GapKey::KernelStatsReadFailed, collected_at);
-            }
+        if let Some(stats) = self.health.observe(
+            self.source.read_stats(),
+            GapKey::KernelStatsReadFailed,
+            collected_at,
+        ) {
+            self.health.record_kernel(stats);
+        } else {
+            degraded = true;
         }
 
         let interfaces = self.source.attachment_health();

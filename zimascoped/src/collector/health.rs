@@ -70,6 +70,26 @@ impl HealthTracker {
         }
     }
 
+    /// Records the outcome of one kernel read: closes the Observation Gap on
+    /// success and opens it on failure. Returns the value on success.
+    pub fn observe<T, E>(
+        &mut self,
+        result: Result<T, E>,
+        key: GapKey,
+        at: SystemTime,
+    ) -> Option<T> {
+        match result {
+            Ok(value) => {
+                self.close_gap(key, at);
+                Some(value)
+            }
+            Err(_) => {
+                self.open_gap(key, at);
+                None
+            }
+        }
+    }
+
     pub fn close_all(&mut self, at: SystemTime) {
         let keys: Vec<GapKey> = self.open_gaps.keys().copied().collect();
         for key in keys {
@@ -85,50 +105,9 @@ impl HealthTracker {
     /// previous poll. A counter decrease means the kernel object was reloaded,
     /// so the new cumulative values become the delta.
     pub fn record_kernel(&mut self, stats: kernel_abi::KernelStats) -> KernelCounters {
-        let current = KernelCounters {
-            packets_seen: stats.packets_seen,
-            packets_parsed: stats.packets_parsed,
-            parse_failures: stats.parse_failures,
-            map_update_failures: stats.map_update_failures,
-            flow_evictions: stats.flow_evictions,
-            domain_events_emitted: stats.domain_events_emitted,
-            domain_events_dropped: stats.domain_events_dropped,
-            service_events_emitted: stats.service_events_emitted,
-            service_events_dropped: stats.service_events_dropped,
-            owner_events_inserted: stats.owner_events_inserted,
-            owner_events_dropped: stats.owner_events_dropped,
-            policy_dropped_packets: stats.policy_dropped_packets,
-            policy_dropped_bytes: stats.policy_dropped_bytes,
-            policy_missing_state: stats.policy_missing_state,
-        };
-
-        let delta = if self.kernel_seen && is_monotonic(self.last_kernel, current) {
-            KernelCounters {
-                packets_seen: current.packets_seen - self.last_kernel.packets_seen,
-                packets_parsed: current.packets_parsed - self.last_kernel.packets_parsed,
-                parse_failures: current.parse_failures - self.last_kernel.parse_failures,
-                map_update_failures: current.map_update_failures
-                    - self.last_kernel.map_update_failures,
-                flow_evictions: current.flow_evictions - self.last_kernel.flow_evictions,
-                domain_events_emitted: current.domain_events_emitted
-                    - self.last_kernel.domain_events_emitted,
-                domain_events_dropped: current.domain_events_dropped
-                    - self.last_kernel.domain_events_dropped,
-                service_events_emitted: current.service_events_emitted
-                    - self.last_kernel.service_events_emitted,
-                service_events_dropped: current.service_events_dropped
-                    - self.last_kernel.service_events_dropped,
-                owner_events_inserted: current.owner_events_inserted
-                    - self.last_kernel.owner_events_inserted,
-                owner_events_dropped: current.owner_events_dropped
-                    - self.last_kernel.owner_events_dropped,
-                policy_dropped_packets: current.policy_dropped_packets
-                    - self.last_kernel.policy_dropped_packets,
-                policy_dropped_bytes: current.policy_dropped_bytes
-                    - self.last_kernel.policy_dropped_bytes,
-                policy_missing_state: current.policy_missing_state
-                    - self.last_kernel.policy_missing_state,
-            }
+        let current = KernelCounters::from(stats);
+        let delta = if self.kernel_seen && current.is_monotonic_from(&self.last_kernel) {
+            current.delta_from(&self.last_kernel)
         } else {
             current
         };
@@ -160,21 +139,4 @@ impl HealthTracker {
             application,
         }
     }
-}
-
-fn is_monotonic(previous: KernelCounters, current: KernelCounters) -> bool {
-    current.packets_seen >= previous.packets_seen
-        && current.packets_parsed >= previous.packets_parsed
-        && current.parse_failures >= previous.parse_failures
-        && current.map_update_failures >= previous.map_update_failures
-        && current.flow_evictions >= previous.flow_evictions
-        && current.domain_events_emitted >= previous.domain_events_emitted
-        && current.domain_events_dropped >= previous.domain_events_dropped
-        && current.service_events_emitted >= previous.service_events_emitted
-        && current.service_events_dropped >= previous.service_events_dropped
-        && current.owner_events_inserted >= previous.owner_events_inserted
-        && current.owner_events_dropped >= previous.owner_events_dropped
-        && current.policy_dropped_packets >= previous.policy_dropped_packets
-        && current.policy_dropped_bytes >= previous.policy_dropped_bytes
-        && current.policy_missing_state >= previous.policy_missing_state
 }

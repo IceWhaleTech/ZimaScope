@@ -12,7 +12,7 @@ use zimascope_common::{
         self, Direction, FlowKey, FlowValue, IpFamily, KernelStats, OwnerKey, OwnerKind,
         OwnerValue, SampleKind, TransportProtocol,
     },
-    model::{ApplicationHealth, InterfaceHealth},
+    model::{self, ApplicationHealth, InterfaceHealth},
 };
 
 use super::KernelSource;
@@ -306,10 +306,8 @@ pub(crate) fn abi_key(
     dst_port: u16,
     protocol: u8,
 ) -> FlowKey {
-    let mut src_addr = [0u8; 16];
-    src_addr[12..].copy_from_slice(&src);
-    let mut dst_addr = [0u8; 16];
-    dst_addr[12..].copy_from_slice(&dst);
+    let src_addr = model::ipv4_storage(src.into());
+    let dst_addr = model::ipv4_storage(dst.into());
 
     FlowKey {
         src_addr,
@@ -349,13 +347,9 @@ pub(crate) fn abi_owner_key(
     local_port: u16,
     remote: Option<([u8; 4], u16)>,
 ) -> OwnerKey {
-    let mut remote_addr = [0u8; 16];
-    let remote_port_be = match remote {
-        Some((address, port)) => {
-            remote_addr[12..].copy_from_slice(&address);
-            port.to_be()
-        }
-        None => 0,
+    let (remote_addr, remote_port_be) = match remote {
+        Some((address, port)) => (model::ipv4_storage(address.into()), port.to_be()),
+        None => ([0u8; 16], 0),
     };
 
     OwnerKey {
@@ -370,18 +364,13 @@ pub(crate) fn abi_owner_key(
 }
 
 pub(crate) fn abi_owner_value(tgid: u32, uid: u32, comm: &str) -> OwnerValue {
-    let mut raw = [0u8; 16];
-    let bytes = comm.as_bytes();
-    let length = bytes.len().min(raw.len());
-    raw[..length].copy_from_slice(&bytes[..length]);
-
     OwnerValue {
         tgid,
         pid: tgid,
         uid,
         reserved: 0,
         cgroup_id: 0,
-        comm: raw,
+        comm: model::comm_bytes(comm),
         observed_mono_ns: 1_000,
     }
 }
@@ -403,10 +392,9 @@ pub(crate) fn abi_domain_sample(
         ip_family: IpFamily::V4 as u8,
         direction: Direction::Outbound as u8,
         reserved: [0; 6],
-        address: [0; 16],
+        address: model::ipv4_storage(address.into()),
         payload: [0; kernel_abi::DOMAIN_SAMPLE_MAX],
     };
-    sample.address[12..].copy_from_slice(&address);
     sample.payload[..length].copy_from_slice(&payload[..length]);
     sample
 }

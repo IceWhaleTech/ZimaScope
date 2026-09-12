@@ -453,7 +453,7 @@ fn compile_rule(
             .map(|direction| MatchEntry::EndpointExact {
                 direction: *direction,
                 key: EndpointMatchKey {
-                    addr: ipv4_storage(*address),
+                    addr: zimascope_common::model::ipv4_storage(*address),
                     port_be: port.map(u16::to_be).unwrap_or(0),
                     reserved: [0; 6],
                 },
@@ -575,12 +575,6 @@ fn check_capacity(rules: &[CompiledRule]) -> Result<(), String> {
         ));
     }
     Ok(())
-}
-
-fn ipv4_storage(address: Ipv4Addr) -> [u8; 16] {
-    let mut storage = [0u8; 16];
-    storage[12..].copy_from_slice(&address.octets());
-    storage
 }
 
 #[cfg(test)]
@@ -874,7 +868,9 @@ mod tests {
         assert!(rule.matches.contains(&MatchEntry::EndpointExact {
             direction: Direction::Inbound,
             key: EndpointMatchKey {
-                addr: ipv4_storage("203.0.113.9".parse().expect("address")),
+                addr: zimascope_common::model::ipv4_storage(
+                    "203.0.113.9".parse().expect("address")
+                ),
                 port_be: 443u16.to_be(),
                 reserved: [0; 6],
             },
@@ -882,7 +878,9 @@ mod tests {
         assert!(rule.matches.contains(&MatchEntry::EndpointExact {
             direction: Direction::Outbound,
             key: EndpointMatchKey {
-                addr: ipv4_storage("203.0.113.9".parse().expect("address")),
+                addr: zimascope_common::model::ipv4_storage(
+                    "203.0.113.9".parse().expect("address")
+                ),
                 port_be: 443u16.to_be(),
                 reserved: [0; 6],
             },

@@ -6,11 +6,11 @@
 //! best-effort and cached; a process that exited in the meantime still keeps
 //! its `comm` from the kernel observation.
 
-use std::{collections::HashMap, fs, time::Instant};
+use std::{collections::HashMap, fs};
 
 use zimascope_common::model::ApplicationRef;
 
-use crate::cgroup;
+use crate::cgroup::{self, CgroupIndex};
 
 /// How many `(tgid, comm)` resolutions are cached before the cache is dropped.
 const RESOLUTION_CACHE_CAPACITY: usize = 4_096;
@@ -32,9 +32,7 @@ pub(crate) struct ResolvedApplication {
 #[derive(Default)]
 pub(crate) struct ApplicationResolver {
     cache: HashMap<(u32, String), ProcessFacts>,
-    /// cgroup directory inode (`cgroup_id`) to container id.
-    cgroup_index: HashMap<u64, Option<Box<str>>>,
-    cgroup_index_at: Option<Instant>,
+    cgroups: CgroupIndex,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -109,28 +107,15 @@ impl ApplicationResolver {
     ///
     /// cgroup v2 ids are the inode of the cgroup directory, so the index is
     /// built by walking `/sys/fs/cgroup`; an unknown id re-walks the tree at
-    /// most once per [`CGROUP_INDEX_REFRESH`] so containers started later are
+    /// most once per [`cgroup::INDEX_REFRESH`] so containers started later are
     /// still found.
     fn container_for_cgroup(&mut self, cgroup_id: u64) -> Option<String> {
         if cgroup_id == 0 {
             return None;
         }
-        if let Some(found) = self.cgroup_index.get(&cgroup_id) {
-            return found.as_deref().map(ToOwned::to_owned);
-        }
-
-        let due = self
-            .cgroup_index_at
-            .map(|at| at.elapsed() >= cgroup::INDEX_REFRESH)
-            .unwrap_or(true);
-        if due {
-            self.cgroup_index = index_cgroups();
-            self.cgroup_index_at = Some(Instant::now());
-            if let Some(found) = self.cgroup_index.get(&cgroup_id) {
-                return found.as_deref().map(ToOwned::to_owned);
-            }
-        }
-        None
+        self.cgroups
+            .container_for_inode(cgroup_id)
+            .map(ToOwned::to_owned)
     }
 }
 
@@ -144,13 +129,6 @@ fn read_process_facts(tgid: u32) -> ProcessFacts {
         .and_then(cgroup::container_id);
 
     ProcessFacts { exe, container_id }
-}
-
-/// Walks the cgroup v2 tree and records every directory inode.
-fn index_cgroups() -> HashMap<u64, Option<Box<str>>> {
-    let mut index = HashMap::new();
-    cgroup::walk_tree(std::path::Path::new("/sys/fs/cgroup"), &mut index);
-    index
 }
 
 fn normalize_exe(path: &str) -> Option<String> {

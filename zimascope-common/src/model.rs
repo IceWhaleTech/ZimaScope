@@ -3,7 +3,7 @@
 //! These types never cross the kernel boundary and may use normal Rust types.
 
 use std::{
-    net::IpAddr,
+    net::{IpAddr, Ipv4Addr},
     num::NonZeroU32,
     time::{Duration, Instant, SystemTime},
 };
@@ -95,6 +95,42 @@ pub struct ApplicationRef {
     pub uid: u32,
     pub cgroup_id: u64,
     pub comm: Box<str>,
+}
+
+/// Zero-extended 16-byte storage for an IPv4 address, matching the kernel ABI.
+pub fn ipv4_storage(address: Ipv4Addr) -> [u8; 16] {
+    let mut storage = [0u8; 16];
+    storage[12..].copy_from_slice(&address.octets());
+    storage
+}
+
+/// Reads the IPv4 address from its zero-extended 16-byte kernel storage.
+pub fn ipv4_from_abi(storage: [u8; 16]) -> Ipv4Addr {
+    Ipv4Addr::new(storage[12], storage[13], storage[14], storage[15])
+}
+
+/// Encodes an address and its family the way the kernel ABI stores them.
+pub fn ip_storage(address: IpAddr) -> ([u8; 16], kernel_abi::IpFamily) {
+    match address {
+        IpAddr::V4(address) => (ipv4_storage(address), kernel_abi::IpFamily::V4),
+        IpAddr::V6(address) => (address.octets(), kernel_abi::IpFamily::V6),
+    }
+}
+
+/// Encodes a process name the way `bpf_get_current_comm` does: at most 15
+/// bytes plus a NUL terminator.
+pub fn comm_bytes(comm: &str) -> [u8; 16] {
+    let mut storage = [0u8; 16];
+    let length = comm.len().min(15);
+    storage[..length].copy_from_slice(&comm.as_bytes()[..length]);
+    storage
+}
+
+/// Decodes a kernel `comm` value back into text.
+pub fn comm_text(raw: &[u8; 16]) -> Box<str> {
+    let end = raw.iter().position(|byte| *byte == 0).unwrap_or(raw.len());
+    let text = std::str::from_utf8(&raw[..end]).unwrap_or_default();
+    text.trim().into()
 }
 
 /// An Association between a domain and an Endpoint.
@@ -212,22 +248,53 @@ pub struct InterfaceHealth {
 }
 
 /// Kernel counters converted to the interval since the previous poll.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct KernelCounters {
-    pub packets_seen: u64,
-    pub packets_parsed: u64,
-    pub parse_failures: u64,
-    pub map_update_failures: u64,
-    pub flow_evictions: u64,
-    pub domain_events_emitted: u64,
-    pub domain_events_dropped: u64,
-    pub service_events_emitted: u64,
-    pub service_events_dropped: u64,
-    pub owner_events_inserted: u64,
-    pub owner_events_dropped: u64,
-    pub policy_dropped_packets: u64,
-    pub policy_dropped_bytes: u64,
-    pub policy_missing_state: u64,
+///
+/// The field list is defined once and shared by the ABI conversion and the
+/// delta arithmetic, so a new kernel counter cannot be half-wired.
+macro_rules! kernel_counters {
+    ($($field:ident),+ $(,)?) => {
+        #[derive(Clone, Copy, Debug, Default)]
+        pub struct KernelCounters {
+            $(pub $field: u64,)+
+        }
+
+        impl From<kernel_abi::KernelStats> for KernelCounters {
+            fn from(stats: kernel_abi::KernelStats) -> Self {
+                Self { $($field: stats.$field,)+ }
+            }
+        }
+
+        impl KernelCounters {
+            /// Whether every counter is at least its previous value. A
+            /// decrease means the kernel object was reloaded.
+            pub fn is_monotonic_from(&self, previous: &Self) -> bool {
+                true $(&& self.$field >= previous.$field)+
+            }
+
+            /// Field-wise delta; callers must check
+            /// [`Self::is_monotonic_from`] first.
+            pub fn delta_from(&self, previous: &Self) -> Self {
+                Self { $($field: self.$field - previous.$field,)+ }
+            }
+        }
+    };
+}
+
+kernel_counters! {
+    packets_seen,
+    packets_parsed,
+    parse_failures,
+    map_update_failures,
+    flow_evictions,
+    domain_events_emitted,
+    domain_events_dropped,
+    service_events_emitted,
+    service_events_dropped,
+    owner_events_inserted,
+    owner_events_dropped,
+    policy_dropped_packets,
+    policy_dropped_bytes,
+    policy_missing_state,
 }
 
 /// A known interval in which ZimaScope could not observe complete metadata.

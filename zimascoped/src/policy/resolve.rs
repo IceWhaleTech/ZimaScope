@@ -5,16 +5,13 @@
 //! `applications` table's `comm` column, so the API normalizes it before
 //! compilation and this resolver reports it as unresolved otherwise.
 
-use std::{collections::HashMap, path::Path, time::Instant};
-
 use super::{AppKey, ApplicationKeys};
-use crate::cgroup;
+use crate::cgroup::CgroupIndex;
 
 /// Resolves `cont:` and `proc:comm:` identities on this host.
 #[derive(Default)]
 pub struct SystemApplicationKeys {
-    containers: HashMap<String, Vec<u64>>,
-    refreshed_at: Option<Instant>,
+    cgroups: CgroupIndex,
 }
 
 impl SystemApplicationKeys {
@@ -22,42 +19,10 @@ impl SystemApplicationKeys {
         Self::default()
     }
 
-    fn cgroups_for(&mut self, container_id: &str) -> Vec<u64> {
-        let stale = self
-            .refreshed_at
-            .map(|at| at.elapsed() >= cgroup::INDEX_REFRESH)
-            .unwrap_or(true);
-        if stale {
-            self.refresh();
-        }
-        self.containers
-            .get(container_id)
-            .cloned()
-            .unwrap_or_default()
-    }
-
-    fn refresh(&mut self) {
-        let mut index = HashMap::new();
-        cgroup::walk_tree(Path::new("/sys/fs/cgroup"), &mut index);
-
-        let mut containers: HashMap<String, Vec<u64>> = HashMap::new();
-        for (inode, container) in index {
-            if let Some(container) = container {
-                containers
-                    .entry(container.into_string())
-                    .or_default()
-                    .push(inode);
-            }
-        }
-        self.containers = containers;
-        self.refreshed_at = Some(Instant::now());
-    }
-
     #[cfg(test)]
-    fn with_containers(containers: HashMap<String, Vec<u64>>) -> Self {
+    fn with_containers(containers: std::collections::HashMap<String, Vec<u64>>) -> Self {
         Self {
-            containers,
-            refreshed_at: Some(Instant::now()),
+            cgroups: CgroupIndex::with_containers(containers),
         }
     }
 }
@@ -65,10 +30,15 @@ impl SystemApplicationKeys {
 impl ApplicationKeys for SystemApplicationKeys {
     fn keys(&mut self, identity: &str) -> Result<Vec<AppKey>, String> {
         if let Some(comm) = identity.strip_prefix("proc:comm:") {
-            return Ok(vec![AppKey::Comm(comm_bytes(comm)?)]);
+            if comm.is_empty() {
+                return Err("process name is empty".to_owned());
+            }
+            return Ok(vec![AppKey::Comm(zimascope_common::model::comm_bytes(
+                comm,
+            ))]);
         }
         if let Some(container_id) = identity.strip_prefix("cont:") {
-            let cgroups = self.cgroups_for(container_id);
+            let cgroups = self.cgroups.inodes_for_container(container_id);
             if cgroups.is_empty() {
                 return Err(format!("container {container_id} has no cgroup directory"));
             }
@@ -80,20 +50,10 @@ impl ApplicationKeys for SystemApplicationKeys {
     }
 }
 
-/// Encodes a process name the way `bpf_get_current_comm` does: at most 15
-/// bytes plus a NUL terminator.
-fn comm_bytes(comm: &str) -> Result<[u8; 16], String> {
-    if comm.is_empty() {
-        return Err("process name is empty".to_owned());
-    }
-    let mut storage = [0u8; 16];
-    let length = comm.len().min(15);
-    storage[..length].copy_from_slice(&comm.as_bytes()[..length]);
-    Ok(storage)
-}
-
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use super::*;
 
     #[test]

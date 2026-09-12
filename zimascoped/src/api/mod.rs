@@ -1138,9 +1138,7 @@ fn resolve_rule_identity(db: &Db, rule: &mut TrafficRule) -> Option<String> {
     let RuleMatch::Application { identity } = &rule.matcher else {
         return None;
     };
-    let Some(executable) = identity.strip_prefix("proc:") else {
-        return None;
-    };
+    let executable = identity.strip_prefix("proc:")?;
     if executable.starts_with("comm:") {
         return None;
     }

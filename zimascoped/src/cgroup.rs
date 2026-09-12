@@ -4,13 +4,96 @@
 //! once per refresh window. Both the Application Identity resolver and the
 //! Traffic Rule compiler need the same view of the cgroup tree.
 
-use std::{collections::HashMap, fs, os::unix::fs::MetadataExt, path::Path, time::Duration};
+use std::{
+    collections::HashMap,
+    fs,
+    os::unix::fs::MetadataExt,
+    path::Path,
+    time::{Duration, Instant},
+};
+
+/// Mount point of the cgroup v2 hierarchy on ZimaOS.
+pub(crate) const CGROUP_ROOT: &str = "/sys/fs/cgroup";
 
 /// Minimum age of a cgroup-id index before a miss walks the tree again.
 pub(crate) const INDEX_REFRESH: Duration = Duration::from_secs(5);
 
 /// Bound on the cgroup tree walk, so a symlink loop cannot recurse forever.
 pub(crate) const WALK_DEPTH: usize = 12;
+
+/// Cached view of the cgroup tree.
+///
+/// One walk builds both directions: inode to container (used to resolve
+/// short-lived processes) and container to inodes (used to compile
+/// application-identity Traffic Rules).
+#[derive(Default)]
+pub(crate) struct CgroupIndex {
+    by_inode: HashMap<u64, Option<Box<str>>>,
+    by_container: HashMap<String, Vec<u64>>,
+    refreshed_at: Option<Instant>,
+}
+
+impl CgroupIndex {
+    /// Rebuilds the snapshot when it is older than [`INDEX_REFRESH`].
+    pub(crate) fn refresh_if_stale(&mut self) {
+        let stale = self
+            .refreshed_at
+            .map(|at| at.elapsed() >= INDEX_REFRESH)
+            .unwrap_or(true);
+        if stale {
+            self.refresh();
+        }
+    }
+
+    /// Returns the container owning a cgroup inode.
+    ///
+    /// A cached hit is returned without walking the tree; a miss refreshes a
+    /// stale snapshot so containers started later are still found.
+    pub(crate) fn container_for_inode(&mut self, inode: u64) -> Option<&str> {
+        if !self.by_inode.contains_key(&inode) {
+            self.refresh_if_stale();
+        }
+        self.by_inode
+            .get(&inode)
+            .and_then(|container| container.as_deref())
+    }
+
+    /// Every cgroup inode that belongs to `container`.
+    pub(crate) fn inodes_for_container(&mut self, container: &str) -> Vec<u64> {
+        self.refresh_if_stale();
+        self.by_container
+            .get(container)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    fn refresh(&mut self) {
+        let mut by_inode = HashMap::new();
+        walk_tree(Path::new(CGROUP_ROOT), &mut by_inode);
+
+        let mut by_container: HashMap<String, Vec<u64>> = HashMap::new();
+        for (inode, container) in &by_inode {
+            if let Some(container) = container {
+                by_container
+                    .entry(container.to_string())
+                    .or_default()
+                    .push(*inode);
+            }
+        }
+        self.by_inode = by_inode;
+        self.by_container = by_container;
+        self.refreshed_at = Some(Instant::now());
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_containers(containers: HashMap<String, Vec<u64>>) -> Self {
+        Self {
+            by_inode: HashMap::new(),
+            by_container: containers,
+            refreshed_at: Some(Instant::now()),
+        }
+    }
+}
 
 /// Walks a cgroup tree and records every directory inode.
 ///
