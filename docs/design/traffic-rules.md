@@ -5,6 +5,13 @@ Device Boundary. It complements
 [ADR-0004](../adr/0004-traffic-policing.md) and uses the product vocabulary
 from `CONTEXT.md`.
 
+The rule target model is defined by
+[query-abstraction.md](query-abstraction.md) (ADR-0005): the persisted `match`
+field is now a `Selector`, action parameters live in `ActionSpec`, and
+Application Identity resolution goes through the shared resolver seam. The
+kernel ABI, token bucket, ordering invariants and fail-open rules in this
+document stay authoritative.
+
 ## Scope
 
 ZimaScope polices user-confirmed Traffic Rules with eBPF programs inside the
@@ -12,12 +19,12 @@ existing TC attachment. It never shapes, queues or delays packets: over-limit
 traffic is dropped, so TCP reacts through congestion control and UDP sees loss.
 
 The first phase supports IPv4, the actions `limit` and `block`, the directions
-`inbound`, `outbound` and `both`, and two match kinds: an Endpoint (address or
-CIDR, optional port) and an Application Identity (container or process). Domain
-and single-Flow matches are out of scope. Enforcement precedes accounting: a
-packet dropped by a rule is not a Flow and moves no boundary byte counters.
-Per-rule counters and global `policy_*` counters are the record, and policy
-drops are intentional behavior, never an Observation Gap.
+`inbound`, `outbound` and `both`, and three selector kinds: Endpoint (address
+plus optional port), CIDR and Application Identity (container or process).
+Domain and single-Flow selectors are out of scope. Enforcement precedes
+accounting: a packet dropped by a rule is not a Flow and moves no boundary byte
+counters. Per-rule counters and global `policy_*` counters are the record, and
+policy drops are intentional behavior, never an Observation Gap.
 
 Fail-open is absolute. A packet passes unless an enabled rule explicitly
 matches it and the rule's action says drop; every missing fact (no match,
@@ -31,24 +38,26 @@ user-visible fields are:
 
 | Field | Values | Constraints |
 | --- | --- | --- |
-| `action` | `limit`, `block` | required |
+| `action` | `limit`, `block` | required; `limit` carries `rate_bytes_per_s` and `burst_bytes`, `block` carries neither |
 | `direction` | `inbound`, `outbound`, `both` | required; `both` is compiled into both direction map sets |
-| `match` | Endpoint, CIDR or Application | exactly one |
+| `selector` | `endpoint`, `cidr` or `application` | exactly one, in the shape defined by [query-abstraction.md](query-abstraction.md) |
 | `rate_bytes_per_s` | `u64` | required for `limit`, forbidden for `block`; 4 KiB/s to 10 GiB/s |
 | `burst_bytes` | `u64` | derived on creation (`rate × 1s`) and stored; not user-facing in this phase |
 | `enabled` | `bool` | disabled rules stay persisted but are not compiled |
 
 `MAX_TRAFFIC_RULES` is 64, matching the `DEFAULT_TRAFFIC_RULE_CAPACITY`
 compiled into the eBPF object. The bound keeps the fixed map capacities honest
-and the per-packet evaluation bounded.
+and the per-packet evaluation bounded. The preflight endpoint reports the same
+bound, so a selector that cannot fit is visible before a rule is created.
 
-An Endpoint rule matches the direction-relative remote endpoint, the same side
-the Explorer shows: an outbound rule matches the destination, an inbound rule
-matches the source. The optional port uses `0` as the wildcard value, which is
-safe because TCP/UDP port 0 never appears on the wire. A CIDR rule matches the
-remote address with the longest-prefix lookup and carries no port.
+A `Selector::Endpoint` matches the direction-relative remote endpoint, the same
+side the Explorer shows: an outbound rule matches the destination, an inbound
+rule matches the source. The optional port uses `0` as the wildcard value,
+which is safe because TCP/UDP port 0 never appears on the wire. A
+`Selector::Cidr` matches the remote address with the longest-prefix lookup and
+carries no port.
 
-An Application rule matches the identity selected in the UI:
+An `Selector::Application` matches the identity selected in the UI:
 
 - `cont:<container_id>` resolves to the container's cgroup ids (see
   Compilation); every socket the container owns matches.
@@ -229,12 +238,18 @@ observe-only behavior.
 
 ## Compilation and reconciliation
 
-`zimascoped/src/policy/` owns user-space policy:
+`zimascoped/src/policy/` owns user-space policy and `zimascoped/src/query/`
+owns selector resolution (ADR-0005):
 
-- `TrafficRule` is the persisted model; `compile(rows, resolver)` turns enabled
-  rules into a `CompiledPolicy` (revision, per-tier match entries, per-rule
-  state seeds) or an inactive entry with an explanation when a match cannot be
-  resolved.
+- `TrafficRule` is the persisted model; `compile(rules, resolver)` turns
+  enabled rules into a `CompiledPolicy` (revision, per-tier match entries,
+  per-rule state seeds) or an inactive entry with an explanation when a
+  selector cannot be resolved.
+- The `EvidenceResolver` turns a `Selector` into bounded `MatchTarget`s.
+  `Selector::Endpoint` and `Selector::Cidr` are direct; `proc:comm:` is
+  direct; `cont:<id>` resolves through the cgroup tree; `proc:<exe>` resolves
+  through the `applications` table's `comm` column. Missing evidence is
+  `Coverage::Unresolved`, never a partially installed rule.
 - Container rules resolve `cont:<id>` to cgroup ids by walking
   `/sys/fs/cgroup`, propagating a container id to descendant directories so
   nested cgroups inside the container match too. The walk is cached and
@@ -242,8 +257,8 @@ observe-only behavior.
   restarts and its cgroup id changes, the refresh recompiles the affected rule.
   A container with more cgroup directories than the match capacity allows is
   reported unresolved instead of partially matched.
-- Process rules resolve `proc:comm:<comm>` directly and `proc:<exe>` through
-  the `applications` table's `comm` column; a missing `comm` is unresolved.
+- Actions are `ActionSpec::Limit` (token bucket) and `ActionSpec::Block`;
+  per-action validation replaces the combined match/rate check.
 
 Applying a `CompiledPolicy` is diff-based against the previously applied
 program. The ordering invariants make every intermediate state fail open:
@@ -277,25 +292,21 @@ gains `apply_policy(Vec<PolicyOp>)` and `read_rule_states(&[BucketKey])`; the
 collector worker tracks the applied revision, and the deterministic test
 source records operations for assertions.
 
-`ApiState` owns the rule snapshots, the `SystemApplicationKeys` resolver and
-the `PolicyHandle`, injected after the Collector starts. Rule mutations and
+`ApiState` owns the rule snapshots, the cgroup resolver state and the
+`PolicyHandle`, injected after the Collector starts. Rule mutations and
 settings changes recompile and reapply through the handle; failures are
 reported through `/v1/status` instead of blocking the request.
 
 ## Storage
 
-Schema v6 adds:
+Schema v7 replaces the per-kind match columns with one selector document:
 
 ```sql
 CREATE TABLE IF NOT EXISTS traffic_rules (
     id INTEGER PRIMARY KEY,
     action TEXT NOT NULL,
     direction TEXT NOT NULL,
-    match_kind TEXT NOT NULL,
-    address TEXT,
-    prefix_len INTEGER,
-    port INTEGER,
-    application_id TEXT,
+    selector_json TEXT NOT NULL,
     rate_bytes_per_s INTEGER,
     burst_bytes INTEGER,
     enabled INTEGER NOT NULL,
@@ -303,6 +314,9 @@ CREATE TABLE IF NOT EXISTS traffic_rules (
     updated_at_ms INTEGER NOT NULL
 );
 ```
+
+Pre-release databases recreate the rules table on the version bump; no row
+migration is written (ADR-0005).
 
 `Settings` gains a `traffic_rules.enabled` master switch (default `true`) that
 is applied before any rule diff; turning it off clears `policy_config.enabled`
@@ -317,16 +331,18 @@ details, audit ring):
 | --- | --- | --- |
 | GET | `/v1/traffic-rules` | List rules with live counters and per-rule state |
 | POST | `/v1/traffic-rules` | Create a rule; 422 on validation failure, 409 when the bound is hit |
+| POST | `/v1/traffic-rules/resolve` | Preflight a selector: targets, coverage, expiry; persists nothing |
 | GET | `/v1/traffic-rules/{id}` | Rule detail |
-| PATCH | `/v1/traffic-rules/{id}` | Enable/disable, change rate, change direction |
+| PATCH | `/v1/traffic-rules/{id}` | Enable/disable, change rate, change direction, change selector |
 | DELETE | `/v1/traffic-rules/{id}` | Remove the rule |
 
-The DTO carries `action`, `direction`, `match` (kind plus the kind's fields),
-`rate_bytes_per_s`, `burst_bytes`, `enabled`, timestamps, `counters`
-(matched/dropped packets and bytes) and a derived `state`: `active`,
-`unresolved`, `bypassed`, or `unavailable`. Mutations write the existing audit
-ring (`traffic_rule.create`, `.update`, `.delete`) and the master switch goes
-through `PATCH /v1/settings`.
+The DTO carries `action`, `direction`, `selector`, `rate_bytes_per_s`,
+`burst_bytes`, `enabled`, timestamps, `counters` (matched/dropped packets and
+bytes) and a derived `state`: `active`, `unresolved`, `bypassed`, or
+`unavailable`. Mutations write the existing audit ring (`traffic_rule.create`,
+`.update`, `.delete`) and the master switch goes through `PATCH /v1/settings`.
+The preflight response reports `plan` (`direct`/`resolved`), the resolved
+targets, `coverage` plus a reason when unresolved, and `expires_at`.
 
 `/v1/status` gains an `enforcement` block: master switch, applied revision,
 active rule count, kernel drop counters, and `last_error`. Rules are never
@@ -338,8 +354,11 @@ The Explorer row menu's `Rate limit` and `Block traffic` entries become real
 actions: they open a dialog prefilled from the row (connection → remote
 endpoint and port; endpoint → address; application → identity) with direction,
 rate in Mbps (converted to bytes per second) and an explicit confirmation
-before a `block`. Domain rows do not offer Traffic Rule actions because domain
-matching is not supported; the reason is disclosed instead of pretending.
+before a `block`. The dialog calls the resolve preflight on open and on
+direction changes, then discloses the target count or an unresolved reason
+before the rule is created. Domain rows do not offer Traffic Rule actions
+because domain matching is not supported; the reason is disclosed instead of
+pretending.
 
 Settings gains a `Traffic rules` card: the master switch, the rule list with
 per-rule state, counters and enable/disable/delete, and a prominent
