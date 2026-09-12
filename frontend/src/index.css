@@ -1,0 +1,263 @@
+/* =========================================================================
+   ZimaScope theme — Apple-inspired tokens on Tailwind v4.
+
+   Design rules baked in (deliberately, not decoratively):
+   - Flat solid canvas. No gradient washes, no glows, no shimmer.
+   - Translucent materials only where chrome floats over scrolling content.
+   - macOS-scale radii: 12px surfaces, 7px controls, 14px sheets.
+   - Type hierarchy from weight and color, 15px floor, tabular numerals.
+   - Series colors: inbound = systemBlue, outbound = systemTeal.
+   ========================================================================= */
+
+@import "tailwindcss";
+@import "tw-animate-css";
+
+@custom-variant dark (&:where([data-theme="dark"], [data-theme="dark"] *));
+
+/* ---------- Design tokens (light) --------------------------------------- */
+
+:root {
+  color-scheme: light;
+
+  --background: #f2f2f7;
+  --foreground: #1d1d1f;
+  --card: #ffffff;
+  --card-foreground: #1d1d1f;
+  --popover: #ffffff;
+  --popover-foreground: #1d1d1f;
+  --primary: #007aff;
+  --primary-foreground: #ffffff;
+  --secondary: rgba(120, 120, 128, 0.1);
+  --secondary-foreground: #1d1d1f;
+  --muted: rgba(120, 120, 128, 0.08);
+  --muted-foreground: rgba(60, 60, 67, 0.62);
+  --accent: rgba(120, 120, 128, 0.1);
+  --accent-foreground: #1d1d1f;
+  --destructive: #ff3b30;
+  --destructive-foreground: #ffffff;
+  --border: rgba(60, 60, 67, 0.14);
+  --input: rgba(60, 60, 67, 0.14);
+  --ring: rgba(0, 122, 255, 0.35);
+
+  --success: #34c759;
+  --warning: #ff9500;
+  --series-inbound: #007aff;
+  --series-outbound: #30b0c7;
+
+  --elevation-1: 0 1px 2px rgba(0, 0, 0, 0.04), 0 4px 16px -8px rgba(0, 0, 0, 0.08);
+  --elevation-2: 0 2px 10px rgba(0, 0, 0, 0.06), 0 16px 40px -16px rgba(0, 0, 0, 0.24);
+  --chrome-shadow: 0 18px 44px -24px rgba(20, 24, 32, 0.28), inset 0 1px rgba(255, 255, 255, 0.72);
+  --surface-shadow: 0 18px 48px -34px rgba(20, 24, 32, 0.24), inset 0 1px rgba(255, 255, 255, 0.52);
+  --scrim: rgba(0, 0, 0, 0.25);
+  --radius: 0.75rem;
+}
+
+[data-theme="dark"] {
+  color-scheme: dark;
+
+  --background: #000000;
+  --foreground: #f5f5f7;
+  --card: #1c1c1e;
+  --card-foreground: #f5f5f7;
+  --popover: #1c1c1e;
+  --popover-foreground: #f5f5f7;
+  --primary: #0a84ff;
+  --primary-foreground: #ffffff;
+  --secondary: rgba(120, 120, 128, 0.2);
+  --secondary-foreground: #f5f5f7;
+  --muted: rgba(120, 120, 128, 0.16);
+  --muted-foreground: rgba(235, 235, 245, 0.62);
+  --accent: rgba(120, 120, 128, 0.2);
+  --accent-foreground: #f5f5f7;
+  --destructive: #ff453a;
+  --destructive-foreground: #ffffff;
+  --border: rgba(235, 235, 245, 0.16);
+  --input: rgba(235, 235, 245, 0.16);
+  --ring: rgba(10, 132, 255, 0.45);
+
+  --success: #30d158;
+  --warning: #ff9f0a;
+  --series-inbound: #0a84ff;
+  --series-outbound: #40c8e0;
+
+  --elevation-1: 0 0 0 0.5px rgba(255, 255, 255, 0.07), 0 4px 16px -8px rgba(0, 0, 0, 0.55);
+  --elevation-2: 0 0 0 0.5px rgba(255, 255, 255, 0.09), 0 16px 48px -16px rgba(0, 0, 0, 0.7);
+  --chrome-shadow: 0 20px 48px -20px rgba(0, 0, 0, 0.78), inset 0 1px rgba(255, 255, 255, 0.055);
+  --surface-shadow: 0 18px 48px -28px rgba(0, 0, 0, 0.72), inset 0 1px rgba(255, 255, 255, 0.035);
+  --scrim: rgba(0, 0, 0, 0.45);
+}
+
+/* ---------- Tailwind theme mapping --------------------------------------- */
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-destructive-foreground: var(--destructive-foreground);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+  --color-success: var(--success);
+  --color-warning: var(--warning);
+  --color-series-inbound: var(--series-inbound);
+  --color-series-outbound: var(--series-outbound);
+  --color-chart-1: var(--series-inbound);
+  --color-chart-2: var(--series-outbound);
+
+  --font-sans: -apple-system, BlinkMacSystemFont, "SF Pro Text", "SF Pro Display", "Segoe UI",
+    Roboto, "Helvetica Neue", Arial, sans-serif;
+  --font-mono: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+
+  /* Size-specific type: 15px floor, 17px body, hierarchy via weight. */
+  --text-2xs: 0.9375rem;
+  --text-2xs--line-height: 1.3rem;
+  --text-xs: 1rem;
+  --text-xs--line-height: 1.4375rem;
+  --text-sm: 1.0625rem;
+  --text-sm--line-height: 1.625rem;
+  --text-base: 1.125rem;
+  --text-base--line-height: 1.75rem;
+  --text-lg: 1.3125rem;
+  --text-lg--line-height: 1.4;
+
+  /* macOS-scale radii: controls 7px, surfaces 12px, sheets 14px. */
+  --radius-sm: 6px;
+  --radius-md: 7px;
+  --radius-lg: 12px;
+  --radius-xl: 14px;
+
+  --shadow-card: var(--elevation-1);
+  --shadow-pop: var(--elevation-2);
+}
+
+/* ---------- Base --------------------------------------------------------- */
+
+@layer base {
+  * {
+    @apply border-border outline-ring/50;
+  }
+
+  html {
+    -webkit-text-size-adjust: 100%;
+  }
+
+  body {
+    @apply bg-background text-foreground font-sans text-sm antialiased;
+    margin: 0;
+    min-width: 320px;
+    letter-spacing: 0.01em;
+    text-rendering: optimizeLegibility;
+  }
+
+  ::selection {
+    background: color-mix(in srgb, var(--primary) 22%, transparent);
+  }
+
+  * {
+    scrollbar-width: thin;
+    scrollbar-color: color-mix(in srgb, var(--foreground) 22%, transparent) transparent;
+  }
+
+  button,
+  input,
+  select,
+  textarea {
+    font: inherit;
+    color: inherit;
+  }
+}
+
+/* ---------- Materials ----------------------------------------------------- */
+/* Translucent layers are reserved for chrome that floats over scrolling
+   content: sidebar, topbar, detail sheet, popovers. Content surfaces stay
+   opaque so legibility never stacks translucency on translucency. */
+
+@layer components {
+  .material-chrome {
+    background: color-mix(in srgb, var(--card) 72%, transparent);
+    backdrop-filter: blur(20px) saturate(180%);
+    -webkit-backdrop-filter: blur(20px) saturate(180%);
+  }
+
+  .material-overlay {
+    background: color-mix(in srgb, var(--popover) 88%, transparent);
+    backdrop-filter: blur(14px) saturate(180%);
+    -webkit-backdrop-filter: blur(14px) saturate(180%);
+  }
+
+  .floating-chrome {
+    box-shadow: var(--chrome-shadow);
+  }
+
+  .layered-surface {
+    background: color-mix(in srgb, var(--card) 38%, transparent);
+    box-shadow: var(--surface-shadow);
+  }
+
+  /* Radix uses a table-sized wrapper inside ScrollArea. These panels only
+     scroll vertically, so keep that wrapper from adopting content width. */
+  [data-slot="scroll-area-viewport"] > div {
+    display: block !important;
+    width: 100% !important;
+    min-width: 0 !important;
+    max-width: 100% !important;
+  }
+
+  .material-scrim {
+    background: var(--scrim);
+  }
+
+  /* Zebra striping for data tables — alternation lives here so hover and
+     selected states (utilities layer) always win over it. */
+  /* Zebra striping for data tables — alternation lives here so hover and
+     selected states (utilities layer) always win over it. --muted is the
+     iOS systemGray fill (8% light / 16% dark): visible but calm. */
+  [data-slot="table-body"] > tr:nth-child(odd):not(:only-child) {
+    background-color: color-mix(in srgb, var(--muted) 48%, transparent);
+  }
+}
+
+/* ---------- Accessibility equivalents ------------------------------------- */
+
+@media (prefers-reduced-transparency: reduce) {
+  .material-chrome,
+  .material-overlay {
+    background: var(--card);
+    backdrop-filter: none;
+    -webkit-backdrop-filter: none;
+  }
+}
+
+@media (prefers-contrast: more) {
+  :root {
+    --border: rgba(60, 60, 67, 0.45);
+    --muted-foreground: rgba(60, 60, 67, 0.85);
+  }
+
+  [data-theme="dark"] {
+    --border: rgba(235, 235, 245, 0.45);
+    --muted-foreground: rgba(235, 235, 245, 0.8);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}
