@@ -29,6 +29,21 @@ pub struct Settings {
     pub resources: ResourceSettings,
     /// mihomo/Clash external-controller integration (fake-IP resolution).
     pub proxy: ProxySettings,
+    /// Master switch for Traffic Rule enforcement.
+    pub traffic_rules: TrafficRuleSettings,
+}
+
+/// Traffic Rule enforcement controls.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct TrafficRuleSettings {
+    pub enabled: bool,
+}
+
+impl Default for TrafficRuleSettings {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
 }
 
 /// Resolves fake-IP destinations through a local/remote proxy control API.
@@ -81,6 +96,7 @@ impl Default for Settings {
             history: HistorySettings::default(),
             resources: ResourceSettings::default(),
             proxy: ProxySettings::default(),
+            traffic_rules: TrafficRuleSettings::default(),
         }
     }
 }
@@ -198,6 +214,7 @@ pub struct SettingsPatch {
     pub history: Option<HistoryPatch>,
     pub resources: Option<ResourcePatch>,
     pub proxy: Option<ProxyPatch>,
+    pub traffic_rules: Option<TrafficRulePatch>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -235,6 +252,12 @@ pub struct ProxyPatch {
     pub enabled: Option<bool>,
     pub controller_url: Option<String>,
     pub secret: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct TrafficRulePatch {
+    pub enabled: Option<bool>,
 }
 
 impl SettingsPatch {
@@ -286,6 +309,11 @@ impl SettingsPatch {
             }
             if let Some(secret) = proxy.secret {
                 settings.proxy.secret = secret;
+            }
+        }
+        if let Some(traffic_rules) = self.traffic_rules {
+            if let Some(enabled) = traffic_rules.enabled {
+                settings.traffic_rules.enabled = enabled;
             }
         }
     }

@@ -40,6 +40,42 @@ impl RuleDirection {
             Self::Both => &[Direction::Inbound, Direction::Outbound],
         }
     }
+
+    /// Storage and wire name.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Inbound => "inbound",
+            Self::Outbound => "outbound",
+            Self::Both => "both",
+        }
+    }
+
+    /// Parses a storage or wire name.
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "inbound" => Some(Self::Inbound),
+            "outbound" => Some(Self::Outbound),
+            "both" => Some(Self::Both),
+            _ => None,
+        }
+    }
+}
+
+/// Storage and wire name for a rule action.
+pub const fn action_name(action: RuleAction) -> &'static str {
+    match action {
+        RuleAction::Limit => "limit",
+        RuleAction::Block => "block",
+    }
+}
+
+/// Parses a storage or wire action name.
+pub fn action_from_name(name: &str) -> Option<RuleAction> {
+    match name {
+        "limit" => Some(RuleAction::Limit),
+        "block" => Some(RuleAction::Block),
+        _ => None,
+    }
 }
 
 /// What a Traffic Rule matches.

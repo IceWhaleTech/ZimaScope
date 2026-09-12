@@ -7,7 +7,7 @@
 
 use std::{
     collections::VecDeque,
-    net::IpAddr,
+    net::{IpAddr, Ipv4Addr},
     num::NonZeroUsize,
     path::PathBuf,
     sync::{Arc, Mutex},
@@ -19,15 +19,19 @@ use rusqlite::{
     Connection, OptionalExtension, Row, functions::FunctionFlags, params, params_from_iter,
     types::Value,
 };
-use zimascope_common::model::{
-    AddressScope, AssociationConfidence, CollectionBatch, CollectorHealth, DomainEvidence,
-    DomainObservation, Endpoint, FlowDirection, FlowKey, FlowState, FlowUpdate, Protocol,
-    TrafficCounters,
+use zimascope_common::{
+    kernel_abi::RuleAction,
+    model::{
+        AddressScope, AssociationConfidence, CollectionBatch, CollectorHealth, DomainEvidence,
+        DomainObservation, Endpoint, FlowDirection, FlowKey, FlowState, FlowUpdate, Protocol,
+        TrafficCounters,
+    },
 };
 
 #[cfg(test)]
 use crate::enrichment::GeoIpDatabase;
 use crate::enrichment::{DEFAULT_CACHE_CAPACITY, Enricher, EnrichmentStats};
+use crate::policy::{RuleDirection, RuleMatch, TrafficRule, action_from_name, action_name};
 
 use crate::SharedFingerprints;
 use crate::proxy::{ProxyKey, ProxyResolver};
@@ -78,7 +82,7 @@ const MINUTE_BUCKET_RETENTION_MS: i64 = 2 * 60 * 60 * 1000;
 const HOUR_BUCKET_RETENTION_MS: i64 = 8 * 24 * 60 * 60 * 1000;
 const MS_PER_DAY: i64 = 24 * 60 * 60 * 1000;
 
-const SCHEMA_VERSION: i64 = 5;
+const SCHEMA_VERSION: i64 = 6;
 
 const SCHEMA_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS flows (
@@ -179,6 +183,22 @@ CREATE TABLE IF NOT EXISTS exports (
     truncated INTEGER NOT NULL,
     content_type TEXT NOT NULL,
     content BLOB NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS traffic_rules (
+    id INTEGER PRIMARY KEY,
+    action TEXT NOT NULL,
+    direction TEXT NOT NULL,
+    match_kind TEXT NOT NULL,
+    address TEXT,
+    prefix_len INTEGER,
+    port INTEGER,
+    application_id TEXT,
+    rate_bytes_per_s INTEGER,
+    burst_bytes INTEGER,
+    enabled INTEGER NOT NULL,
+    created_at_ms INTEGER NOT NULL,
+    updated_at_ms INTEGER NOT NULL
 );
 "#;
 
@@ -381,6 +401,25 @@ pub(crate) struct ExportContent {
     pub bytes: Vec<u8>,
 }
 
+/// One persisted Traffic Rule plus its storage timestamps.
+#[derive(Clone, Debug)]
+pub(crate) struct TrafficRuleRecord {
+    pub rule: TrafficRule,
+    pub created_at: SystemTime,
+    pub updated_at: SystemTime,
+}
+
+/// A rule about to be persisted; storage assigns the id.
+#[derive(Clone, Debug)]
+pub(crate) struct TrafficRuleDraft {
+    pub action: RuleAction,
+    pub direction: RuleDirection,
+    pub matcher: RuleMatch,
+    pub rate_bytes_per_s: u64,
+    pub burst_bytes: u64,
+    pub enabled: bool,
+}
+
 /// SQLite connection plus live state that does not belong in the database.
 pub(crate) struct Db {
     conn: Connection,
@@ -405,6 +444,8 @@ pub(crate) struct Db {
     /// `tick_overview` counters change slowly and scan the whole table; cache
     /// them for a few intervals.
     overview_cache: Option<(Instant, TickOverviewDto)>,
+    /// Monotonic token for Traffic Rule changes; applied programs carry it.
+    rules_revision: u64,
 }
 
 impl Db {
@@ -468,6 +509,7 @@ impl Db {
             flow_capacity: config.flow_capacity.max(1),
             last_policy_at: None,
             overview_cache: None,
+            rules_revision: 0,
         })
     }
 
@@ -2393,6 +2435,115 @@ impl Db {
         self.enforce_policy(settings, SystemTime::now())
     }
 
+    // ----------------------------------------------------------- traffic rules
+
+    /// Monotonic token that advances on every Traffic Rule mutation.
+    pub(crate) fn rules_revision(&self) -> u64 {
+        self.rules_revision
+    }
+
+    pub(crate) fn list_traffic_rules(&self) -> Result<Vec<TrafficRuleRecord>, ApiError> {
+        let mut statement = self.conn.prepare(
+            "SELECT id, action, direction, match_kind, address, prefix_len, port, \
+             application_id, rate_bytes_per_s, burst_bytes, enabled, created_at_ms, \
+             updated_at_ms FROM traffic_rules ORDER BY id",
+        )?;
+        let rows = statement
+            .query_map([], traffic_rule_row)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        rows.into_iter().map(RawTrafficRule::into_record).collect()
+    }
+
+    pub(crate) fn traffic_rule(&self, id: i64) -> Result<TrafficRuleRecord, ApiError> {
+        let row = self
+            .conn
+            .query_row(
+                "SELECT id, action, direction, match_kind, address, prefix_len, port, \
+                 application_id, rate_bytes_per_s, burst_bytes, enabled, created_at_ms, \
+                 updated_at_ms FROM traffic_rules WHERE id = ?1",
+                [id],
+                traffic_rule_row,
+            )
+            .optional()?;
+        match row {
+            Some(row) => row.into_record(),
+            None => Err(ApiError::not_found(format!("traffic rule {id}"))),
+        }
+    }
+
+    pub(crate) fn insert_traffic_rule(
+        &mut self,
+        draft: &TrafficRuleDraft,
+    ) -> Result<TrafficRuleRecord, ApiError> {
+        let matcher = MatcherColumns::from_matcher(&draft.matcher);
+        let now = unix_millis(SystemTime::now());
+        self.conn.execute(
+            "INSERT INTO traffic_rules (action, direction, match_kind, address, prefix_len, \
+             port, application_id, rate_bytes_per_s, burst_bytes, enabled, created_at_ms, \
+             updated_at_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?11)",
+            params![
+                action_name(draft.action),
+                draft.direction.as_str(),
+                matcher.kind,
+                matcher.address,
+                matcher.prefix_len,
+                matcher.port,
+                matcher.application_id,
+                draft.rate_bytes_per_s as i64,
+                draft.burst_bytes as i64,
+                i64::from(draft.enabled),
+                now,
+            ],
+        )?;
+        self.rules_revision += 1;
+        self.traffic_rule(self.conn.last_insert_rowid())
+    }
+
+    pub(crate) fn update_traffic_rule(
+        &mut self,
+        id: i64,
+        draft: &TrafficRuleDraft,
+    ) -> Result<TrafficRuleRecord, ApiError> {
+        let matcher = MatcherColumns::from_matcher(&draft.matcher);
+        let now = unix_millis(SystemTime::now());
+        let changed = self.conn.execute(
+            "UPDATE traffic_rules SET action = ?1, direction = ?2, match_kind = ?3, \
+             address = ?4, prefix_len = ?5, port = ?6, application_id = ?7, \
+             rate_bytes_per_s = ?8, burst_bytes = ?9, enabled = ?10, updated_at_ms = ?11 \
+             WHERE id = ?12",
+            params![
+                action_name(draft.action),
+                draft.direction.as_str(),
+                matcher.kind,
+                matcher.address,
+                matcher.prefix_len,
+                matcher.port,
+                matcher.application_id,
+                draft.rate_bytes_per_s as i64,
+                draft.burst_bytes as i64,
+                i64::from(draft.enabled),
+                now,
+                id,
+            ],
+        )?;
+        if changed == 0 {
+            return Err(ApiError::not_found(format!("traffic rule {id}")));
+        }
+        self.rules_revision += 1;
+        self.traffic_rule(id)
+    }
+
+    pub(crate) fn delete_traffic_rule(&mut self, id: i64) -> Result<(), ApiError> {
+        let changed = self
+            .conn
+            .execute("DELETE FROM traffic_rules WHERE id = ?1", [id])?;
+        if changed == 0 {
+            return Err(ApiError::not_found(format!("traffic rule {id}")));
+        }
+        self.rules_revision += 1;
+        Ok(())
+    }
+
     pub(crate) fn health(&self) -> Option<&CollectorHealth> {
         self.health.as_ref()
     }
@@ -3281,6 +3432,144 @@ fn domain_sort_key(domain: &str) -> String {
 }
 
 /// Adds a column to an existing table when the schema upgrade needs it.
+struct RawTrafficRule {
+    id: i64,
+    action: String,
+    direction: String,
+    match_kind: String,
+    address: Option<String>,
+    prefix_len: Option<i64>,
+    port: Option<i64>,
+    application_id: Option<String>,
+    rate_bytes_per_s: Option<i64>,
+    burst_bytes: Option<i64>,
+    enabled: i64,
+    created_at_ms: i64,
+    updated_at_ms: i64,
+}
+
+fn traffic_rule_row(row: &Row<'_>) -> rusqlite::Result<RawTrafficRule> {
+    Ok(RawTrafficRule {
+        id: row.get(0)?,
+        action: row.get(1)?,
+        direction: row.get(2)?,
+        match_kind: row.get(3)?,
+        address: row.get(4)?,
+        prefix_len: row.get(5)?,
+        port: row.get(6)?,
+        application_id: row.get(7)?,
+        rate_bytes_per_s: row.get(8)?,
+        burst_bytes: row.get(9)?,
+        enabled: row.get(10)?,
+        created_at_ms: row.get(11)?,
+        updated_at_ms: row.get(12)?,
+    })
+}
+
+impl RawTrafficRule {
+    fn into_record(self) -> Result<TrafficRuleRecord, ApiError> {
+        let action = action_from_name(&self.action).ok_or_else(|| {
+            ApiError::internal(format!(
+                "traffic rule {} has unknown action {:?}",
+                self.id, self.action
+            ))
+        })?;
+        let direction = RuleDirection::from_name(&self.direction).ok_or_else(|| {
+            ApiError::internal(format!(
+                "traffic rule {} has unknown direction {:?}",
+                self.id, self.direction
+            ))
+        })?;
+        let matcher = match self.match_kind.as_str() {
+            "endpoint" => RuleMatch::Endpoint {
+                address: parse_rule_address(self.id, self.address.as_deref())?,
+                port: self.port.map(|port| port as u16),
+            },
+            "cidr" => RuleMatch::Cidr {
+                address: parse_rule_address(self.id, self.address.as_deref())?,
+                prefix_len: self.prefix_len.unwrap_or(0).clamp(0, 32) as u8,
+            },
+            "application" => RuleMatch::Application {
+                identity: self.application_id.clone().ok_or_else(|| {
+                    ApiError::internal(format!(
+                        "traffic rule {} has no application identity",
+                        self.id
+                    ))
+                })?,
+            },
+            other => {
+                return Err(ApiError::internal(format!(
+                    "traffic rule {} has unknown match kind {other:?}",
+                    self.id
+                )));
+            }
+        };
+
+        Ok(TrafficRuleRecord {
+            rule: TrafficRule {
+                id: self.id as u32,
+                action,
+                direction,
+                matcher,
+                rate_bytes_per_s: self.rate_bytes_per_s.unwrap_or(0).max(0) as u64,
+                burst_bytes: self.burst_bytes.unwrap_or(0).max(0) as u64,
+                enabled: self.enabled != 0,
+            },
+            created_at: unix_millis_time(self.created_at_ms),
+            updated_at: unix_millis_time(self.updated_at_ms),
+        })
+    }
+}
+
+fn parse_rule_address(id: i64, address: Option<&str>) -> Result<Ipv4Addr, ApiError> {
+    address
+        .and_then(|address| address.parse::<Ipv4Addr>().ok())
+        .ok_or_else(|| ApiError::internal(format!("traffic rule {id} has an invalid address")))
+}
+
+fn unix_millis_time(millis: i64) -> SystemTime {
+    SystemTime::UNIX_EPOCH + Duration::from_millis(millis.max(0) as u64)
+}
+
+struct MatcherColumns {
+    kind: &'static str,
+    address: Option<String>,
+    prefix_len: Option<i64>,
+    port: Option<i64>,
+    application_id: Option<String>,
+}
+
+impl MatcherColumns {
+    fn from_matcher(matcher: &RuleMatch) -> Self {
+        match matcher {
+            RuleMatch::Endpoint { address, port } => Self {
+                kind: "endpoint",
+                address: Some(address.to_string()),
+                prefix_len: None,
+                port: port.map(i64::from),
+                application_id: None,
+            },
+            RuleMatch::Cidr {
+                address,
+                prefix_len,
+            } => Self {
+                kind: "cidr",
+                address: Some(address.to_string()),
+                prefix_len: Some(i64::from(*prefix_len)),
+                port: None,
+                application_id: None,
+            },
+            RuleMatch::Application { identity } => Self {
+                kind: "application",
+                address: None,
+                prefix_len: None,
+                port: None,
+                application_id: Some(identity.clone()),
+            },
+        }
+    }
+}
+
 fn add_column_if_missing(
     conn: &rusqlite::Connection,
     table: &str,
@@ -3485,4 +3774,144 @@ fn encode_uri_component(value: &str) -> String {
         }
     }
     output
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn db() -> Db {
+        Db::open(&ApiConfig {
+            database: None,
+            ..ApiConfig::default()
+        })
+        .expect("open in-memory database")
+    }
+
+    fn endpoint_draft() -> TrafficRuleDraft {
+        TrafficRuleDraft {
+            action: RuleAction::Limit,
+            direction: RuleDirection::Outbound,
+            matcher: RuleMatch::Endpoint {
+                address: "203.0.113.9".parse().expect("address"),
+                port: Some(443),
+            },
+            rate_bytes_per_s: 1_000_000,
+            burst_bytes: 1_000_000,
+            enabled: true,
+        }
+    }
+
+    #[test]
+    fn traffic_rules_crud_round_trip() {
+        let mut db = db();
+        assert_eq!(db.rules_revision(), 0);
+
+        let record = db.insert_traffic_rule(&endpoint_draft()).expect("insert");
+        assert_eq!(record.rule.id, 1);
+        assert_eq!(db.rules_revision(), 1);
+        assert_eq!(
+            record.rule.matcher,
+            RuleMatch::Endpoint {
+                address: "203.0.113.9".parse().expect("address"),
+                port: Some(443),
+            }
+        );
+
+        assert_eq!(db.list_traffic_rules().expect("list").len(), 1);
+
+        let mut updated = endpoint_draft();
+        updated.enabled = false;
+        updated.rate_bytes_per_s = 5_000;
+        updated.burst_bytes = 5_000;
+        let record = db.update_traffic_rule(1, &updated).expect("update");
+        assert!(!record.rule.enabled);
+        assert_eq!(record.rule.rate_bytes_per_s, 5_000);
+        assert_eq!(db.rules_revision(), 2);
+
+        db.delete_traffic_rule(1).expect("delete");
+        assert!(db.list_traffic_rules().expect("list").is_empty());
+        assert_eq!(db.rules_revision(), 3);
+        assert!(db.traffic_rule(1).is_err());
+        assert!(db.delete_traffic_rule(1).is_err());
+    }
+
+    #[test]
+    fn traffic_rules_cover_every_match_kind() {
+        let mut db = db();
+
+        let cidr = db
+            .insert_traffic_rule(&TrafficRuleDraft {
+                matcher: RuleMatch::Cidr {
+                    address: "192.0.2.0".parse().expect("address"),
+                    prefix_len: 24,
+                },
+                ..endpoint_draft()
+            })
+            .expect("insert cidr");
+        let application = db
+            .insert_traffic_rule(&TrafficRuleDraft {
+                matcher: RuleMatch::Application {
+                    identity: "cont:abc".to_owned(),
+                },
+                action: RuleAction::Block,
+                rate_bytes_per_s: 0,
+                burst_bytes: 0,
+                ..endpoint_draft()
+            })
+            .expect("insert application");
+
+        assert_eq!(
+            cidr.rule.matcher,
+            RuleMatch::Cidr {
+                address: "192.0.2.0".parse().expect("address"),
+                prefix_len: 24,
+            }
+        );
+        assert_eq!(
+            application.rule.matcher,
+            RuleMatch::Application {
+                identity: "cont:abc".to_owned(),
+            }
+        );
+        assert_eq!(application.rule.action, RuleAction::Block);
+    }
+
+    #[test]
+    fn migrates_a_v5_database_and_keeps_settings() {
+        let unique = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_nanos();
+        let path =
+            std::env::temp_dir().join(format!("zs-rules-{}-{unique}.db", std::process::id()));
+        {
+            let conn = Connection::open(&path).expect("open old database");
+            conn.execute_batch(
+                "CREATE TABLE settings (id INTEGER PRIMARY KEY CHECK (id = 1), \
+                 json TEXT NOT NULL, version INTEGER NOT NULL); \
+                 INSERT INTO settings VALUES (1, '{\"enabled\":false}', 4); \
+                 PRAGMA user_version = 5;",
+            )
+            .expect("seed old schema");
+        }
+
+        let mut db = Db::open(&ApiConfig {
+            database: Some(path.clone()),
+            ..ApiConfig::default()
+        })
+        .expect("open upgraded database");
+        let (settings, version) = db.load_settings().expect("settings").expect("row");
+        assert_eq!(version, 4);
+        assert!(!settings.enabled);
+        assert!(settings.traffic_rules.enabled);
+
+        let record = db.insert_traffic_rule(&endpoint_draft()).expect("insert");
+        assert_eq!(record.rule.id, 1);
+
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("db-wal"));
+        let _ = std::fs::remove_file(path.with_extension("db-shm"));
+    }
 }
