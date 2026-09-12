@@ -10,6 +10,7 @@ use std::{
     net::IpAddr,
     num::NonZeroUsize,
     path::PathBuf,
+    sync::{Arc, Mutex},
     time::{Duration, Instant, SystemTime},
 };
 
@@ -64,7 +65,7 @@ const MINUTE_BUCKET_RETENTION_MS: i64 = 2 * 60 * 60 * 1000;
 const HOUR_BUCKET_RETENTION_MS: i64 = 8 * 24 * 60 * 60 * 1000;
 const MS_PER_DAY: i64 = 24 * 60 * 60 * 1000;
 
-const SCHEMA_VERSION: i64 = 4;
+const SCHEMA_VERSION: i64 = 5;
 
 const SCHEMA_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS flows (
@@ -94,11 +95,13 @@ CREATE TABLE IF NOT EXISTS flows (
     remote_db_version TEXT,
     remote_enriched_at_ms INTEGER NOT NULL,
     domains_json TEXT NOT NULL DEFAULT '[]',
-    service TEXT
+    service TEXT,
+    app_id TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_flows_last_seen ON flows(last_seen_ms);
 CREATE INDEX IF NOT EXISTS idx_flows_remote ON flows(remote_addr);
 CREATE INDEX IF NOT EXISTS idx_flows_state ON flows(state);
+CREATE INDEX IF NOT EXISTS idx_flows_app_id ON flows(app_id);
 
 CREATE TABLE IF NOT EXISTS applications (
     id TEXT PRIMARY KEY,
@@ -260,9 +263,28 @@ pub(crate) struct StreamEvent {
     pub observations: Vec<DomainObservationDto>,
     pub overview: TickOverviewDto,
     pub health: CollectorHealthDto,
+    /// Serialized tick payloads keyed by subscriber filter, so several idle
+    /// subscribers share one JSON encoding per interval.
+    tick_cache: Mutex<HashMap<String, Arc<str>>>,
 }
 
 impl StreamEvent {
+    /// Serializes this interval for one subscriber filter, computing the JSON
+    /// at most once per distinct filter set.
+    pub(crate) fn tick_json(&self, filter: &super::dto::StreamFilter) -> Option<Arc<str>> {
+        let key = filter.cache_key();
+        if let Ok(cache) = self.tick_cache.lock() {
+            if let Some(data) = cache.get(&key) {
+                return Some(Arc::clone(data));
+            }
+        }
+        let data: Arc<str> = serde_json::to_string(&self.tick(filter)).ok()?.into();
+        if let Ok(mut cache) = self.tick_cache.lock() {
+            cache.insert(key, Arc::clone(&data));
+        }
+        Some(data)
+    }
+
     /// Projects the interval into a filtered `tick` payload.
     ///
     /// Aggregate lists are keyed by the filtered Flows: a subscriber only
@@ -434,12 +456,13 @@ impl Db {
         batch: CollectionBatch,
         settings: &Settings,
         proxy: &ProxyResolver,
+        publish: bool,
     ) -> StreamEvent {
         let sequence = batch.sequence;
         let collected_at = batch.collected_at;
         let interval = batch.interval;
         let health = CollectorHealthDto::from_health(&batch.health);
-        match self.try_ingest(batch, settings, proxy) {
+        match self.try_ingest(batch, settings, proxy, publish) {
             Ok(event) => event,
             Err(error) => {
                 eprintln!("zimascoped: storage ingest failed: {error}");
@@ -459,6 +482,7 @@ impl Db {
                     observations: Vec::new(),
                     overview: TickOverviewDto::default(),
                     health,
+                    tick_cache: Mutex::new(HashMap::new()),
                 }
             }
         }
@@ -469,6 +493,7 @@ impl Db {
         batch: CollectionBatch,
         settings: &Settings,
         proxy: &ProxyResolver,
+        publish: bool,
     ) -> Result<StreamEvent, ApiError> {
         let now_instant = Instant::now();
         let now_system = SystemTime::now();
@@ -649,10 +674,23 @@ impl Db {
             }
         }
 
-        let endpoints = self.endpoint_summaries_for(&touched_addresses)?;
-        let domain_summaries = self.domain_summaries_for(&touched_domains)?;
-        let applications = self.application_summaries_for(&touched_applications)?;
-        let overview = self.tick_overview()?;
+        // Aggregates only matter to live subscribers; skip the whole-history
+        // scans when nobody is watching.
+        let (endpoints, domain_summaries, applications, overview) = if publish {
+            (
+                self.endpoint_summaries_for(&touched_addresses)?,
+                self.domain_summaries_for(&touched_domains)?,
+                self.application_summaries_for(&touched_applications)?,
+                self.tick_overview()?,
+            )
+        } else {
+            (
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                TickOverviewDto::default(),
+            )
+        };
 
         Ok(StreamEvent {
             sequence,
@@ -669,6 +707,7 @@ impl Db {
             observations: domain_events,
             overview,
             health: health_dto,
+            tick_cache: Mutex::new(HashMap::new()),
         })
     }
 

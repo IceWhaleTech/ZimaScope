@@ -186,13 +186,21 @@ impl FlowTracker {
         self.merged = merged_buffer;
 
         let idle_timeout = self.idle_timeout;
+        // Ended Flows are kept only long enough to keep delta accounting
+        // stable if a stale kernel entry reappears; without this bound every
+        // Flow ever seen would stay in memory and be walked every poll.
+        let ended_retention = idle_timeout.saturating_mul(4).max(Duration::from_secs(120));
         self.previous.retain(|key, previous| {
             if previous.generation == generation {
                 return true;
             }
 
+            if previous.state != FlowState::Active {
+                return now.saturating_duration_since(previous.last_seen) < ended_retention;
+            }
+
             let age = now.saturating_duration_since(previous.last_seen);
-            if previous.state != FlowState::Active || age < idle_timeout {
+            if age < idle_timeout {
                 return true;
             }
 

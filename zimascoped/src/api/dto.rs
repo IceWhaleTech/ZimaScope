@@ -873,6 +873,26 @@ pub struct StreamFilter {
 }
 
 impl StreamFilter {
+    /// Stable signature of this filter set; subscribers with the same
+    /// signature share one serialized tick payload.
+    pub fn cache_key(&self) -> String {
+        format!(
+            "{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}",
+            self.q,
+            self.direction,
+            self.protocol,
+            self.ip,
+            self.src_ip,
+            self.dst_ip,
+            self.port,
+            self.domain,
+            self.application_id,
+            self.exclude_scope,
+            self.state,
+            self.has_domain,
+        )
+    }
+
     pub fn matches(&self, flow: &FlowDto) -> bool {
         if !self.exclude_scope.is_empty() && self.exclude_scope.contains(&flow.remote_profile.scope)
         {

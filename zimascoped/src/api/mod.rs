@@ -130,10 +130,13 @@ impl ApiState {
     /// Feeds one collection interval into storage and notifies SSE
     /// subscribers.
     pub fn ingest_batch(&self, batch: CollectionBatch) {
+        let publish = self.events.receiver_count() > 0;
         let event = {
             let mut guard = self.lock();
             let inner = &mut *guard;
-            inner.db.ingest(batch, &inner.settings, &inner.proxy)
+            inner
+                .db
+                .ingest(batch, &inner.settings, &inner.proxy, publish)
         };
         let _ = self.events.send(Arc::new(event));
     }
@@ -384,13 +387,12 @@ async fn stream(
 }
 
 fn tick_event(event: &StreamEvent, filter: &dto::StreamFilter) -> Event {
-    let tick = event.tick(filter);
-    match serde_json::to_string(&tick) {
-        Ok(data) => Event::default()
+    match event.tick_json(filter) {
+        Some(data) => Event::default()
             .id(event.sequence.to_string())
             .event("tick")
-            .data(data),
-        Err(_) => resync_event("event serialization failed"),
+            .data(data.as_ref()),
+        None => resync_event("event serialization failed"),
     }
 }
 
