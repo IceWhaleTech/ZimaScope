@@ -9,6 +9,7 @@ import { motion } from "motion/react";
 import { AppSidebar } from "@/components/app-sidebar";
 import { Topbar } from "@/components/topbar";
 import { DetailSheet } from "@/components/detail-sheet";
+import { consumeSurfaceMorph } from "@/lib/view-morph";
 
 export const FOCUS_SEARCH_EVENT = "zimascope:focus-search";
 
@@ -17,6 +18,15 @@ export function AppLayout() {
   const location = useLocation();
   const navigate = useNavigate();
   const mainRef = useRef<HTMLElement>(null);
+
+  // The Overview → Explorer morph animates the table surface itself, so the
+  // route enter animation is skipped for that one navigation.
+  const surfaceMorph = useRef(false);
+  const lastPath = useRef(location.pathname);
+  if (lastPath.current !== location.pathname) {
+    lastPath.current = location.pathname;
+    surfaceMorph.current = consumeSurfaceMorph();
+  }
 
   useEffect(() => {
     setNavOpen(false);
@@ -45,7 +55,7 @@ export function AppLayout() {
         <motion.main
           ref={mainRef}
           key={location.pathname}
-          initial={{ opacity: 0, y: 8 }}
+          initial={surfaceMorph.current ? false : { opacity: 0, y: 8 }}
           animate={{ opacity: 1, y: 0 }}
           transition={{ duration: 0.34, ease: [0.32, 0.72, 0, 1] }}
           className="w-full flex-1 px-5 py-5 sm:px-7 sm:py-6 lg:px-9"

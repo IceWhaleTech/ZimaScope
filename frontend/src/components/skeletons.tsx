@@ -1,7 +1,7 @@
 /** Quiet placeholder blocks — static, no shimmer sweep. */
 
 import { Skeleton as UiSkeleton } from "@/components/ui/skeleton";
-import { TableBody, TableCell, TableRow } from "@/components/ui/table";
+import { TableCell, TableRow } from "@/components/ui/table";
 
 export function Skeleton({ className }: { className?: string }) {
   return <UiSkeleton className={className} />;
@@ -17,10 +17,12 @@ export function SkeletonRows({ rows = 3, className }: { rows?: number; className
   );
 }
 
-/** Table-shaped skeleton; rows must be real `<tr>`s to stay inside `<tbody>`. */
+/** Table-shaped skeleton. Renders bare `<tr>`s so callers place it inside an
+    existing `<tbody>`; nesting a second tbody is invalid DOM and React 19
+    treats it as an error. */
 export function TableSkeleton({ rows = 6, columns = 6 }: { rows?: number; columns?: number }) {
   return (
-    <TableBody>
+    <>
       {Array.from({ length: rows }, (_, row) => (
         <TableRow key={row} className="hover:bg-transparent">
           {Array.from({ length: columns }, (_, column) => (
@@ -30,6 +32,6 @@ export function TableSkeleton({ rows = 6, columns = 6 }: { rows?: number; column
           ))}
         </TableRow>
       ))}
-    </TableBody>
+    </>
   );
 }

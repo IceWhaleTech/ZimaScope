@@ -7,10 +7,11 @@
  * recent-flows rows in place.
  */
 
-import { useEffect, useMemo, useRef, useState } from "react";
-import { Link } from "react-router";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Link, useNavigate } from "react-router";
 import { useQueryClient } from "@tanstack/react-query";
-import { ArrowLeftRight, ChevronRight, Info, TriangleAlert } from "lucide-react";
+import { motion, useReducedMotion } from "motion/react";
+import { ArrowLeftRight, ChevronDown, ChevronRight, Info, TriangleAlert } from "lucide-react";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { TimelineChart, rateSeries, Sparkline } from "@/components/charts";
@@ -23,9 +24,12 @@ import { queryKeys, useFlows, useOverview, useStatus } from "@/hooks/use-data";
 import { useHideLan } from "@/hooks/use-hide-lan";
 import { useSetTopbar } from "@/hooks/use-topbar";
 import { useTick } from "@/hooks/use-tick";
+import { data } from "@/store";
 import { excludeScopeParam } from "@/lib/filters";
+import { markSurfaceMorph, runViewTransition } from "@/lib/view-morph";
 import { evidenceLabel, flagEmoji, formatBytes, formatNumber, formatPercent, formatRate, networkLabel, rangeLabel, relativeTime } from "@/lib/format";
 import { cn } from "@/lib/utils";
+import type { FlowQuery } from "@/api";
 import type {
   CollectorHealth,
   Flow,
@@ -55,8 +59,99 @@ export function OverviewView() {
   const statusQuery = useStatus();
   const tick = useTick();
   const queryClient = useQueryClient();
-  const { open } = useDetails();
+  const { open, target } = useDetails();
+  const navigate = useNavigate();
+  const reduceMotion = useReducedMotion();
   useSetTopbar("Overview", `Last ${rangeLabel(range)}`);
+
+  // One scroll past the Recent flows ledger hands the same table over to the
+  // Explorer: the payload is prefetched first so the morph lands on real rows,
+  // and the surface is morphed by the View Transitions API.
+  const scrollTriggerRef = useRef<HTMLDivElement>(null);
+  const morphStarted = useRef(false);
+  const hoveringRows = useRef(false);
+  const detailsOpen = useRef(false);
+  detailsOpen.current = target !== null;
+
+  const explorerDefaults = useMemo<FlowQuery>(
+    () => ({
+      range: "15m",
+      exclude_scope: excludeScopeParam(hideLan),
+      sort: "-last_seen",
+      limit: 50,
+      hide_noise: true,
+    }),
+    [hideLan],
+  );
+
+  const openFlows = useCallback(async () => {
+    try {
+      // The Explorer consumes this key as an infinite query; prefetch it with
+      // the same shape and pagination contract so the morph lands on rows.
+      await queryClient.ensureInfiniteQueryData({
+        queryKey: queryKeys.connectionsPage(explorerDefaults),
+        queryFn: ({ pageParam }) => data.connections({ ...explorerDefaults, offset: pageParam }),
+        initialPageParam: 0,
+        getNextPageParam: (last: { items: unknown[]; total: number; offset: number }) => {
+          const next = last.offset + last.items.length;
+          return last.items.length > 0 && next < last.total ? next : undefined;
+        },
+      });
+    } catch {
+      // Fall through: the Explorer shows its own unavailable state.
+    }
+    runViewTransition(() => {
+      markSurfaceMorph();
+      // The Explorer's Flows lens shows merged Connections, the same traffic
+      // grouped into the endpoint pairs the Recent flows rows belong to.
+      navigate("/explore?scope=flows");
+    });
+  }, [queryClient, explorerDefaults, navigate]);
+
+  useEffect(() => {
+    const trigger = scrollTriggerRef.current;
+    if (!trigger) return;
+    let timer: number | undefined;
+    const cancel = () => {
+      if (timer !== undefined) {
+        window.clearTimeout(timer);
+        timer = undefined;
+      }
+    };
+    // Arm only when the ledger is visible and the page is at its end; the
+    // brief dwell keeps a quick flick from stealing a click on a row.
+    const arm = () => {
+      if (morphStarted.current || detailsOpen.current || hoveringRows.current) {
+        cancel();
+        return;
+      }
+      const atEnd =
+        window.innerHeight + window.scrollY >=
+        document.documentElement.scrollHeight - 24;
+      const visible = trigger.getBoundingClientRect().top < window.innerHeight;
+      if (!atEnd || !visible) {
+        cancel();
+        return;
+      }
+      if (timer !== undefined) return;
+      timer = window.setTimeout(() => {
+        timer = undefined;
+        if (morphStarted.current || detailsOpen.current || hoveringRows.current) {
+          return;
+        }
+        morphStarted.current = true;
+        void openFlows();
+      }, 320);
+    };
+    window.addEventListener("scroll", arm, { passive: true });
+    window.addEventListener("resize", arm);
+    arm();
+    return () => {
+      cancel();
+      window.removeEventListener("scroll", arm);
+      window.removeEventListener("resize", arm);
+    };
+  }, [openFlows]);
 
   const [recent, setRecent] = useState<Flow[]>([]);
   useEffect(() => {
@@ -285,26 +380,51 @@ export function OverviewView() {
             </Link>
           }
         />
-        <Table>
-          <TableHeader>
-            <TableRow>
-              {FLOW_COLUMNS.map((column) => (
-                <TableHead key={column.label}>{column.label}</TableHead>
-              ))}
-            </TableRow>
-          </TableHeader>
-          <TableBody>
-            {recent.length ? (
-              recent.map((flow) => <FlowRow key={flow.id} flow={flow} onOpen={(id) => open({ kind: "flow", id })} />)
-            ) : (
-              <TableRow className="hover:bg-transparent">
-                <TableCell colSpan={FLOW_COLUMNS.length} className="h-24 text-center text-muted-foreground">
-                  No flows observed yet
-                </TableCell>
+        <div
+          style={{ viewTransitionName: "flows-surface" }}
+          onMouseEnter={() => {
+            hoveringRows.current = true;
+          }}
+          onMouseLeave={() => {
+            hoveringRows.current = false;
+          }}
+        >
+          <Table>
+            <TableHeader>
+              <TableRow>
+                {FLOW_COLUMNS.map((column) => (
+                  <TableHead key={column.label}>{column.label}</TableHead>
+                ))}
               </TableRow>
-            )}
-          </TableBody>
-        </Table>
+            </TableHeader>
+            <TableBody>
+              {recent.length ? (
+                recent.map((flow) => <FlowRow key={flow.id} flow={flow} onOpen={(id) => open({ kind: "flow", id })} />)
+              ) : (
+                <TableRow className="hover:bg-transparent">
+                  <TableCell colSpan={FLOW_COLUMNS.length} className="h-24 text-center text-muted-foreground">
+                    No flows observed yet
+                  </TableCell>
+                </TableRow>
+              )}
+            </TableBody>
+          </Table>
+        </div>
+
+        <motion.div
+          ref={scrollTriggerRef}
+          className="flex items-center justify-center gap-1.5 pt-0.5 text-2xs text-muted-foreground"
+          initial={false}
+        >
+          <motion.span
+            aria-hidden
+            animate={reduceMotion ? undefined : { y: [0, 3, 0] }}
+            transition={{ duration: 1.8, repeat: Infinity, ease: "easeInOut" }}
+          >
+            <ChevronDown className="size-3.5" />
+          </motion.span>
+          Keep scrolling to open the full flows ledger
+        </motion.div>
       </section>
     </div>
   );

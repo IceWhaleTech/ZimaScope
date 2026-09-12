@@ -236,6 +236,37 @@
   }
 }
 
+/* ---------- Overview → Explorer surface morph ----------------------------- */
+
+/* Both the Recent flows table and the Explorer table carry this
+   view-transition-name; the browser morphs one surface into the other while
+   the rest of the page cross-fades quickly. */
+::view-transition-group(flows-surface) {
+  animation-duration: 340ms;
+  animation-timing-function: cubic-bezier(0.32, 0.72, 0, 1);
+}
+
+::view-transition-old(flows-surface) {
+  animation-duration: 180ms;
+}
+
+::view-transition-new(flows-surface) {
+  animation-duration: 240ms;
+}
+
+::view-transition-old(root),
+::view-transition-new(root) {
+  animation-duration: 220ms;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  ::view-transition-group(flows-surface),
+  ::view-transition-old(flows-surface),
+  ::view-transition-new(flows-surface) {
+    animation: none;
+  }
+}
+
 /* ---------- Accessibility equivalents ------------------------------------- */
 
 @media (prefers-reduced-transparency: reduce) {

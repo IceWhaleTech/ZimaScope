@@ -1,11 +1,11 @@
 /**
- * Explorer — one table, three lenses. Flows, Endpoints and Domains are the
- * same observed traffic grouped differently, so a single persistent table
- * serves all three: the scope control re-targets the same table and the
- * header labels and body morph across with a short crossfade — the frame
- * never remounts. Scope lives in the URL (`?scope=`) so deep links keep
- * working. Live ticks patch flow rows in place; interacting with a row or
- * the search pauses live re-sorting (PRD 9.2).
+ * Explorer — one table, four lenses. Connections, Endpoints, Domains and
+ * Applications are the same observed traffic grouped differently, so a single
+ * persistent table serves all four: the scope control re-targets the same
+ * table and the header labels and body morph across with a short crossfade —
+ * the frame never remounts. Scope lives in the URL (`?scope=`) so deep links
+ * keep working. Connection rows fold into groups and are refreshed live;
+ * interacting with a row or the search pauses live re-sorting (PRD 9.2).
  */
 
 import { startTransition, useEffect, useMemo, useRef, useState } from "react";
@@ -39,19 +39,16 @@ import {
 import { DomainRow, DOMAIN_COLUMNS } from "@/components/domain-table";
 import { EmptyState } from "@/components/empty-state";
 import { EndpointRow, ENDPOINT_COLUMNS } from "@/components/endpoint-table";
-import { FlowRow, FLOW_COLUMNS } from "@/components/flow-table";
 import { ApplicationRow, APPLICATION_COLUMNS } from "@/components/application-table";
 import { Segmented } from "@/components/segmented";
 import { TableSkeleton } from "@/components/skeletons";
 import { FOCUS_SEARCH_EVENT } from "@/components/app-layout";
 import {
-  queryKeys,
   useApplicationsInfinite,
   useConnectionsInfinite,
   useCreateExport,
   useDomainsInfinite,
   useEndpointsInfinite,
-  useFlowsInfinite,
 } from "@/hooks/use-data";
 import { useDetails } from "@/hooks/use-details";
 import { useHideLan } from "@/hooks/use-hide-lan";
@@ -67,7 +64,6 @@ import type {
   DomainSummary,
   EndpointSummary,
   Evidence,
-  Flow,
   TimeRange,
 } from "@/types";
 import type { FlowQuery } from "@/api";
@@ -83,13 +79,6 @@ const SCOPES = [
 ] as const;
 
 type Scope = (typeof SCOPES)[number]["value"];
-
-const VIEWS = [
-  { value: "connections", label: "Connections" },
-  { value: "raw", label: "Raw flows" },
-] as const;
-
-type View = (typeof VIEWS)[number]["value"];
 
 const NOISE_OPTIONS = [
   { value: "hide", label: "Hide noise" },
@@ -150,11 +139,6 @@ const RANGE_OPTIONS = [
   { value: "1h", label: "1h" },
   { value: "24h", label: "24h" },
   { value: "7d", label: "7d" },
-];
-const DIRECTION_OPTIONS = [
-  { value: "", label: "Both" },
-  { value: "inbound", label: "Inbound" },
-  { value: "outbound", label: "Outbound" },
 ];
 const STATE_OPTIONS = [
   { value: "", label: "All" },
@@ -262,8 +246,6 @@ export function ExplorerView() {
     scopeParam === "endpoints" || scopeParam === "domains" || scopeParam === "applications"
       ? scopeParam
       : "flows";
-  const viewParam = searchParams.get("view");
-  const view: View = viewParam === "raw" ? "raw" : "connections";
   const meta = SCOPE_META[scope];
   const pinned = {
     ip: searchParams.get("ip") ?? "",
@@ -276,7 +258,6 @@ export function ExplorerView() {
   const [search, setSearch] = useState(searchParams.get("q") ?? "");
   const [appliedQ, setAppliedQ] = useState(searchParams.get("q") ?? "");
   const [range, setRange] = useState<TimeRange>("15m");
-  const [direction, setDirection] = useState("");
   const [state, setState] = useState("");
   const [visibility, setVisibility] = useState("");
   const [protocol, setProtocol] = useState("");
@@ -288,7 +269,6 @@ export function ExplorerView() {
   const [sort, setSort] = useState("-last_seen");
   const [live, setLive] = useState(true);
   const [pendingCount, setPendingCount] = useState(0);
-  const [selectedId, setSelectedId] = useState<string | null>(null);
   const [expandedGroups, setExpandedGroups] = useState<Set<string>>(new Set());
   const { open } = useDetails();
   const queryClient = useQueryClient();
@@ -329,15 +309,16 @@ export function ExplorerView() {
     prevScope.current = scope;
     setSearch("");
     setAppliedQ("");
-    setSelectedId(null);
+    setExpandedGroups(new Set());
     setSort(defaultSort(scope));
   }, [scope]);
 
+  // Shared base filters for the Flows lens: connections use them for the
+  // merged view and exports reuse them unchanged.
   const flowsFilter = useMemo<FlowQuery>(
     () => ({
       q: appliedQ || undefined,
       range,
-      direction: direction || undefined,
       state: state || undefined,
       protocol: protocol || undefined,
       port: port ? Number(port) : undefined,
@@ -354,11 +335,10 @@ export function ExplorerView() {
       sort: scope === "flows" ? sort : "-last_seen",
       limit: LIMIT,
     }),
-    [appliedQ, range, direction, state, visibility, protocol, port, evidence, confidence, scopeFilter, hideLan, sort, scope, pinned.ip, pinned.domain, pinned.application, pinned.country, pinned.asn],
+    [appliedQ, range, state, visibility, protocol, port, evidence, confidence, scopeFilter, hideLan, sort, scope, pinned.ip, pinned.domain, pinned.application, pinned.country, pinned.asn],
   );
-  const flowsQuery = useFlowsInfinite(flowsFilter);
   const connectionsFilter = useMemo<FlowQuery>(
-    () => ({ ...flowsFilter, direction: undefined, hide_noise: hideNoise }),
+    () => ({ ...flowsFilter, hide_noise: hideNoise }),
     [flowsFilter, hideNoise],
   );
   const connectionsQuery = useConnectionsInfinite(connectionsFilter);
@@ -386,9 +366,7 @@ export function ExplorerView() {
         ? domainsQuery
         : scope === "applications"
           ? applicationsQuery
-          : view === "connections"
-            ? connectionsQuery
-            : flowsQuery;
+          : connectionsQuery;
   const total = activeQuery.data?.pages[0]?.total ?? 0;
   const searchRef = useRef<HTMLInputElement>(null);
   useEffect(() => {
@@ -426,10 +404,10 @@ export function ExplorerView() {
     meta.title,
     scope === "flows"
       ? pinned.ip && total
-        ? `${formatNumber(total)} ${view === "connections" ? "connections" : "flows"} · endpoint ${pinned.ip}`
+        ? `${formatNumber(total)} connections · endpoint ${pinned.ip}`
         : pinned.domain && total
-          ? `${formatNumber(total)} ${view === "connections" ? "connections" : "flows"} · ${pinned.domain}`
-          : `${formatNumber(total)} ${view === "connections" ? "connections" : "flows"} in last ${rangeLabel(range)}`
+          ? `${formatNumber(total)} connections · ${pinned.domain}`
+          : `${formatNumber(total)} connections in last ${rangeLabel(range)}`
       : scope === "endpoints"
         ? `${formatNumber(total)} remote peers`
         : scope === "domains"
@@ -437,11 +415,6 @@ export function ExplorerView() {
           : `${formatNumber(total)} applications`,
     searchField,
   );
-
-  const [items, setItems] = useState<Flow[]>([]);
-  useEffect(() => {
-    if (flowsQuery.data) setItems(flowsQuery.data.pages.flatMap((page) => page.items));
-  }, [flowsQuery.data]);
 
   const [endpointItems, setEndpointItems] = useState<EndpointSummary[]>([]);
   useEffect(() => {
@@ -474,28 +447,22 @@ export function ExplorerView() {
         ? domainItems.length
         : scope === "applications"
           ? applicationItems.length
-          : view === "connections"
-            ? connectionItems.length
-            : items.length;
+          : connectionItems.length;
 
   // Connections fold into group headers; expanding a group adds child rows.
   const connectionGroups = useMemo(
-    () =>
-      displayedScope === "flows" && view === "connections"
-        ? groupConnections(connectionItems, sort)
-        : [],
-    [displayedScope, view, connectionItems, sort],
+    () => (displayedScope === "flows" ? groupConnections(connectionItems, sort) : []),
+    [displayedScope, connectionItems, sort],
   );
   const flatConnections = useMemo(
     () => flattenConnectionGroups(connectionGroups, expandedGroups),
     [connectionGroups, expandedGroups],
   );
-  // The live stream is retargeted to the same filters the Flow list uses, so
-  // ticks only carry rows this view can show.
+  // The live stream is retargeted to the same filters the connection list
+  // uses, so ticks only carry rows this view can show.
   useEffect(() => {
     setStreamQuery({
       q: appliedQ || undefined,
-      direction: direction || undefined,
       state: state || undefined,
       protocol: protocol || undefined,
       port: port ? Number(port) : undefined,
@@ -505,7 +472,7 @@ export function ExplorerView() {
       domain: pinned.domain || undefined,
       application_id: pinned.application || undefined,
     });
-  }, [appliedQ, direction, state, visibility, protocol, port, hideLan, pinned.ip, pinned.domain, pinned.application]);
+  }, [appliedQ, state, visibility, protocol, port, hideLan, pinned.ip, pinned.domain, pinned.application]);
 
   // Clear the stream filters only when leaving the view, not between filter
   // updates (a per-update reset caused an extra reconnect on every change).
@@ -518,18 +485,10 @@ export function ExplorerView() {
   liveRef.current = live;
   const scopeRef = useRef(scope);
   scopeRef.current = scope;
-  const viewRef = useRef(view);
-  viewRef.current = view;
   const pagesLoadedRef = useRef(1);
   pagesLoadedRef.current = activeQuery.data?.pages.length ?? 1;
-  const sortRef = useRef(sort);
-  sortRef.current = sort;
-  const itemsRef = useRef(items);
-  itemsRef.current = items;
   const connectionItemsRef = useRef(connectionItems);
   connectionItemsRef.current = connectionItems;
-  const flowsFilterRef = useRef(flowsFilter);
-  flowsFilterRef.current = flowsFilter;
   const tickCount = useRef(0);
 
   useEffect(
@@ -593,12 +552,8 @@ export function ExplorerView() {
             void queryClient.invalidateQueries({ queryKey: ["domains-page"] });
           } else if (scopeRef.current === "applications") {
             void queryClient.invalidateQueries({ queryKey: ["applications-page"] });
-          } else if (viewRef.current === "connections") {
-            if (liveRef.current) {
-              void queryClient.invalidateQueries({ queryKey: ["connections-page"] });
-            }
-          } else if (liveRef.current && sortRef.current === "-last_seen") {
-            void queryClient.invalidateQueries({ queryKey: queryKeys.flowsPage(flowsFilterRef.current) });
+          } else if (liveRef.current) {
+            void queryClient.invalidateQueries({ queryKey: ["connections-page"] });
           }
         }
 
@@ -606,37 +561,13 @@ export function ExplorerView() {
 
         // Connections cannot be patched from directional ticks; pause just
         // counts how many visible peers saw activity.
-        if (viewRef.current === "connections") {
-          if (!liveRef.current) {
-            const peers = new Set(
-              connectionItemsRef.current.map((connection) => connection.remote.address),
-            );
-            const updates = tick.flows.filter((flow) => peers.has(flow.remote.address));
-            if (updates.length) setPendingCount((count) => count + updates.length);
-          }
-          return;
-        }
-
-        const byId = new Map(tick.flows.map((flow) => [flow.id, flow]));
         if (!liveRef.current) {
-          const ids = new Set(itemsRef.current.map((item) => item.id));
-          const updates = tick.flows.filter((flow) => ids.has(flow.id));
+          const peers = new Set(
+            connectionItemsRef.current.map((connection) => connection.remote.address),
+          );
+          const updates = tick.flows.filter((flow) => peers.has(flow.remote.address));
           if (updates.length) setPendingCount((count) => count + updates.length);
-          return;
         }
-        // Non-urgent: a one-second tick must never block scrolling or typing.
-        startTransition(() => {
-          setItems((previous) => {
-            let changed = false;
-            const next = previous.map((flow) => {
-              const update = byId.get(flow.id);
-              if (!update) return flow;
-              changed = true;
-              return update;
-            });
-            return changed ? next : previous;
-          });
-        });
       }),
     [queryClient],
   );
@@ -684,18 +615,8 @@ export function ExplorerView() {
     setLive(next);
     if (next) {
       setPendingCount(0);
-      if (view === "connections") {
-        void queryClient.invalidateQueries({ queryKey: ["connections-page"] });
-      } else {
-        void queryClient.invalidateQueries({ queryKey: queryKeys.flowsPage(flowsFilter) });
-      }
+      void queryClient.invalidateQueries({ queryKey: ["connections-page"] });
     }
-  };
-
-  const openFlow = (id: string) => {
-    setSelectedId(id);
-    setLiveAndSync(false);
-    open({ kind: "flow", id });
   };
 
   // Debounced search: typing or focusing the field pauses live updates first.
@@ -756,17 +677,6 @@ export function ExplorerView() {
     setSearchParams(next, { replace: true });
   };
 
-  // Connections vs raw directional Flows lives in `?view=`.
-  const switchView = (value: string) => {
-    if (value === view) return;
-    const next = new URLSearchParams(searchParams);
-    if (value === "connections") next.delete("view");
-    else next.set("view", value);
-    setSearchParams(next, { replace: true });
-    setSelectedId(null);
-    setSort("-last_seen");
-  };
-
   const toggleSort = (field: string) => {
     const current = sort.startsWith("-") ? sort.slice(1) : sort;
     setSort(current === field ? (sort.startsWith("-") ? field : `-${field}`) : `-${field}`);
@@ -774,9 +684,7 @@ export function ExplorerView() {
 
   const columns: readonly Column[] =
     scope === "flows"
-      ? view === "connections"
-        ? CONNECTION_COLUMNS
-        : FLOW_COLUMNS
+      ? CONNECTION_COLUMNS
       : scope === "endpoints"
         ? ENDPOINT_COLUMNS
         : scope === "domains"
@@ -786,25 +694,20 @@ export function ExplorerView() {
 
   const renderRows = (active: Scope) => {
     if (active === "flows") {
-      if (view === "connections") {
-        return (
-          <ConnectionRows
-            items={flatConnections}
-            onToggle={(key) =>
-              setExpandedGroups((previous) => {
-                const next = new Set(previous);
-                if (next.has(key)) next.delete(key);
-                else next.add(key);
-                return next;
-              })
-            }
-            onOpen={(address) => open({ kind: "endpoint", address })}
-          />
-        );
-      }
-      return items.map((flow) => (
-        <FlowRow key={flow.id} flow={flow} selected={flow.id === selectedId} onOpen={openFlow} />
-      ));
+      return (
+        <ConnectionRows
+          items={flatConnections}
+          onToggle={(key) =>
+            setExpandedGroups((previous) => {
+              const next = new Set(previous);
+              if (next.has(key)) next.delete(key);
+              else next.add(key);
+              return next;
+            })
+          }
+          onOpen={(address) => open({ kind: "endpoint", address })}
+        />
+      );
     }
     if (active === "endpoints") {
       return endpointItems.map((endpoint) => (
@@ -837,9 +740,7 @@ export function ExplorerView() {
   // the content swaps mid-fade, never the table frame.
   const displayedColumns =
     displayedScope === "flows"
-      ? view === "connections"
-        ? CONNECTION_COLUMNS
-        : FLOW_COLUMNS
+      ? CONNECTION_COLUMNS
       : displayedScope === "endpoints"
         ? ENDPOINT_COLUMNS
         : displayedScope === "domains"
@@ -847,9 +748,7 @@ export function ExplorerView() {
           : APPLICATION_COLUMNS;
   const bodyQuery =
     displayedScope === "flows"
-      ? view === "connections"
-        ? connectionsQuery
-        : flowsQuery
+      ? connectionsQuery
       : displayedScope === "endpoints"
         ? endpointsQuery
         : displayedScope === "domains"
@@ -858,9 +757,7 @@ export function ExplorerView() {
   const bodyRows = renderRows(displayedScope);
   const bodyEmpty =
     displayedScope === "flows"
-      ? view === "connections"
-        ? connectionItems.length === 0
-        : items.length === 0
+      ? connectionItems.length === 0
       : displayedScope === "endpoints"
         ? endpointItems.length === 0
         : displayedScope === "domains"
@@ -874,7 +771,7 @@ export function ExplorerView() {
             ? bodyQuery.error.message
             : "The local agent did not respond. Check that it is running.",
       }
-    : displayedScope === "flows" && view === "connections"
+    : displayedScope === "flows"
       ? {
           title: "No matching connections",
           message: "Try widening the time range, showing noise, or clearing filters.",
@@ -969,17 +866,11 @@ export function ExplorerView() {
               transition={{ duration: 0.24, ease: EASE }}
             >
               <div className="flex flex-wrap items-center gap-2">
-                <Segmented ariaLabel="List view" options={[...VIEWS]} value={view} onChange={switchView} />
                 <Segmented ariaLabel="Time range" options={RANGE_OPTIONS} value={range} onChange={(value) => { setRange(value as TimeRange); }} />
-                {view === "raw" && (
-                  <Segmented ariaLabel="Direction" options={DIRECTION_OPTIONS} value={direction} onChange={(value) => { setDirection(value); }} />
-                )}
                 <Segmented ariaLabel="Flow state" options={STATE_OPTIONS} value={state} onChange={(value) => { setState(value); }} />
                 <Segmented ariaLabel="Domain visibility" options={VISIBILITY_OPTIONS} value={visibility} onChange={(value) => { setVisibility(value); }} />
                 <Segmented ariaLabel="Local traffic" options={LAN_OPTIONS} value={hideLan ? "internet" : "all"} onChange={(value) => { setHideLan(value === "internet"); }} />
-                {view === "connections" && (
-                  <Segmented ariaLabel="Noise" options={NOISE_OPTIONS} value={hideNoise ? "hide" : "all"} onChange={(value) => setHideNoise(value === "hide")} />
-                )}
+                <Segmented ariaLabel="Noise" options={NOISE_OPTIONS} value={hideNoise ? "hide" : "all"} onChange={(value) => setHideNoise(value === "hide")} />
                 <div className="flex-1" />
                 <label className="flex items-center gap-1.5 text-2xs text-muted-foreground">
                   Port
@@ -1059,6 +950,7 @@ export function ExplorerView() {
 
       <motion.div
         className="layered-surface overflow-hidden rounded-xl"
+        style={{ viewTransitionName: "flows-surface" }}
         initial={false}
         animate={{ height: lockedHeight ?? "auto" }}
         transition={{ duration: 0.28, ease: EASE }}
@@ -1096,7 +988,7 @@ export function ExplorerView() {
       <div className="flex items-center justify-between gap-3 py-2.5 text-2xs text-muted-foreground">
         <span className="tabular-nums">
           {formatNumber(loadedCount)} of {formatNumber(total)}{" "}
-          {scope === "flows" && view === "connections" ? "connections" : meta.unit}
+          {scope === "flows" ? "connections" : meta.unit}
         </span>
         <span className="inline-flex items-center gap-1.5">
           {activeQuery.isFetchingNextPage ? (

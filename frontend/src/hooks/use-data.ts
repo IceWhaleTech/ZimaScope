@@ -13,7 +13,6 @@ import type { SettingsPatch, TimeRange } from "@/types";
 export const queryKeys = {
   overview: (range: TimeRange, excludeScope?: string) => ["overview", range, excludeScope ?? ""] as const,
   flows: (query: FlowQuery) => ["flows", query] as const,
-  flowsPage: (query: FlowQuery) => ["flows-page", query] as const,
   connectionsPage: (query: FlowQuery) => ["connections-page", query] as const,
   flow: (id: string) => ["flow", id] as const,
   endpoints: (query: FlowQuery) => ["endpoints", query] as const,
@@ -61,18 +60,7 @@ export function useFlows(query: FlowQuery) {
   });
 }
 
-/** Offset-paginated Flow list that loads the next page as it is scrolled. */
-export function useFlowsInfinite(query: FlowQuery) {
-  return useInfiniteQuery({
-    queryKey: queryKeys.flowsPage(query),
-    queryFn: ({ pageParam }) => data.flows({ ...query, offset: pageParam }),
-    initialPageParam: 0,
-    getNextPageParam: nextPageParam,
-    placeholderData: keepPreviousData,
-  });
-}
-
-/** Merged connection list, also loaded page by page while scrolling. */
+/** Merged connection list, loaded page by page while scrolling. */
 export function useConnectionsInfinite(query: FlowQuery) {
   return useInfiniteQuery({
     queryKey: queryKeys.connectionsPage(query),
