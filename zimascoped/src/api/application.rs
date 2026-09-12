@@ -6,12 +6,24 @@
 //! best-effort and cached; a process that exited in the meantime still keeps
 //! its `comm` from the kernel observation.
 
-use std::{collections::HashMap, fs};
+use std::{
+    collections::HashMap,
+    fs,
+    os::unix::fs::MetadataExt,
+    path::Path,
+    time::{Duration, Instant},
+};
 
 use zimascope_common::model::ApplicationRef;
 
 /// How many `(tgid, comm)` resolutions are cached before the cache is dropped.
 const RESOLUTION_CACHE_CAPACITY: usize = 4_096;
+
+/// Minimum age of the cgroup-id index before a miss walks the tree again.
+const CGROUP_INDEX_REFRESH: Duration = Duration::from_secs(5);
+
+/// Bound on the cgroup tree walk, so a symlink loop cannot recurse forever.
+const CGROUP_WALK_DEPTH: usize = 12;
 
 /// A stable Application record ready for storage.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -30,6 +42,9 @@ pub(crate) struct ResolvedApplication {
 #[derive(Default)]
 pub(crate) struct ApplicationResolver {
     cache: HashMap<(u32, String), ProcessFacts>,
+    /// cgroup directory inode (`cgroup_id`) to container id.
+    cgroup_index: HashMap<u64, Option<Box<str>>>,
+    cgroup_index_at: Option<Instant>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -47,7 +62,7 @@ impl ApplicationResolver {
     ) -> Option<ResolvedApplication> {
         let application = application?;
         let comm: String = application.comm.to_string();
-        let facts = self.facts(application.tgid, &comm);
+        let facts = self.facts(application.tgid, &comm, application.cgroup_id);
 
         let (id, kind, name) = if let Some(container_id) = &facts.container_id {
             let name = if comm.is_empty() {
@@ -82,7 +97,7 @@ impl ApplicationResolver {
         })
     }
 
-    fn facts(&mut self, tgid: u32, comm: &str) -> ProcessFacts {
+    fn facts(&mut self, tgid: u32, comm: &str, cgroup_id: u64) -> ProcessFacts {
         let key = (tgid, comm.to_owned());
         if let Some(facts) = self.cache.get(&key) {
             return facts.clone();
@@ -90,9 +105,42 @@ impl ApplicationResolver {
         if self.cache.len() >= RESOLUTION_CACHE_CAPACITY {
             self.cache.clear();
         }
-        let facts = read_process_facts(tgid);
+        let mut facts = read_process_facts(tgid);
+        // Short-lived processes exit before the poll; the kernel's cgroup id
+        // still identifies the container they ran in.
+        if facts.container_id.is_none() {
+            facts.container_id = self.container_for_cgroup(cgroup_id);
+        }
         self.cache.insert(key, facts.clone());
         facts
+    }
+
+    /// Maps a kernel `cgroup_id` to the container that owns that cgroup.
+    ///
+    /// cgroup v2 ids are the inode of the cgroup directory, so the index is
+    /// built by walking `/sys/fs/cgroup`; an unknown id re-walks the tree at
+    /// most once per [`CGROUP_INDEX_REFRESH`] so containers started later are
+    /// still found.
+    fn container_for_cgroup(&mut self, cgroup_id: u64) -> Option<String> {
+        if cgroup_id == 0 {
+            return None;
+        }
+        if let Some(found) = self.cgroup_index.get(&cgroup_id) {
+            return found.as_deref().map(ToOwned::to_owned);
+        }
+
+        let due = self
+            .cgroup_index_at
+            .map(|at| at.elapsed() >= CGROUP_INDEX_REFRESH)
+            .unwrap_or(true);
+        if due {
+            self.cgroup_index = index_cgroups();
+            self.cgroup_index_at = Some(Instant::now());
+            if let Some(found) = self.cgroup_index.get(&cgroup_id) {
+                return found.as_deref().map(ToOwned::to_owned);
+            }
+        }
+        None
     }
 }
 
@@ -106,6 +154,37 @@ fn read_process_facts(tgid: u32) -> ProcessFacts {
         .and_then(container_id_from_cgroup);
 
     ProcessFacts { exe, container_id }
+}
+
+/// Walks the cgroup v2 tree and records every directory inode.
+fn index_cgroups() -> HashMap<u64, Option<Box<str>>> {
+    let mut index = HashMap::new();
+    walk_cgroups(Path::new("/sys/fs/cgroup"), 0, &mut index);
+    index
+}
+
+fn walk_cgroups(directory: &Path, depth: usize, index: &mut HashMap<u64, Option<Box<str>>>) {
+    if depth >= CGROUP_WALK_DEPTH {
+        return;
+    }
+    let Ok(entries) = fs::read_dir(directory) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let Ok(metadata) = entry.metadata() else {
+            continue;
+        };
+        if !metadata.is_dir() {
+            continue;
+        }
+        let path = entry.path();
+        let container = path
+            .to_str()
+            .and_then(container_id_from_cgroup)
+            .map(Into::into);
+        index.insert(metadata.ino(), container);
+        walk_cgroups(&path, depth + 1, index);
+    }
 }
 
 fn normalize_exe(path: &str) -> Option<String> {
@@ -214,6 +293,37 @@ mod tests {
             container_id_from_cgroup("0::/user.slice/user-1000.slice"),
             None
         );
+    }
+
+    #[test]
+    fn cgroup_index_maps_directories_to_containers() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("zs-cgroup-{}-{unique}", std::process::id()));
+        let id = "3f2a9c1d4b5e6f708a9b0c1d2e3f4a5b6c7d8e9f0a1b2c3d4e5f60718293a4b5";
+        let container = root.join("system.slice").join(format!("docker-{id}.scope"));
+        let host = root.join("user.slice");
+        std::fs::create_dir_all(&container).expect("create container cgroup");
+        std::fs::create_dir_all(&host).expect("create host cgroup");
+
+        let mut index = HashMap::new();
+        walk_cgroups(&root, 0, &mut index);
+
+        let container_inode = std::fs::metadata(&container)
+            .expect("container metadata")
+            .ino();
+        assert_eq!(
+            index
+                .get(&container_inode)
+                .and_then(|value| value.as_deref()),
+            Some(id)
+        );
+        let host_inode = std::fs::metadata(&host).expect("host metadata").ino();
+        assert!(index.get(&host_inode).is_some_and(|value| value.is_none()));
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
