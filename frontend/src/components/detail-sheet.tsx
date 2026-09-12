@@ -1,10 +1,13 @@
 /**
- * Detail panel: a right-side material Sheet. All three details answer the
- * same questions — what is it, how much traffic, what evidence do we have,
- * and where can I go next.
+ * Detail panel: a right-side material Sheet. All four details answer the same
+ * questions — what is it, how much traffic, what evidence do we have, and
+ * where can I go next — but only one answer at a time: a compact summary
+ * stays visible, a segmented control switches between focused sections, and
+ * long lists are capped with a "view all flows" exit instead of scrolling a
+ * wall of rows.
  */
 
-import { useEffect, useState } from "react";
+import { useEffect, useState, type ReactNode } from "react";
 import { useNavigate } from "react-router";
 import { motion } from "motion/react";
 import { toast } from "sonner";
@@ -16,7 +19,7 @@ import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from "
 import { TimelineChart } from "@/components/charts";
 import { CountryLabel, DirectionBadge, EvidenceChip, ScopeChip, StateBadge } from "@/components/flow-bits";
 import { Segmented } from "@/components/segmented";
-import { DefList, PanelSection, StatTiles } from "@/components/stat-tiles";
+import { DefList, StatTiles } from "@/components/stat-tiles";
 import { useDetails } from "@/hooks/use-details";
 import {
   useApplication,
@@ -43,6 +46,11 @@ const enter = {
   animate: { opacity: 1, y: 0 },
   transition: { duration: 0.28, ease: [0.32, 0.72, 0, 1] as const },
 };
+
+/** Rows shown per list before the "view all flows" exit takes over. */
+const LIST_LIMIT = 6;
+
+type Tab = { value: string; label: string };
 
 export function DetailSheet() {
   const { target, close } = useDetails();
@@ -103,6 +111,43 @@ function PanelHead({ eyebrow, title, subtitle }: { eyebrow: string; title: strin
   );
 }
 
+/** One section at a time: the segmented control switches the visible block. */
+function DetailTabs({
+  tabs,
+  value,
+  onChange,
+}: {
+  tabs: Tab[];
+  value: string;
+  onChange: (value: string) => void;
+}) {
+  return (
+    <div className="flex min-w-0 overflow-x-auto pb-0.5">
+      <Segmented ariaLabel="Detail sections" options={tabs} value={value} onChange={onChange} />
+    </div>
+  );
+}
+
+/** Caption + content inside a tab; the tab label already names the section. */
+function TabSection({ caption, children }: { caption: string; children: ReactNode }) {
+  return (
+    <section className="flex flex-col gap-2.5">
+      <p className="text-2xs text-muted-foreground">{caption}</p>
+      {children}
+    </section>
+  );
+}
+
+/** Notes that a list is truncated; the footer button opens the full view. */
+function TruncationNote({ shown, total }: { shown: number; total: number }) {
+  if (total <= shown) return null;
+  return (
+    <p className="pt-1 text-2xs text-muted-foreground">
+      Showing {shown} of {total} — open all flows for the rest.
+    </p>
+  );
+}
+
 const TREND_RANGES = [
   { value: "15m", label: "15m" },
   { value: "1h", label: "1h" },
@@ -126,7 +171,7 @@ function EntityTrend({
     kind === "endpoint" ? endpointQuery : kind === "domain" ? domainQuery : applicationQuery;
 
   return (
-    <PanelSection title="Traffic trend" subtitle="Bytes at the device boundary per interval">
+    <TabSection caption="Bytes at the device boundary per interval">
       <div className="flex min-w-0 justify-end">
         <Segmented
           ariaLabel="Trend range"
@@ -148,7 +193,7 @@ function EntityTrend({
           <i className="size-1.5 rounded-full bg-series-outbound" />Outbound
         </span>
       </div>
-    </PanelSection>
+    </TabSection>
   );
 }
 
@@ -163,6 +208,12 @@ function FakeIpNote() {
     </p>
   );
 }
+
+const FLOW_TABS: Tab[] = [
+  { value: "summary", label: "Summary" },
+  { value: "remote", label: "Remote" },
+  { value: "path", label: "Path" },
+];
 
 function FlowDetail({ id }: { id: string }) {
   const query = useFlow(id);
@@ -186,13 +237,14 @@ function FlowDetail({ id }: { id: string }) {
 function FlowDetailBody({ flow }: { flow: Flow }) {
   const { close, open } = useDetails();
   const navigate = useNavigate();
+  const [tab, setTab] = useState("summary");
   const domain = flow.domains[0];
   const network = flow.remote_profile;
   const source = `${flow.source.address}${flow.source.port ? `:${flow.source.port}` : ""}`;
   const destination = `${flow.destination.address}${flow.destination.port ? `:${flow.destination.port}` : ""}`;
   return (
     <ScrollArea className="min-h-0 min-w-0 max-w-full flex-1 overflow-hidden">
-      <motion.div {...enter} className="flex w-full min-w-0 max-w-full flex-col gap-5 p-4">
+      <motion.div {...enter} className="flex w-full min-w-0 max-w-full flex-col gap-4 p-4">
         <div className="flex flex-wrap items-center gap-2">
           <StateBadge state={flow.state} />
           <DirectionBadge direction={flow.direction} />
@@ -208,108 +260,118 @@ function FlowDetailBody({ flow }: { flow: Flow }) {
           ]}
         />
 
-        <PanelSection title="Associated domain" subtitle="Evidence linking this flow to a name">
-          {domain ? (
-            <div className="rounded-lg border border-border/60 p-3">
-              <div className="flex items-center justify-between gap-2">
-                <strong className="truncate text-xs">{domain.domain}</strong>
-                <EvidenceChip evidence={domain.evidence} confidence={domain.confidence} />
-              </div>
-              <p className="mt-1.5 text-xs text-muted-foreground">
-                {evidenceTitle(domain.evidence)} · {domain.confidence === "direct" ? "Direct" : "Inferred"} association.
-              </p>
-            </div>
-          ) : (
-            <div className="rounded-lg border border-border/60 bg-muted/50 p-3">
-              <div className="flex items-center justify-between gap-2">
-                <strong className="text-xs">Domain unavailable</strong>
-                <span className="text-2xs text-muted-foreground">No evidence</span>
-              </div>
-              <p className="mt-1.5 text-xs text-muted-foreground">
-                No DNS answer, TLS SNI or HTTP Host was observed for this flow. Common reasons: cached DNS, DoH/DoT,
-                ECH, QUIC, fragmentation, or the connection predates collection.
-              </p>
-            </div>
-          )}
-        </PanelSection>
+        <DetailTabs tabs={FLOW_TABS} value={tab} onChange={setTab} />
 
-        <PanelSection title="Remote profile" subtitle="Locally enriched IP metadata">
-          <DefList
-            rows={[
-              { label: "Address", value: <span className="font-mono text-xs">{network.address}</span> },
-              { label: "Address scope", value: <ScopeChip scope={network.scope} /> },
-              {
-                label: "Country / region",
-                value: network.country ? (
-                  <span className="inline-flex items-center gap-1.5">
-                    <CountryLabel country={network.country} />
-                    {network.region && <span className="text-muted-foreground">· {network.region}</span>}
-                  </span>
-                ) : (
-                  <span className="text-muted-foreground">Not enriched</span>
-                ),
-              },
-              { label: "ASN", value: network.asn ? `AS${network.asn}` : <span className="text-muted-foreground">—</span> },
-              { label: "Organization", value: network.organization ?? "—" },
-              {
-                label: "Database",
-                value: network.database_version ?? <span className="text-muted-foreground">Unavailable</span>,
-              },
-            ]}
-          />
-          {network.scope === "fake_ip" ? (
-            <FakeIpNote />
-          ) : (
-            <p className="text-2xs text-muted-foreground">
-              An ASN organization describes network ownership, not the domain owner.
-            </p>
+        <motion.div key={tab} {...enter} className="flex flex-col gap-4">
+          {tab === "summary" && (
+            <TabSection caption="Evidence linking this flow to a name">
+              {domain ? (
+                <div className="rounded-lg border border-border/60 p-3">
+                  <div className="flex items-center justify-between gap-2">
+                    <strong className="truncate text-xs">{domain.domain}</strong>
+                    <EvidenceChip evidence={domain.evidence} confidence={domain.confidence} />
+                  </div>
+                  <p className="mt-1.5 text-xs text-muted-foreground">
+                    {evidenceTitle(domain.evidence)} · {domain.confidence === "direct" ? "Direct" : "Inferred"} association.
+                  </p>
+                </div>
+              ) : (
+                <div className="rounded-lg border border-border/60 bg-muted/50 p-3">
+                  <div className="flex items-center justify-between gap-2">
+                    <strong className="text-xs">Domain unavailable</strong>
+                    <span className="text-2xs text-muted-foreground">No evidence</span>
+                  </div>
+                  <p className="mt-1.5 text-xs text-muted-foreground">
+                    No DNS answer, TLS SNI or HTTP Host was observed for this flow. Common reasons: cached DNS, DoH/DoT,
+                    ECH, QUIC, fragmentation, or the connection predates collection.
+                  </p>
+                </div>
+              )}
+            </TabSection>
           )}
-        </PanelSection>
 
-        <PanelSection title="Path" subtitle="Direction relative to the device boundary">
-          <DefList
-            rows={[
-              ...(flow.application
-                ? [
-                    {
-                      label: "Application",
-                      value: (
-                        <button
-                          type="button"
-                          onClick={() => open({ kind: "application", id: flow.application!.id })}
-                          className="inline-flex max-w-full items-center gap-1 truncate text-xs font-medium text-foreground underline-offset-2 hover:underline"
-                          title={flow.application.id}
-                        >
-                          {flow.application.kind === "container" ? (
-                            <Boxes className="size-3 shrink-0" />
-                          ) : (
-                            <Terminal className="size-3 shrink-0" />
-                          )}
-                          <span className="truncate">{flow.application.name}</span>
-                        </button>
-                      ),
-                    },
-                  ]
-                : []),
-              {
-                label: flow.direction === "outbound" ? "From" : "Remote source",
-                value: <span className="font-mono text-xs">{source}</span>,
-              },
-              {
-                label: flow.direction === "outbound" ? "Remote destination" : "To",
-                value: <span className="font-mono text-xs">{destination}</span>,
-              },
-              {
-                label: "First seen",
-                value: `${formatClock(flow.first_seen)} · ${relativeTime(flow.first_seen)}`,
-              },
-              {
-                label: "End reason",
-                value: flow.end_reason ? flow.end_reason.replace("_", " ") : "—",
-              },
-            ]}
-          />
-        </PanelSection>
+          {tab === "remote" && (
+            <TabSection caption="Locally enriched IP metadata">
+              <DefList
+                rows={[
+                  { label: "Address", value: <span className="font-mono text-xs">{network.address}</span> },
+                  { label: "Address scope", value: <ScopeChip scope={network.scope} /> },
+                  {
+                    label: "Country / region",
+                    value: network.country ? (
+                      <span className="inline-flex items-center gap-1.5">
+                        <CountryLabel country={network.country} />
+                        {network.region && <span className="text-muted-foreground">· {network.region}</span>}
+                      </span>
+                    ) : (
+                      <span className="text-muted-foreground">Not enriched</span>
+                    ),
+                  },
+                  { label: "ASN", value: network.asn ? `AS${network.asn}` : <span className="text-muted-foreground">—</span> },
+                  { label: "Organization", value: network.organization ?? "—" },
+                  {
+                    label: "Database",
+                    value: network.database_version ?? <span className="text-muted-foreground">Unavailable</span>,
+                  },
+                ]}
+              />
+              {network.scope === "fake_ip" ? (
+                <FakeIpNote />
+              ) : (
+                <p className="text-2xs text-muted-foreground">
+                  An ASN organization describes network ownership, not the domain owner.
+                </p>
+              )}
+            </TabSection>
+          )}
+
+          {tab === "path" && (
+            <TabSection caption="Direction relative to the device boundary">
+              <DefList
+                rows={[
+                  ...(flow.application
+                    ? [
+                        {
+                          label: "Application",
+                          value: (
+                            <button
+                              type="button"
+                              onClick={() => open({ kind: "application", id: flow.application!.id })}
+                              className="inline-flex max-w-full items-center gap-1 truncate text-xs font-medium text-foreground underline-offset-2 hover:underline"
+                              title={flow.application.id}
+                            >
+                              {flow.application.kind === "container" ? (
+                                <Boxes className="size-3 shrink-0" />
+                              ) : (
+                                <Terminal className="size-3 shrink-0" />
+                              )}
+                              <span className="truncate">{flow.application.name}</span>
+                            </button>
+                          ),
+                        },
+                      ]
+                    : []),
+                  {
+                    label: flow.direction === "outbound" ? "From" : "Remote source",
+                    value: <span className="font-mono text-xs">{source}</span>,
+                  },
+                  {
+                    label: flow.direction === "outbound" ? "Remote destination" : "To",
+                    value: <span className="font-mono text-xs">{destination}</span>,
+                  },
+                  {
+                    label: "First seen",
+                    value: `${formatClock(flow.first_seen)} · ${relativeTime(flow.first_seen)}`,
+                  },
+                  {
+                    label: "End reason",
+                    value: flow.end_reason ? flow.end_reason.replace("_", " ") : "—",
+                  },
+                ]}
+              />
+            </TabSection>
+          )}
+        </motion.div>
 
         <div className="flex gap-2">
           <Button
@@ -341,6 +403,13 @@ function FlowDetailBody({ flow }: { flow: Flow }) {
 
 /* ------------------------------ Endpoint ---------------------------------- */
 
+const ENDPOINT_TABS: Tab[] = [
+  { value: "traffic", label: "Traffic" },
+  { value: "ports", label: "Ports" },
+  { value: "domains", label: "Domains" },
+  { value: "network", label: "Network" },
+];
+
 function EndpointDetail({ address }: { address: string }) {
   const query = useEndpoint(address);
   const { close } = useDetails();
@@ -366,10 +435,11 @@ function EndpointDetail({ address }: { address: string }) {
 function EndpointDetailBody({ detail }: { detail: EndpointDetail }) {
   const { close, open } = useDetails();
   const navigate = useNavigate();
+  const [tab, setTab] = useState("traffic");
   const maxPort = Math.max(1, ...detail.ports.map((port) => port.bytes));
   return (
     <ScrollArea className="min-h-0 min-w-0 max-w-full flex-1 overflow-hidden">
-      <motion.div {...enter} className="flex w-full min-w-0 max-w-full flex-col gap-5 p-4">
+      <motion.div {...enter} className="flex w-full min-w-0 max-w-full flex-col gap-4 p-4">
         <div className="flex flex-wrap items-center gap-2">
           <ScopeChip scope={detail.profile.scope} />
           {detail.profile.country && <CountryLabel country={detail.profile.country} />}
@@ -384,75 +454,91 @@ function EndpointDetailBody({ detail }: { detail: EndpointDetail }) {
           ]}
         />
 
-        <EntityTrend kind="endpoint" target={detail.address} />
+        <DetailTabs tabs={ENDPOINT_TABS} value={tab} onChange={setTab} />
 
-        <PanelSection title="IP profile" subtitle="From the local enrichment database">
-          <DefList
-            rows={[
-              { label: "Organization", value: detail.profile.organization ?? "—" },
-              { label: "ASN", value: detail.profile.asn ? `AS${detail.profile.asn}` : "—" },
-              {
-                label: "Country / region",
-                value: detail.profile.country ? (
-                  <span className="inline-flex items-center gap-1.5">
-                    <CountryLabel country={detail.profile.country} />
-                    {detail.profile.region && <span className="text-muted-foreground">· {detail.profile.region}</span>}
-                  </span>
-                ) : (
-                  <span className="text-muted-foreground">Not enriched</span>
-                ),
-              },
-              {
-                label: "Last seen",
-                value: `${formatClock(detail.last_seen)} · ${relativeTime(detail.last_seen)}`,
-              },
-            ]}
-          />
-          {detail.profile.scope === "fake_ip" && <FakeIpNote />}
-        </PanelSection>
+        <motion.div key={tab} {...enter} className="flex flex-col gap-4">
+          {tab === "traffic" && <EntityTrend kind="endpoint" target={detail.address} />}
 
-        <PanelSection title="Ports" subtitle="Observed usage by port and direction">
-          {detail.ports.length ? (
-            <ul className="flex flex-col gap-2.5">
-              {detail.ports.slice(0, 8).map((port) => (
-                <li key={`${port.port}-${port.protocol}-${port.direction}`} className="flex flex-col gap-1">
-                  <div className="flex items-baseline justify-between gap-2">
-                    <span className="font-mono text-xs font-medium">{port.port || "—"}</span>
-                    <strong className="text-xs tabular-nums">{formatBytes(port.bytes)}</strong>
-                  </div>
-                  <UsageBar ratio={port.bytes / maxPort} />
-                  <span className="text-2xs text-muted-foreground">
-                    {port.protocol.toUpperCase()} · {port.direction} · {port.flow_count} flows
-                  </span>
-                </li>
-              ))}
-            </ul>
-          ) : (
-            <p className="text-xs text-muted-foreground">No port data</p>
+          {tab === "ports" && (
+            <TabSection caption="Observed usage by port and direction">
+              {detail.ports.length ? (
+                <>
+                  <ul className="flex flex-col gap-2.5">
+                    {detail.ports.slice(0, LIST_LIMIT).map((port) => (
+                      <li key={`${port.port}-${port.protocol}-${port.direction}`} className="flex flex-col gap-1">
+                        <div className="flex items-baseline justify-between gap-2">
+                          <span className="font-mono text-xs font-medium">{port.port || "—"}</span>
+                          <strong className="text-xs tabular-nums">{formatBytes(port.bytes)}</strong>
+                        </div>
+                        <UsageBar ratio={port.bytes / maxPort} />
+                        <span className="text-2xs text-muted-foreground">
+                          {port.protocol.toUpperCase()} · {port.direction} · {port.flow_count} flows
+                        </span>
+                      </li>
+                    ))}
+                  </ul>
+                  <TruncationNote shown={Math.min(LIST_LIMIT, detail.ports.length)} total={detail.ports.length} />
+                </>
+              ) : (
+                <p className="text-xs text-muted-foreground">No port data</p>
+              )}
+            </TabSection>
           )}
-        </PanelSection>
 
-        <PanelSection title="Associated domains" subtitle="Names linked to this endpoint">
-          {detail.domains.length ? (
-            <ul className="flex flex-col">
-              {detail.domains.slice(0, 8).map((ref) => (
-                <li key={ref.domain}>
-                  <button
-                    type="button"
-                    onClick={() => open({ kind: "domain", name: ref.domain })}
-                    className="flex w-full items-center gap-2 rounded-md px-1 py-2 text-left transition-colors hover:bg-accent"
-                  >
-                    <span className="min-w-0 flex-1 truncate text-xs font-medium">{ref.domain}</span>
-                    <EvidenceChip evidence={ref.evidence} confidence={ref.confidence} />
-                    <ChevronRight className="size-3.5 shrink-0 text-muted-foreground" />
-                  </button>
-                </li>
-              ))}
-            </ul>
-          ) : (
-            <p className="text-xs text-muted-foreground">No domain evidence is associated with this endpoint.</p>
+          {tab === "domains" && (
+            <TabSection caption="Names linked to this endpoint">
+              {detail.domains.length ? (
+                <>
+                  <ul className="flex flex-col">
+                    {detail.domains.slice(0, LIST_LIMIT).map((ref) => (
+                      <li key={ref.domain}>
+                        <button
+                          type="button"
+                          onClick={() => open({ kind: "domain", name: ref.domain })}
+                          className="flex w-full items-center gap-2 rounded-md px-1 py-2 text-left transition-colors hover:bg-accent"
+                        >
+                          <span className="min-w-0 flex-1 truncate text-xs font-medium">{ref.domain}</span>
+                          <EvidenceChip evidence={ref.evidence} confidence={ref.confidence} />
+                          <ChevronRight className="size-3.5 shrink-0 text-muted-foreground" />
+                        </button>
+                      </li>
+                    ))}
+                  </ul>
+                  <TruncationNote shown={Math.min(LIST_LIMIT, detail.domains.length)} total={detail.domains.length} />
+                </>
+              ) : (
+                <p className="text-xs text-muted-foreground">No domain evidence is associated with this endpoint.</p>
+              )}
+            </TabSection>
           )}
-        </PanelSection>
+
+          {tab === "network" && (
+            <TabSection caption="From the local enrichment database">
+              <DefList
+                rows={[
+                  { label: "Organization", value: detail.profile.organization ?? "—" },
+                  { label: "ASN", value: detail.profile.asn ? `AS${detail.profile.asn}` : "—" },
+                  {
+                    label: "Country / region",
+                    value: detail.profile.country ? (
+                      <span className="inline-flex items-center gap-1.5">
+                        <CountryLabel country={detail.profile.country} />
+                        {detail.profile.region && <span className="text-muted-foreground">· {detail.profile.region}</span>}
+                      </span>
+                    ) : (
+                      <span className="text-muted-foreground">Not enriched</span>
+                    ),
+                  },
+                  {
+                    label: "Last seen",
+                    value: `${formatClock(detail.last_seen)} · ${relativeTime(detail.last_seen)}`,
+                  },
+                ]}
+              />
+              {detail.profile.scope === "fake_ip" && <FakeIpNote />}
+            </TabSection>
+          )}
+        </motion.div>
 
         <Button
           onClick={() => {
@@ -469,6 +555,13 @@ function EndpointDetailBody({ detail }: { detail: EndpointDetail }) {
 }
 
 /* ------------------------------- Domain ----------------------------------- */
+
+const DOMAIN_TABS: Tab[] = [
+  { value: "traffic", label: "Traffic" },
+  { value: "evidence", label: "Evidence" },
+  { value: "addresses", label: "Addresses" },
+  { value: "destinations", label: "Destinations" },
+];
 
 function DomainDetail({ name }: { name: string }) {
   const query = useDomain(name);
@@ -495,10 +588,11 @@ function DomainDetail({ name }: { name: string }) {
 function DomainDetailBody({ detail }: { detail: DomainDetail }) {
   const { close, open } = useDetails();
   const navigate = useNavigate();
+  const [tab, setTab] = useState("traffic");
   const evidenceTotal = Math.max(1, detail.evidence.reduce((sum, item) => sum + item.flows, 0));
   return (
     <ScrollArea className="min-h-0 min-w-0 max-w-full flex-1 overflow-hidden">
-      <motion.div {...enter} className="flex w-full min-w-0 max-w-full flex-col gap-5 p-4">
+      <motion.div {...enter} className="flex w-full min-w-0 max-w-full flex-col gap-4 p-4">
         <div className="flex flex-wrap items-center gap-2">
           {detail.evidence.map((item) => (
             <EvidenceChip key={item.evidence} evidence={item.evidence} />
@@ -514,79 +608,96 @@ function DomainDetailBody({ detail }: { detail: DomainDetail }) {
           ]}
         />
 
-        <EntityTrend kind="domain" target={detail.domain} />
+        <DetailTabs tabs={DOMAIN_TABS} value={tab} onChange={setTab} />
 
-        <PanelSection title="Evidence" subtitle="How this name was observed">
-          <ul className="flex flex-col gap-2.5">
-            {detail.evidence.map((item) => (
-              <li key={item.evidence} className="flex flex-col gap-1">
-                <div className="flex items-baseline justify-between gap-2">
-                  <span className="text-xs font-medium">
-                    {item.evidence === "dns" ? "DNS" : item.evidence === "tls_sni" ? "TLS SNI" : "HTTP Host"}
-                  </span>
-                  <strong className="text-xs tabular-nums">{item.flows}</strong>
+        <motion.div key={tab} {...enter} className="flex flex-col gap-4">
+          {tab === "traffic" && <EntityTrend kind="domain" target={detail.domain} />}
+
+          {tab === "evidence" && (
+            <TabSection caption="How this name was observed">
+              <ul className="flex flex-col gap-2.5">
+                {detail.evidence.map((item) => (
+                  <li key={item.evidence} className="flex flex-col gap-1">
+                    <div className="flex items-baseline justify-between gap-2">
+                      <span className="text-xs font-medium">
+                        {item.evidence === "dns" ? "DNS" : item.evidence === "tls_sni" ? "TLS SNI" : "HTTP Host"}
+                      </span>
+                      <strong className="text-xs tabular-nums">{item.flows}</strong>
+                    </div>
+                    <UsageBar ratio={item.flows / evidenceTotal} />
+                    <span className="text-2xs text-muted-foreground">{evidenceTitle(item.evidence)}</span>
+                  </li>
+                ))}
+              </ul>
+            </TabSection>
+          )}
+
+          {tab === "addresses" && (
+            <TabSection caption="IPs seen carrying this name">
+              {detail.addresses.length ? (
+                <>
+                  <ul className="flex flex-col">
+                    {detail.addresses.slice(0, LIST_LIMIT).map((address) => (
+                      <li key={address.address}>
+                        <button
+                          type="button"
+                          onClick={() => open({ kind: "endpoint", address: address.address })}
+                          className="flex w-full items-center gap-2 rounded-md px-1 py-2 text-left transition-colors hover:bg-accent"
+                        >
+                          <span className="flex min-w-0 flex-1 flex-col">
+                            <span className="truncate font-mono text-xs font-medium">{address.address}</span>
+                            <span className="truncate text-2xs text-muted-foreground">
+                              {address.organization ?? "—"}
+                              {address.country ? ` · ${address.country}` : ""}
+                            </span>
+                          </span>
+                          <span className="text-xs tabular-nums text-muted-foreground">{formatBytes(address.bytes)}</span>
+                          <ChevronRight className="size-3.5 shrink-0 text-muted-foreground" />
+                        </button>
+                      </li>
+                    ))}
+                  </ul>
+                  <TruncationNote shown={Math.min(LIST_LIMIT, detail.addresses.length)} total={detail.addresses.length} />
+                </>
+              ) : (
+                <p className="text-xs text-muted-foreground">No addresses observed yet.</p>
+              )}
+            </TabSection>
+          )}
+
+          {tab === "destinations" && (
+            <TabSection caption="Countries and networks serving this name">
+              <div className="grid grid-cols-2 gap-4">
+                <div>
+                  <h4 className="mb-1 text-2xs font-medium text-muted-foreground">Countries</h4>
+                  {detail.countries.length ? (
+                    detail.countries.map((item) => (
+                      <p key={item.country} className="flex items-center justify-between gap-2 py-0.5 text-xs">
+                        <CountryLabel country={item.country} />
+                        <span className="font-medium tabular-nums">{formatBytes(item.bytes)}</span>
+                      </p>
+                    ))
+                  ) : (
+                    <p className="text-xs text-muted-foreground">—</p>
+                  )}
                 </div>
-                <UsageBar ratio={item.flows / evidenceTotal} />
-                <span className="text-2xs text-muted-foreground">{evidenceTitle(item.evidence)}</span>
-              </li>
-            ))}
-          </ul>
-        </PanelSection>
-
-        <PanelSection title="Resolved addresses" subtitle="IPs seen carrying this name">
-          <ul className="flex flex-col">
-            {detail.addresses.slice(0, 8).map((address) => (
-              <li key={address.address}>
-                <button
-                  type="button"
-                  onClick={() => open({ kind: "endpoint", address: address.address })}
-                  className="flex w-full items-center gap-2 rounded-md px-1 py-2 text-left transition-colors hover:bg-accent"
-                >
-                  <span className="flex min-w-0 flex-1 flex-col">
-                    <span className="truncate font-mono text-xs font-medium">{address.address}</span>
-                    <span className="truncate text-2xs text-muted-foreground">
-                      {address.organization ?? "—"}
-                      {address.country ? ` · ${address.country}` : ""}
-                    </span>
-                  </span>
-                  <span className="text-xs tabular-nums text-muted-foreground">{formatBytes(address.bytes)}</span>
-                  <ChevronRight className="size-3.5 shrink-0 text-muted-foreground" />
-                </button>
-              </li>
-            ))}
-          </ul>
-        </PanelSection>
-
-        <PanelSection title="Destinations" subtitle="Countries and networks serving this name">
-          <div className="grid grid-cols-2 gap-4">
-            <div>
-              <h4 className="mb-1 text-2xs font-medium text-muted-foreground">Countries</h4>
-              {detail.countries.length ? (
-                detail.countries.map((item) => (
-                  <p key={item.country} className="flex items-center justify-between gap-2 py-0.5 text-xs">
-                    <CountryLabel country={item.country} />
-                    <span className="font-medium tabular-nums">{formatBytes(item.bytes)}</span>
-                  </p>
-                ))
-              ) : (
-                <p className="text-xs text-muted-foreground">—</p>
-              )}
-            </div>
-            <div>
-              <h4 className="mb-1 text-2xs font-medium text-muted-foreground">Networks</h4>
-              {detail.asns.length ? (
-                detail.asns.map((item) => (
-                  <p key={item.asn} className="flex items-center justify-between gap-2 py-0.5 text-xs">
-                    <span className="truncate">AS{item.asn}</span>
-                    <span className="font-medium tabular-nums">{formatBytes(item.bytes)}</span>
-                  </p>
-                ))
-              ) : (
-                <p className="text-xs text-muted-foreground">—</p>
-              )}
-            </div>
-          </div>
-        </PanelSection>
+                <div>
+                  <h4 className="mb-1 text-2xs font-medium text-muted-foreground">Networks</h4>
+                  {detail.asns.length ? (
+                    detail.asns.map((item) => (
+                      <p key={item.asn} className="flex items-center justify-between gap-2 py-0.5 text-xs">
+                        <span className="truncate">AS{item.asn}</span>
+                        <span className="font-medium tabular-nums">{formatBytes(item.bytes)}</span>
+                      </p>
+                    ))
+                  ) : (
+                    <p className="text-xs text-muted-foreground">—</p>
+                  )}
+                </div>
+              </div>
+            </TabSection>
+          )}
+        </motion.div>
 
         <Button
           onClick={() => {
@@ -614,6 +725,13 @@ function UsageBar({ ratio }: { ratio: number }) {
 }
 
 /* ---------------------------- Application --------------------------------- */
+
+const APPLICATION_TABS: Tab[] = [
+  { value: "traffic", label: "Traffic" },
+  { value: "destinations", label: "Destinations" },
+  { value: "domains", label: "Domains" },
+  { value: "identity", label: "Identity" },
+];
 
 function ApplicationDetailPanel({ id }: { id: string }) {
   const query = useApplication(id);
@@ -644,15 +762,16 @@ function ApplicationDetailPanel({ id }: { id: string }) {
 function ApplicationDetailBody({ detail }: { detail: ApplicationDetail }) {
   const { close, open } = useDetails();
   const navigate = useNavigate();
+  const [tab, setTab] = useState("traffic");
   const Icon = detail.kind === "container" ? Boxes : Terminal;
   const domains = useDomains({
     application_id: detail.id,
     sort: "-bytes",
-    limit: 8,
+    limit: LIST_LIMIT,
   });
   return (
     <ScrollArea className="min-h-0 min-w-0 max-w-full flex-1 overflow-hidden">
-      <motion.div {...enter} className="flex w-full min-w-0 max-w-full flex-col gap-5 p-4">
+      <motion.div {...enter} className="flex w-full min-w-0 max-w-full flex-col gap-4 p-4">
         <div className="flex flex-wrap items-center gap-2">
           <span className="inline-flex items-center gap-1.5 rounded-md border border-border/60 px-2 py-0.5 text-2xs text-muted-foreground">
             <Icon className="size-3" />
@@ -669,126 +788,139 @@ function ApplicationDetailBody({ detail }: { detail: ApplicationDetail }) {
           ]}
         />
 
-        <EntityTrend kind="application" target={detail.id} />
+        <DetailTabs tabs={APPLICATION_TABS} value={tab} onChange={setTab} />
 
-        <PanelSection title="Identity" subtitle="Observed evidence for this Application">
-          <DefList
-            rows={[
-              {
-                label: "Key",
-                value: (
-                  <span className="font-mono text-xs" title={detail.id}>
-                    {detail.id}
-                  </span>
-                ),
-              },
-              {
-                label: "Executable",
-                value: detail.exe ? <span className="font-mono text-xs">{detail.exe}</span> : "—",
-              },
-              { label: "Process name", value: detail.comm ?? "—" },
-              { label: "UID", value: detail.uid !== null ? String(detail.uid) : "—" },
-              ...(detail.container_id
-                ? [
-                    {
-                      label: "Container",
-                      value: <span className="font-mono text-xs">{detail.container_id}</span>,
-                    },
-                  ]
-                : []),
-            ]}
-          />
-          <p className="text-2xs text-muted-foreground">
-            Attribution comes from observed socket ownership; the executable path is best-effort
-            and a process that exited before resolution keeps its captured name.
-          </p>
-        </PanelSection>
+        <motion.div key={tab} {...enter} className="flex flex-col gap-4">
+          {tab === "traffic" && <EntityTrend kind="application" target={detail.id} />}
 
-        <PanelSection
-          title="Destinations"
-          subtitle="Peer addresses this Application talked to, by traffic"
-        >
-          {detail.destinations.length ? (
-            <ul className="flex flex-col">
-              {detail.destinations.map((destination) => (
-                <li key={destination.address}>
-                  <button
-                    type="button"
-                    onClick={() => open({ kind: "endpoint", address: destination.address })}
-                    className="flex w-full items-center gap-2 rounded-md px-1 py-2 text-left transition-colors hover:bg-accent"
-                  >
-                    <span className="flex min-w-0 flex-1 flex-col">
-                      <span className="truncate font-mono text-xs font-medium">
-                        {destination.address}
-                      </span>
-                      <span className="truncate text-2xs text-muted-foreground">
-                        {destination.country ? (
-                          <CountryLabel country={destination.country} />
-                        ) : (
-                          (destination.organization ?? "Not enriched")
-                        )}
-                        {destination.domains.length
-                          ? ` · ${destination.domains
-                              .slice(0, 3)
-                              .map((domain) => domain.domain)
-                              .join(" · ")}${destination.domains.length > 3 ? ` +${destination.domains.length - 3}` : ""}`
-                          : " · No domain evidence"}
-                      </span>
-                    </span>
-                    <span className="shrink-0 text-2xs tabular-nums text-muted-foreground">
-                      ↓{formatBytes(destination.traffic.inbound.bytes)} ↑
-                      {formatBytes(destination.traffic.outbound.bytes)}
-                    </span>
-                    <ChevronRight className="size-3.5 shrink-0 text-muted-foreground" />
-                  </button>
-                </li>
-              ))}
-            </ul>
-          ) : (
-            <p className="text-xs text-muted-foreground">
-              No destination was observed for this Application yet.
-            </p>
+          {tab === "destinations" && (
+            <TabSection caption="Peer addresses this Application talked to, by traffic">
+              {detail.destinations.length ? (
+                <>
+                  <ul className="flex flex-col">
+                    {detail.destinations.slice(0, LIST_LIMIT).map((destination) => (
+                      <li key={destination.address}>
+                        <button
+                          type="button"
+                          onClick={() => open({ kind: "endpoint", address: destination.address })}
+                          className="flex w-full items-center gap-2 rounded-md px-1 py-2 text-left transition-colors hover:bg-accent"
+                        >
+                          <span className="flex min-w-0 flex-1 flex-col">
+                            <span className="truncate font-mono text-xs font-medium">
+                              {destination.address}
+                            </span>
+                            <span className="truncate text-2xs text-muted-foreground">
+                              {destination.country ? (
+                                <CountryLabel country={destination.country} />
+                              ) : (
+                                (destination.organization ?? "Not enriched")
+                              )}
+                              {destination.domains.length
+                                ? ` · ${destination.domains
+                                    .slice(0, 3)
+                                    .map((domain) => domain.domain)
+                                    .join(" · ")}${destination.domains.length > 3 ? ` +${destination.domains.length - 3}` : ""}`
+                                : " · No domain evidence"}
+                            </span>
+                          </span>
+                          <span className="shrink-0 text-2xs tabular-nums text-muted-foreground">
+                            ↓{formatBytes(destination.traffic.inbound.bytes)} ↑
+                            {formatBytes(destination.traffic.outbound.bytes)}
+                          </span>
+                          <ChevronRight className="size-3.5 shrink-0 text-muted-foreground" />
+                        </button>
+                      </li>
+                    ))}
+                  </ul>
+                  <TruncationNote
+                    shown={Math.min(LIST_LIMIT, detail.destinations.length)}
+                    total={detail.destinations.length}
+                  />
+                </>
+              ) : (
+                <p className="text-xs text-muted-foreground">
+                  No destination was observed for this Application yet.
+                </p>
+              )}
+            </TabSection>
           )}
-        </PanelSection>
 
-        <PanelSection title="Domains" subtitle="Names contacted by this Application, by traffic">
-          {domains.data?.items.length ? (
-            <ul className="flex flex-col">
-              {domains.data.items.map((summary) => (
-                <li key={summary.domain}>
-                  <button
-                    type="button"
-                    onClick={() => open({ kind: "domain", name: summary.domain })}
-                    className="flex w-full items-center gap-2 rounded-md px-1 py-2 text-left transition-colors hover:bg-accent"
-                  >
-                    <span className="min-w-0 flex-1 truncate text-xs font-medium">
-                      {summary.domain}
-                    </span>
-                    <span className="flex shrink-0 items-center gap-1">
-                      {summary.evidence.map((evidence) => (
-                        <EvidenceChip
-                          key={evidence}
-                          evidence={evidence}
-                          confidence={evidence === "dns" ? "inferred" : "direct"}
-                        />
-                      ))}
-                    </span>
-                    <span className="shrink-0 text-2xs tabular-nums text-muted-foreground">
-                      ↑{formatBytes(summary.traffic.outbound.bytes)}
-                    </span>
-                    <ChevronRight className="size-3.5 shrink-0 text-muted-foreground" />
-                  </button>
-                </li>
-              ))}
-            </ul>
-          ) : domains.isLoading ? (
-            <Skeleton className="h-16 w-full" />
-          ) : (
-            <p className="text-xs text-muted-foreground">
-              No Associated Domain was observed for this Application yet.
-            </p>
+          {tab === "domains" && (
+            <TabSection caption="Names contacted by this Application, by traffic">
+              {domains.data?.items.length ? (
+                <ul className="flex flex-col">
+                  {domains.data.items.map((summary) => (
+                    <li key={summary.domain}>
+                      <button
+                        type="button"
+                        onClick={() => open({ kind: "domain", name: summary.domain })}
+                        className="flex w-full items-center gap-2 rounded-md px-1 py-2 text-left transition-colors hover:bg-accent"
+                      >
+                        <span className="min-w-0 flex-1 truncate text-xs font-medium">
+                          {summary.domain}
+                        </span>
+                        <span className="flex shrink-0 items-center gap-1">
+                          {summary.evidence.map((evidence) => (
+                            <EvidenceChip
+                              key={evidence}
+                              evidence={evidence}
+                              confidence={evidence === "dns" ? "inferred" : "direct"}
+                            />
+                          ))}
+                        </span>
+                        <span className="shrink-0 text-2xs tabular-nums text-muted-foreground">
+                          ↑{formatBytes(summary.traffic.outbound.bytes)}
+                        </span>
+                        <ChevronRight className="size-3.5 shrink-0 text-muted-foreground" />
+                      </button>
+                    </li>
+                  ))}
+                </ul>
+              ) : domains.isLoading ? (
+                <Skeleton className="h-16 w-full" />
+              ) : (
+                <p className="text-xs text-muted-foreground">
+                  No Associated Domain was observed for this Application yet.
+                </p>
+              )}
+            </TabSection>
           )}
-        </PanelSection>
+
+          {tab === "identity" && (
+            <TabSection caption="Observed evidence for this Application">
+              <DefList
+                rows={[
+                  {
+                    label: "Key",
+                    value: (
+                      <span className="font-mono text-xs" title={detail.id}>
+                        {detail.id}
+                      </span>
+                    ),
+                  },
+                  {
+                    label: "Executable",
+                    value: detail.exe ? <span className="font-mono text-xs">{detail.exe}</span> : "—",
+                  },
+                  { label: "Process name", value: detail.comm ?? "—" },
+                  { label: "UID", value: detail.uid !== null ? String(detail.uid) : "—" },
+                  ...(detail.container_id
+                    ? [
+                        {
+                          label: "Container",
+                          value: <span className="font-mono text-xs">{detail.container_id}</span>,
+                        },
+                      ]
+                    : []),
+                ]}
+              />
+              <p className="text-2xs text-muted-foreground">
+                Attribution comes from observed socket ownership; the executable path is best-effort
+                and a process that exited before resolution keeps its captured name.
+              </p>
+            </TabSection>
+          )}
+        </motion.div>
 
         <Button
           onClick={() => {
