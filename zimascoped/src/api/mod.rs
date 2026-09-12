@@ -23,7 +23,9 @@ mod application;
 mod db;
 
 use std::{
+    collections::HashMap,
     convert::Infallible,
+    net::Ipv4Addr,
     path::Path,
     sync::{Arc, Mutex, MutexGuard},
     time::{Duration, SystemTime},
@@ -45,18 +47,30 @@ use tokio::sync::broadcast;
 use tokio_stream::{Stream, StreamExt, wrappers::BroadcastStream};
 use tower_http::services::{ServeDir, ServeFile};
 
-use zimascope_common::model::{AddressScope, CollectionBatch};
+use zimascope_common::{
+    kernel_abi::{BucketKey, RuleAction, RuleState},
+    model::{AddressScope, CollectionBatch, TrafficCounters},
+};
 
-use crate::{FingerprintLibrary, SharedFingerprints, proxy::ProxyResolver};
+use crate::{
+    FingerprintLibrary, PolicyHandle, SharedFingerprints,
+    policy::{
+        MAX_TRAFFIC_RULES, RuleDirection, RuleMatch, SystemApplicationKeys, TrafficRule,
+        action_from_name, action_name, compile, validate_rule,
+    },
+    proxy::ProxyResolver,
+};
 
 use self::{
-    db::{Db, StreamEvent},
+    db::{Db, StreamEvent, TrafficRuleDraft, TrafficRuleRecord},
     dto::{
         API_VERSION, ApplicationDetailDto, ApplicationSummaryDto, AuditEntryDto, ClearHistoryQuery,
-        CollectorHealthDto, ConnectionDto, CreateExportRequest, DomainDetailDto, DomainSummaryDto,
-        EndpointDetailDto, EndpointSummaryDto, EnrichmentStatusDto, ExportTaskDto, FlowDto,
-        FlowQuery, OverviewDto, Page, ServiceStatusDto, SettingsSummaryDto, StreamQuery, TimeRange,
-        TimelineDto, collector_state_name, unix_millis,
+        CollectorHealthDto, ConnectionDto, CreateExportRequest, CreateTrafficRuleRequest,
+        DomainDetailDto, DomainSummaryDto, EndpointDetailDto, EndpointSummaryDto,
+        EnforcementStatusDto, EnrichmentStatusDto, ExportTaskDto, FlowDto, FlowQuery, OverviewDto,
+        Page, ServiceStatusDto, SettingsSummaryDto, StreamQuery, TimeRange, TimelineDto,
+        TrafficRuleCountersDto, TrafficRuleDto, TrafficRuleMatchDto, TrafficRuleMatchRequest,
+        UpdateTrafficRuleRequest, collector_state_name, unix_millis,
     },
     error::ApiError,
     settings::{Settings, SettingsPatch},
@@ -85,6 +99,21 @@ struct Inner {
     fingerprints: SharedFingerprints,
     fingerprints_path: Option<std::path::PathBuf>,
     proxy: ProxyResolver,
+    policy_handle: Option<PolicyHandle>,
+    policy: PolicyRuntime,
+    application_keys: SystemApplicationKeys,
+    /// Cumulative policy drops since startup, accumulated from the interval
+    /// deltas carried by every collection batch.
+    policy_drops: TrafficCounters,
+}
+
+/// Last known Traffic Rule enforcement state.
+#[derive(Clone, Debug, Default)]
+struct PolicyRuntime {
+    applied_revision: u64,
+    active_rules: usize,
+    unresolved: HashMap<u32, String>,
+    last_error: Option<String>,
 }
 
 impl ApiState {
@@ -122,8 +151,67 @@ impl ApiState {
                 fingerprints: config.fingerprints,
                 fingerprints_path: config.fingerprints_path,
                 proxy,
+                policy_handle: None,
+                policy: PolicyRuntime::default(),
+                application_keys: SystemApplicationKeys::new(),
+                policy_drops: TrafficCounters::default(),
             })),
             events,
+        }
+    }
+
+    /// Attaches the collector control handle so rule changes can be applied.
+    pub fn set_policy_handle(&self, handle: PolicyHandle) {
+        self.lock().policy_handle = Some(handle);
+    }
+
+    /// Compiles the persisted rules and applies them through the collector.
+    ///
+    /// Failures are recorded for `/v1/status`; rules stay persisted either way.
+    pub async fn apply_policy(&self) -> anyhow::Result<crate::policy::ApplySummary> {
+        let (handle, program, unresolved) = {
+            let mut inner = self.lock();
+            let Some(handle) = inner.policy_handle.clone() else {
+                inner.policy.last_error = Some("collector is not running".to_owned());
+                anyhow::bail!("collector is not running");
+            };
+
+            let master = inner.settings.traffic_rules.enabled;
+            let revision = inner.db.rules_revision();
+            let records = inner.db.list_traffic_rules()?;
+            let mut rules = Vec::with_capacity(records.len());
+            let mut unresolved = HashMap::new();
+            for record in records {
+                let mut rule = record.rule;
+                if let Some(reason) = resolve_rule_identity(&inner.db, &mut rule) {
+                    unresolved.insert(rule.id, reason);
+                    continue;
+                }
+                rules.push(rule);
+            }
+
+            let compiled = compile(&rules, &mut inner.application_keys, revision, master)
+                .map_err(|error| anyhow::anyhow!(error))?;
+            for rule in &compiled.unresolved {
+                unresolved.insert(rule.rule_id, rule.reason.clone());
+            }
+            (handle, compiled.policy, unresolved)
+        };
+
+        match handle.apply(program).await {
+            Ok(summary) => {
+                let mut inner = self.lock();
+                inner.policy.applied_revision = summary.revision;
+                inner.policy.active_rules = summary.rules;
+                inner.policy.unresolved = unresolved;
+                inner.policy.last_error = None;
+                Ok(summary)
+            }
+            Err(error) => {
+                let mut inner = self.lock();
+                inner.policy.last_error = Some(format!("{error:#}"));
+                Err(error)
+            }
         }
     }
 
@@ -134,6 +222,14 @@ impl ApiState {
         let event = {
             let mut guard = self.lock();
             let inner = &mut *guard;
+            inner.policy_drops.packets = inner
+                .policy_drops
+                .packets
+                .saturating_add(batch.health.kernel.policy_dropped_packets);
+            inner.policy_drops.bytes = inner
+                .policy_drops
+                .bytes
+                .saturating_add(batch.health.kernel.policy_dropped_bytes);
             inner
                 .db
                 .ingest(batch, &inner.settings, &inner.proxy, publish)
@@ -210,6 +306,21 @@ impl Inner {
                 mapped: proxy.mapped,
                 last_error: proxy.last_error,
             },
+            enforcement: EnforcementStatusDto {
+                enabled: self.settings.traffic_rules.enabled,
+                available: self.policy_handle.is_some(),
+                revision: self.policy.applied_revision,
+                rules_total: self
+                    .db
+                    .list_traffic_rules()
+                    .map(|rules| rules.len())
+                    .unwrap_or(0),
+                rules_active: self.policy.active_rules,
+                rules_unresolved: self.policy.unresolved.len(),
+                dropped_packets: self.policy_drops.packets,
+                dropped_bytes: self.policy_drops.bytes,
+                last_error: self.policy.last_error.clone(),
+            },
             settings: SettingsSummaryDto {
                 enabled: self.settings.enabled,
                 boundary_interfaces: self.settings.boundary.interfaces.clone(),
@@ -284,6 +395,16 @@ fn api_routes(state: ApiState) -> Router {
         .route("/v1/exports", get(list_exports).post(create_export))
         .route("/v1/exports/{id}", get(get_export).delete(delete_export))
         .route("/v1/exports/{id}/content", get(get_export_content))
+        .route(
+            "/v1/traffic-rules",
+            get(list_traffic_rules).post(create_traffic_rule),
+        )
+        .route(
+            "/v1/traffic-rules/{id}",
+            get(get_traffic_rule)
+                .patch(update_traffic_rule)
+                .delete(delete_traffic_rule),
+        )
         .route("/v1/history", delete(clear_history))
         .with_state(state)
 }
@@ -509,25 +630,33 @@ async fn put_settings(
     State(state): State<ApiState>,
     ApiJson(body): ApiJson<Settings>,
 ) -> Result<Json<Settings>, ApiError> {
-    let mut inner = state.lock();
-    let mut settings = body;
-    settings.normalize();
-    settings.validate()?;
-    apply_settings(&mut inner, settings)?;
-    Ok(Json(inner.settings.clone()))
+    let settings = {
+        let mut inner = state.lock();
+        let mut settings = body;
+        settings.normalize();
+        settings.validate()?;
+        apply_settings(&mut inner, settings)?;
+        inner.settings.clone()
+    };
+    let _ = state.apply_policy().await;
+    Ok(Json(settings))
 }
 
 async fn patch_settings(
     State(state): State<ApiState>,
     ApiJson(patch): ApiJson<SettingsPatch>,
 ) -> Result<Json<Settings>, ApiError> {
-    let mut inner = state.lock();
-    let mut settings = inner.settings.clone();
-    patch.apply(&mut settings);
-    settings.normalize();
-    settings.validate()?;
-    apply_settings(&mut inner, settings)?;
-    Ok(Json(inner.settings.clone()))
+    let settings = {
+        let mut inner = state.lock();
+        let mut settings = inner.settings.clone();
+        patch.apply(&mut settings);
+        settings.normalize();
+        settings.validate()?;
+        apply_settings(&mut inner, settings)?;
+        inner.settings.clone()
+    };
+    let _ = state.apply_policy().await;
+    Ok(Json(settings))
 }
 
 fn apply_settings(inner: &mut Inner, settings: Settings) -> Result<(), ApiError> {
@@ -540,6 +669,83 @@ fn apply_settings(inner: &mut Inner, settings: Settings) -> Result<(), ApiError>
     );
     inner.settings = settings;
     Ok(())
+}
+
+impl Inner {
+    /// Derived enforcement state for one rule.
+    fn traffic_rule_state(&self, rule: &TrafficRule) -> (&'static str, Option<String>) {
+        if self.policy_handle.is_none() {
+            return ("unavailable", Some("collector is not running".to_owned()));
+        }
+        if !self.settings.traffic_rules.enabled {
+            return (
+                "bypassed",
+                Some("Traffic Rule enforcement is disabled".to_owned()),
+            );
+        }
+        if !rule.enabled {
+            return ("bypassed", Some("rule is disabled".to_owned()));
+        }
+        if let Some(reason) = self.policy.unresolved.get(&rule.id) {
+            return ("unresolved", Some(reason.clone()));
+        }
+        ("active", None)
+    }
+
+    fn traffic_rule_dto(
+        &self,
+        record: &TrafficRuleRecord,
+        counters: Option<RuleState>,
+    ) -> TrafficRuleDto {
+        let rule = &record.rule;
+        let (state, state_reason) = self.traffic_rule_state(rule);
+        let matcher = match &rule.matcher {
+            RuleMatch::Endpoint { address, port } => TrafficRuleMatchDto {
+                kind: "endpoint",
+                address: Some(address.to_string()),
+                prefix_len: None,
+                port: *port,
+                application_id: None,
+            },
+            RuleMatch::Cidr {
+                address,
+                prefix_len,
+            } => TrafficRuleMatchDto {
+                kind: "cidr",
+                address: Some(address.to_string()),
+                prefix_len: Some(*prefix_len),
+                port: None,
+                application_id: None,
+            },
+            RuleMatch::Application { identity } => TrafficRuleMatchDto {
+                kind: "application",
+                address: None,
+                prefix_len: None,
+                port: None,
+                application_id: Some(identity.clone()),
+            },
+        };
+
+        TrafficRuleDto {
+            id: rule.id,
+            action: action_name(rule.action),
+            direction: rule.direction.as_str(),
+            matcher,
+            rate_bytes_per_s: rule.rate_bytes_per_s,
+            burst_bytes: rule.burst_bytes,
+            enabled: rule.enabled,
+            state,
+            state_reason,
+            created_at: unix_millis(record.created_at),
+            updated_at: unix_millis(record.updated_at),
+            counters: counters.map(|counters| TrafficRuleCountersDto {
+                matched_packets: counters.matched_packets,
+                matched_bytes: counters.matched_bytes,
+                dropped_packets: counters.dropped_packets,
+                dropped_bytes: counters.dropped_bytes,
+            }),
+        }
+    }
 }
 
 /// Returns the active fingerprint library document.
@@ -656,6 +862,297 @@ async fn delete_export(
 ) -> Result<StatusCode, ApiError> {
     state.lock().db.delete_export(&id)?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+// ------------------------------------------------------------ traffic rules
+
+async fn list_traffic_rules(
+    State(state): State<ApiState>,
+) -> Result<Json<Vec<TrafficRuleDto>>, ApiError> {
+    let (records, keys, handle) = {
+        let inner = state.lock();
+        let records = inner.db.list_traffic_rules()?;
+        let keys: Vec<BucketKey> = records
+            .iter()
+            .flat_map(|record| rule_bucket_keys(&record.rule))
+            .collect();
+        (records, keys, inner.policy_handle.clone())
+    };
+
+    let states = match handle {
+        Some(handle) if !keys.is_empty() => handle
+            .rule_states(&keys)
+            .await
+            .unwrap_or_else(|_| vec![None; keys.len()]),
+        _ => Vec::new(),
+    };
+
+    let inner = state.lock();
+    let mut rules = Vec::with_capacity(records.len());
+    let mut position = 0;
+    for record in &records {
+        let key_count = rule_bucket_keys(&record.rule).len();
+        let counters = states.get(position).copied().flatten();
+        position += key_count;
+        rules.push(inner.traffic_rule_dto(record, counters));
+    }
+    Ok(Json(rules))
+}
+
+async fn get_traffic_rule(
+    State(state): State<ApiState>,
+    AxumPath(id): AxumPath<u32>,
+) -> Result<Json<TrafficRuleDto>, ApiError> {
+    let record = state.lock().db.traffic_rule(i64::from(id))?;
+    let counters = rule_counters(&state, &record.rule).await;
+    let inner = state.lock();
+    Ok(Json(inner.traffic_rule_dto(&record, counters)))
+}
+
+async fn create_traffic_rule(
+    State(state): State<ApiState>,
+    ApiJson(request): ApiJson<CreateTrafficRuleRequest>,
+) -> Result<(StatusCode, Json<TrafficRuleDto>), ApiError> {
+    let draft = draft_from_create(&request)?;
+    let record = {
+        let mut inner = state.lock();
+        if inner.db.list_traffic_rules()?.len() >= MAX_TRAFFIC_RULES {
+            return Err(ApiError::conflict(format!(
+                "at most {MAX_TRAFFIC_RULES} Traffic Rules are supported"
+            )));
+        }
+        let record = inner.db.insert_traffic_rule(&draft)?;
+        inner
+            .db
+            .record_operation("traffic_rule.create", "completed");
+        record
+    };
+
+    let _ = state.apply_policy().await;
+    let inner = state.lock();
+    Ok((
+        StatusCode::CREATED,
+        Json(inner.traffic_rule_dto(&record, None)),
+    ))
+}
+
+async fn update_traffic_rule(
+    State(state): State<ApiState>,
+    AxumPath(id): AxumPath<u32>,
+    ApiJson(request): ApiJson<UpdateTrafficRuleRequest>,
+) -> Result<Json<TrafficRuleDto>, ApiError> {
+    let draft = {
+        let inner = state.lock();
+        let record = inner.db.traffic_rule(i64::from(id))?;
+        draft_from_update(&record.rule, &request)?
+    };
+    let record = {
+        let mut inner = state.lock();
+        let record = inner.db.update_traffic_rule(i64::from(id), &draft)?;
+        inner
+            .db
+            .record_operation("traffic_rule.update", "completed");
+        record
+    };
+
+    let _ = state.apply_policy().await;
+    let counters = rule_counters(&state, &record.rule).await;
+    let inner = state.lock();
+    Ok(Json(inner.traffic_rule_dto(&record, counters)))
+}
+
+async fn delete_traffic_rule(
+    State(state): State<ApiState>,
+    AxumPath(id): AxumPath<u32>,
+) -> Result<StatusCode, ApiError> {
+    {
+        let mut inner = state.lock();
+        inner.db.delete_traffic_rule(i64::from(id))?;
+        inner
+            .db
+            .record_operation("traffic_rule.delete", "completed");
+    }
+    let _ = state.apply_policy().await;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn rule_counters(state: &ApiState, rule: &TrafficRule) -> Option<RuleState> {
+    let (handle, keys) = {
+        let inner = state.lock();
+        (inner.policy_handle.clone(), rule_bucket_keys(rule))
+    };
+    let handle = handle?;
+    handle
+        .rule_states(&keys)
+        .await
+        .ok()?
+        .into_iter()
+        .flatten()
+        .next()
+}
+
+fn rule_bucket_keys(rule: &TrafficRule) -> Vec<BucketKey> {
+    rule.direction
+        .directions()
+        .iter()
+        .map(|direction| BucketKey {
+            rule_id: rule.id,
+            direction: *direction as u8,
+            reserved: [0; 3],
+        })
+        .collect()
+}
+
+fn draft_from_create(request: &CreateTrafficRuleRequest) -> Result<TrafficRuleDraft, ApiError> {
+    let action = action_from_name(&request.action)
+        .ok_or_else(|| ApiError::unprocessable(format!("unknown action {:?}", request.action)))?;
+    let direction = RuleDirection::from_name(&request.direction).ok_or_else(|| {
+        ApiError::unprocessable(format!("unknown direction {:?}", request.direction))
+    })?;
+    if action == RuleAction::Block && request.rate_bytes_per_s.is_some() {
+        return Err(ApiError::unprocessable("block rules carry no rate"));
+    }
+    let matcher = matcher_from_request(&request.matcher)?;
+    let rate = request.rate_bytes_per_s.unwrap_or(0);
+    let (rate, burst) = match action {
+        RuleAction::Limit => (rate, rate),
+        RuleAction::Block => (0, 0),
+    };
+    let draft = TrafficRuleDraft {
+        action,
+        direction,
+        matcher,
+        rate_bytes_per_s: rate,
+        burst_bytes: burst,
+        enabled: request.enabled.unwrap_or(true),
+    };
+    validate_draft(&draft)?;
+    Ok(draft)
+}
+
+fn draft_from_update(
+    existing: &TrafficRule,
+    request: &UpdateTrafficRuleRequest,
+) -> Result<TrafficRuleDraft, ApiError> {
+    let action = match &request.action {
+        Some(name) => action_from_name(name)
+            .ok_or_else(|| ApiError::unprocessable(format!("unknown action {name:?}")))?,
+        None => existing.action,
+    };
+    let direction = match &request.direction {
+        Some(name) => RuleDirection::from_name(name)
+            .ok_or_else(|| ApiError::unprocessable(format!("unknown direction {name:?}")))?,
+        None => existing.direction,
+    };
+    let matcher = match &request.matcher {
+        Some(request) => matcher_from_request(request)?,
+        None => existing.matcher.clone(),
+    };
+    if action == RuleAction::Block
+        && existing.action != RuleAction::Block
+        && request.rate_bytes_per_s.is_some()
+    {
+        return Err(ApiError::unprocessable("block rules carry no rate"));
+    }
+    let rate = match action {
+        RuleAction::Limit => request
+            .rate_bytes_per_s
+            .unwrap_or(existing.rate_bytes_per_s),
+        RuleAction::Block => 0,
+    };
+    let draft = TrafficRuleDraft {
+        action,
+        direction,
+        matcher,
+        rate_bytes_per_s: rate,
+        burst_bytes: rate,
+        enabled: request.enabled.unwrap_or(existing.enabled),
+    };
+    validate_draft(&draft)?;
+    Ok(draft)
+}
+
+fn matcher_from_request(request: &TrafficRuleMatchRequest) -> Result<RuleMatch, ApiError> {
+    match request.kind.as_str() {
+        "endpoint" => {
+            let address = request
+                .address
+                .as_deref()
+                .ok_or_else(|| ApiError::unprocessable("endpoint match needs an address"))?;
+            let address = address.parse::<Ipv4Addr>().map_err(|_| {
+                ApiError::unprocessable(format!("invalid endpoint address {address:?}"))
+            })?;
+            Ok(RuleMatch::Endpoint {
+                address,
+                port: request.port,
+            })
+        }
+        "cidr" => {
+            let address = request
+                .address
+                .as_deref()
+                .ok_or_else(|| ApiError::unprocessable("cidr match needs an address"))?;
+            let address = address.parse::<Ipv4Addr>().map_err(|_| {
+                ApiError::unprocessable(format!("invalid CIDR address {address:?}"))
+            })?;
+            let prefix_len = request
+                .prefix_len
+                .ok_or_else(|| ApiError::unprocessable("cidr match needs a prefix_len"))?;
+            Ok(RuleMatch::Cidr {
+                address,
+                prefix_len,
+            })
+        }
+        "application" => {
+            let identity = request
+                .application_id
+                .clone()
+                .filter(|identity| !identity.trim().is_empty())
+                .ok_or_else(|| {
+                    ApiError::unprocessable("application match needs an application_id")
+                })?;
+            Ok(RuleMatch::Application { identity })
+        }
+        other => Err(ApiError::unprocessable(format!(
+            "unknown match kind {other:?}"
+        ))),
+    }
+}
+
+fn validate_draft(draft: &TrafficRuleDraft) -> Result<(), ApiError> {
+    let rule = TrafficRule {
+        id: 0,
+        action: draft.action,
+        direction: draft.direction,
+        matcher: draft.matcher.clone(),
+        rate_bytes_per_s: draft.rate_bytes_per_s,
+        burst_bytes: draft.burst_bytes,
+        enabled: draft.enabled,
+    };
+    validate_rule(&rule).map_err(ApiError::unprocessable)
+}
+
+/// Rewrites a `proc:<exe>` identity to the kernel `comm` recorded for that
+/// Application Identity; returns the reason when no `comm` exists.
+fn resolve_rule_identity(db: &Db, rule: &mut TrafficRule) -> Option<String> {
+    let RuleMatch::Application { identity } = &rule.matcher else {
+        return None;
+    };
+    let Some(executable) = identity.strip_prefix("proc:") else {
+        return None;
+    };
+    if executable.starts_with("comm:") {
+        return None;
+    }
+    match db.application_comm(identity) {
+        Some(comm) => {
+            rule.matcher = RuleMatch::Application {
+                identity: format!("proc:comm:{comm}"),
+            };
+            None
+        }
+        None => Some(format!("no stored process name for {identity}")),
+    }
 }
 
 async fn clear_history(
@@ -2408,5 +2905,250 @@ mod tests {
         assert_problem(&response, StatusCode::NOT_FOUND);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn traffic_rules_crud_and_status() {
+        let state = state();
+
+        let response = call(
+            &state,
+            json_request(
+                Method::POST,
+                "/v1/traffic-rules",
+                serde_json::json!({
+                    "action": "limit",
+                    "direction": "outbound",
+                    "match": { "kind": "endpoint", "address": "203.0.113.9", "port": 443 },
+                    "rate_bytes_per_s": 12_500_000
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let body = body_json(response).await;
+        assert_eq!(body["id"], 1);
+        assert_eq!(body["action"], "limit");
+        assert_eq!(body["direction"], "outbound");
+        assert_eq!(body["match"]["kind"], "endpoint");
+        assert_eq!(body["match"]["address"], "203.0.113.9");
+        assert_eq!(body["match"]["port"], 443);
+        assert_eq!(body["rate_bytes_per_s"], 12_500_000);
+        assert_eq!(body["burst_bytes"], 12_500_000);
+        assert_eq!(body["enabled"], true);
+        assert_eq!(body["state"], "unavailable");
+        assert!(body["counters"].is_null());
+
+        let body = body_json(call(&state, get("/v1/traffic-rules")).await).await;
+        assert_eq!(body.as_array().expect("rules").len(), 1);
+
+        let response = call(
+            &state,
+            json_request(
+                Method::PATCH,
+                "/v1/traffic-rules/1",
+                serde_json::json!({ "enabled": false }),
+            ),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_json(response).await;
+        assert_eq!(body["enabled"], false);
+        // No collector handle is attached in this test, so every rule is
+        // reported as unavailable rather than pretending to be enforced.
+        assert_eq!(body["state"], "unavailable");
+
+        let response = call(
+            &state,
+            Request::builder()
+                .method(Method::DELETE)
+                .uri("/v1/traffic-rules/1")
+                .body(Body::empty())
+                .expect("valid request"),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        let body = body_json(call(&state, get("/v1/traffic-rules")).await).await;
+        assert_eq!(body.as_array().expect("rules").len(), 0);
+
+        let status = body_json(call(&state, get("/v1/status")).await).await;
+        assert_eq!(status["enforcement"]["enabled"], true);
+        assert_eq!(status["enforcement"]["available"], false);
+        assert_eq!(status["enforcement"]["rules_total"], 0);
+        assert!(
+            status["recent_operations"]
+                .as_array()
+                .expect("operations")
+                .iter()
+                .any(|operation| operation["action"] == "traffic_rule.create")
+        );
+    }
+
+    #[tokio::test]
+    async fn traffic_rule_requests_are_validated() {
+        let state = state();
+        let invalid = [
+            serde_json::json!({
+                "action": "nope",
+                "direction": "outbound",
+                "match": { "kind": "endpoint", "address": "203.0.113.9" },
+                "rate_bytes_per_s": 1_000_000
+            }),
+            serde_json::json!({
+                "action": "limit",
+                "direction": "outbound",
+                "match": { "kind": "endpoint", "address": "203.0.113.9" },
+                "rate_bytes_per_s": 1
+            }),
+            serde_json::json!({
+                "action": "limit",
+                "direction": "outbound",
+                "match": { "kind": "cidr", "address": "192.0.2.0" },
+                "rate_bytes_per_s": 1_000_000
+            }),
+            serde_json::json!({
+                "action": "limit",
+                "direction": "outbound",
+                "match": { "kind": "application", "application_id": "  " },
+                "rate_bytes_per_s": 1_000_000
+            }),
+            serde_json::json!({
+                "action": "block",
+                "direction": "outbound",
+                "match": { "kind": "endpoint", "address": "203.0.113.9" },
+                "rate_bytes_per_s": 1_000_000
+            }),
+            serde_json::json!({
+                "action": "limit",
+                "direction": "sideways",
+                "match": { "kind": "endpoint", "address": "203.0.113.9" },
+                "rate_bytes_per_s": 1_000_000
+            }),
+        ];
+
+        for body in invalid {
+            let response = call(
+                &state,
+                json_request(Method::POST, "/v1/traffic-rules", body),
+            )
+            .await;
+            assert_problem(&response, StatusCode::UNPROCESSABLE_ENTITY);
+        }
+
+        let response = call(&state, get("/v1/traffic-rules/99")).await;
+        assert_problem(&response, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn traffic_rule_limit_conflicts() {
+        let state = state();
+        {
+            let mut inner = state.lock();
+            for index in 0..MAX_TRAFFIC_RULES {
+                inner
+                    .db
+                    .insert_traffic_rule(&TrafficRuleDraft {
+                        action: RuleAction::Block,
+                        direction: RuleDirection::Outbound,
+                        matcher: RuleMatch::Endpoint {
+                            address: Ipv4Addr::new(203, 0, 113, index as u8 + 1),
+                            port: None,
+                        },
+                        rate_bytes_per_s: 0,
+                        burst_bytes: 0,
+                        enabled: true,
+                    })
+                    .expect("seed rule");
+            }
+        }
+
+        let response = call(
+            &state,
+            json_request(
+                Method::POST,
+                "/v1/traffic-rules",
+                serde_json::json!({
+                    "action": "block",
+                    "direction": "outbound",
+                    "match": { "kind": "endpoint", "address": "198.51.100.1" }
+                }),
+            ),
+        )
+        .await;
+        assert_problem(&response, StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn traffic_rules_apply_through_the_policy_handle() {
+        let state = state();
+        let (handle, source) = crate::collector::test_policy_handle();
+        state.set_policy_handle(handle);
+
+        let response = call(
+            &state,
+            json_request(
+                Method::POST,
+                "/v1/traffic-rules",
+                serde_json::json!({
+                    "action": "block",
+                    "direction": "outbound",
+                    "match": { "kind": "endpoint", "address": "203.0.113.9", "port": 443 }
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let body = body_json(response).await;
+        assert_eq!(body["state"], "active");
+        assert!(!source.policy_ops().is_empty());
+
+        let status = body_json(call(&state, get("/v1/status")).await).await;
+        assert_eq!(status["enforcement"]["available"], true);
+        assert_eq!(status["enforcement"]["rules_active"], 1);
+        assert_eq!(status["enforcement"]["revision"], 1);
+        assert!(status["enforcement"]["last_error"].is_null());
+    }
+
+    #[tokio::test]
+    async fn master_switch_bypasses_rules() {
+        let state = state();
+        let (handle, _source) = crate::collector::test_policy_handle();
+        state.set_policy_handle(handle);
+
+        let response = call(
+            &state,
+            json_request(
+                Method::POST,
+                "/v1/traffic-rules",
+                serde_json::json!({
+                    "action": "limit",
+                    "direction": "inbound",
+                    "match": { "kind": "cidr", "address": "192.0.2.0", "prefix_len": 24 },
+                    "rate_bytes_per_s": 1_000_000
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::CREATED);
+
+        let response = call(
+            &state,
+            json_request(
+                Method::PATCH,
+                "/v1/settings",
+                serde_json::json!({ "traffic_rules": { "enabled": false } }),
+            ),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_json(response).await;
+        assert_eq!(body["traffic_rules"]["enabled"], false);
+
+        let body = body_json(call(&state, get("/v1/traffic-rules")).await).await;
+        assert_eq!(body[0]["state"], "bypassed");
+
+        let status = body_json(call(&state, get("/v1/status")).await).await;
+        assert_eq!(status["enforcement"]["enabled"], false);
+        assert_eq!(status["enforcement"]["rules_active"], 1);
     }
 }

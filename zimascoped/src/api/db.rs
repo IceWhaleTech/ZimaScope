@@ -2544,6 +2544,22 @@ impl Db {
         Ok(())
     }
 
+    /// Stored process name for an Application Identity, when one exists.
+    ///
+    /// `proc:<exe>` rules compile to the `comm` the kernel records, so the
+    /// API resolves the executable path through this lookup.
+    pub(crate) fn application_comm(&self, id: &str) -> Option<String> {
+        self.conn
+            .query_row("SELECT comm FROM applications WHERE id = ?1", [id], |row| {
+                row.get::<_, Option<String>>(0)
+            })
+            .optional()
+            .ok()
+            .flatten()
+            .flatten()
+            .filter(|comm| !comm.is_empty())
+    }
+
     pub(crate) fn health(&self) -> Option<&CollectorHealth> {
         self.health.as_ref()
     }

@@ -33,7 +33,8 @@ pub enum RuleDirection {
 }
 
 impl RuleDirection {
-    fn directions(self) -> &'static [Direction] {
+    /// Kernel directions this rule expands into.
+    pub fn directions(self) -> &'static [Direction] {
         match self {
             Self::Inbound => &[Direction::Inbound],
             Self::Outbound => &[Direction::Outbound],

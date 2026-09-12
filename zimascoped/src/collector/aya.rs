@@ -14,8 +14,8 @@ use anyhow::{Context, Result, bail};
 use aya::{
     Ebpf,
     maps::{
-        Array, HashMap as AyaHashMap, IterableMap, LpmTrie, MapData, PerCpuArray, PerCpuHashMap,
-        RingBuf, lpm_trie::Key as LpmKey,
+        Array, HashMap as AyaHashMap, IterableMap, LpmTrie, MapData, MapError, PerCpuArray,
+        PerCpuHashMap, RingBuf, lpm_trie::Key as LpmKey,
     },
     programs::{
         CgroupAttachMode, CgroupSockAddr, Link, ProgramError, SchedClassifier, SockOps,
@@ -51,7 +51,7 @@ const CGROUP_ROOT: &str = "/sys/fs/cgroup";
 
 /// `BPF_F_LOCK` takes the map value's spin lock while copying; the rule state
 /// map requires it for every user-space read and update.
-const BPF_F_LOCK: u64 = 1 << 3;
+const BPF_F_LOCK: u64 = 4;
 
 #[repr(transparent)]
 #[derive(Clone, Copy)]
@@ -327,6 +327,27 @@ impl KernelSource for AyaKernelSource {
             total.domain_events_dropped = total
                 .domain_events_dropped
                 .saturating_add(value.domain_events_dropped);
+            total.service_events_emitted = total
+                .service_events_emitted
+                .saturating_add(value.service_events_emitted);
+            total.service_events_dropped = total
+                .service_events_dropped
+                .saturating_add(value.service_events_dropped);
+            total.owner_events_inserted = total
+                .owner_events_inserted
+                .saturating_add(value.owner_events_inserted);
+            total.owner_events_dropped = total
+                .owner_events_dropped
+                .saturating_add(value.owner_events_dropped);
+            total.policy_dropped_packets = total
+                .policy_dropped_packets
+                .saturating_add(value.policy_dropped_packets);
+            total.policy_dropped_bytes = total
+                .policy_dropped_bytes
+                .saturating_add(value.policy_dropped_bytes);
+            total.policy_missing_state = total
+                .policy_missing_state
+                .saturating_add(value.policy_missing_state);
         }
         Ok(total)
     }
@@ -391,6 +412,18 @@ impl KernelSource for AyaKernelSource {
                 .with_context(|| format!("apply policy operation {operation:?}"))?;
         }
         Ok(())
+    }
+
+    fn read_rule_states(&mut self, keys: &[BucketKey]) -> Result<Vec<Option<RuleState>>> {
+        let mut states = Vec::with_capacity(keys.len());
+        for key in keys {
+            match self.policy.states.get(&PodBucketKey(*key), BPF_F_LOCK) {
+                Ok(value) => states.push(Some(value.0)),
+                Err(MapError::KeyNotFound) => states.push(None),
+                Err(error) => return Err(error).context("read rule state"),
+            }
+        }
+        Ok(states)
     }
 
     fn detach(&mut self) -> Result<()> {

@@ -134,6 +134,11 @@ async fn main() {
         }
     };
 
+    state.set_policy_handle(collector.policy_handle());
+    if let Err(error) = state.apply_policy().await {
+        eprintln!("zimascoped: traffic rule enforcement unavailable: {error:#}");
+    }
+
     loop {
         tokio::select! {
             batch = batches.recv() => match batch {

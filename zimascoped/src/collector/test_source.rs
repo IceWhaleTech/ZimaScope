@@ -285,6 +285,13 @@ impl KernelSource for InMemoryKernelSource {
         Ok(())
     }
 
+    fn read_rule_states(
+        &mut self,
+        keys: &[kernel_abi::BucketKey],
+    ) -> Result<Vec<Option<kernel_abi::RuleState>>> {
+        Ok(vec![None; keys.len()])
+    }
+
     fn detach(&mut self) -> Result<()> {
         self.detach_count.fetch_add(1, Ordering::SeqCst);
         Ok(())

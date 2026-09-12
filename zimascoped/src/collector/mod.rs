@@ -108,6 +108,10 @@ pub(crate) trait KernelSource: Send {
     fn attachment_health(&self) -> Vec<InterfaceHealth>;
     fn application_health(&self) -> ApplicationHealth;
     fn apply_policy(&mut self, operations: &[PolicyOp]) -> Result<()>;
+    fn read_rule_states(
+        &mut self,
+        keys: &[kernel_abi::BucketKey],
+    ) -> Result<Vec<Option<kernel_abi::RuleState>>>;
     fn detach(&mut self) -> Result<()>;
 }
 
@@ -119,6 +123,7 @@ pub struct Collector {
 }
 
 /// Control-plane handle for applying compiled Traffic Rule programs.
+#[derive(Clone)]
 pub struct PolicyHandle {
     commands: mpsc::Sender<PolicyCommand>,
 }
@@ -128,6 +133,10 @@ enum PolicyCommand {
         program: CompiledPolicy,
         reply: oneshot::Sender<Result<ApplySummary, String>>,
     },
+    RuleStates {
+        keys: Vec<kernel_abi::BucketKey>,
+        reply: oneshot::Sender<Result<Vec<Option<kernel_abi::RuleState>>, String>>,
+    },
 }
 
 impl PolicyHandle {
@@ -136,6 +145,25 @@ impl PolicyHandle {
         let (reply, response) = oneshot::channel();
         self.commands
             .send(PolicyCommand::Apply { program, reply })
+            .await
+            .map_err(|_| anyhow::anyhow!("collector worker is not running"))?;
+        response
+            .await
+            .map_err(|_| anyhow::anyhow!("collector worker dropped the policy request"))?
+            .map_err(|error| anyhow::anyhow!(error))
+    }
+
+    /// Reads the kernel counters for the given rule-direction pairs.
+    pub async fn rule_states(
+        &self,
+        keys: &[kernel_abi::BucketKey],
+    ) -> Result<Vec<Option<kernel_abi::RuleState>>> {
+        let (reply, response) = oneshot::channel();
+        self.commands
+            .send(PolicyCommand::RuleStates {
+                keys: keys.to_vec(),
+                reply,
+            })
             .await
             .map_err(|_| anyhow::anyhow!("collector worker is not running"))?;
         response
@@ -174,6 +202,12 @@ impl Collector {
                         Some(PolicyCommand::Apply { program, reply }) => {
                             let result = core
                                 .apply_policy(program)
+                                .map_err(|error| format!("{error:#}"));
+                            let _ = reply.send(result);
+                        }
+                        Some(PolicyCommand::RuleStates { keys, reply }) => {
+                            let result = core
+                                .read_rule_states(&keys)
                                 .map_err(|error| format!("{error:#}"));
                             let _ = reply.send(result);
                         }
@@ -487,6 +521,14 @@ impl CollectorCore {
         })
     }
 
+    /// Reads kernel counters for the requested rule-direction pairs.
+    fn read_rule_states(
+        &mut self,
+        keys: &[kernel_abi::BucketKey],
+    ) -> Result<Vec<Option<kernel_abi::RuleState>>> {
+        self.source.read_rule_states(keys)
+    }
+
     /// Detaches hooks and returns a final health snapshot.
     fn shutdown(mut self) -> Result<CollectorHealth> {
         let interfaces = self.source.attachment_health();
@@ -514,6 +556,21 @@ impl Drop for CollectorCore {
             let _ = self.source.detach();
         }
     }
+}
+
+/// Builds a running worker with an in-memory kernel source for API tests.
+#[cfg(test)]
+pub(crate) fn test_policy_handle() -> (PolicyHandle, test_source::InMemoryHandle) {
+    let source = test_source::InMemoryKernelSource::new();
+    let handle = source.handle();
+    let core = CollectorCore::from_source(CollectorConfig::default(), Box::new(source));
+    let (collector, batches) = Collector::run_worker(core, Duration::from_secs(3_600));
+    let policy = collector.policy_handle();
+    tokio::spawn(async move {
+        let _keep_alive = (collector, batches);
+        std::future::pending::<()>().await;
+    });
+    (policy, handle)
 }
 
 #[cfg(test)]

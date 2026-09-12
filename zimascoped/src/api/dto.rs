@@ -538,6 +538,9 @@ pub struct KernelCountersDto {
     pub service_events_dropped: u64,
     pub owner_events_inserted: u64,
     pub owner_events_dropped: u64,
+    pub policy_dropped_packets: u64,
+    pub policy_dropped_bytes: u64,
+    pub policy_missing_state: u64,
 }
 
 /// Application Identity capture health.
@@ -597,6 +600,9 @@ impl CollectorHealthDto {
                 service_events_dropped: health.kernel.service_events_dropped,
                 owner_events_inserted: health.kernel.owner_events_inserted,
                 owner_events_dropped: health.kernel.owner_events_dropped,
+                policy_dropped_packets: health.kernel.policy_dropped_packets,
+                policy_dropped_bytes: health.kernel.policy_dropped_bytes,
+                policy_missing_state: health.kernel.policy_missing_state,
             },
             gaps: health
                 .gaps
@@ -668,6 +674,93 @@ pub struct ProxyStatusDto {
     pub last_error: Option<String>,
 }
 
+/// Traffic Rule enforcement state for `/v1/status`.
+#[derive(Clone, Debug, Serialize)]
+pub struct EnforcementStatusDto {
+    /// Master switch from settings.
+    pub enabled: bool,
+    /// Whether a collector control handle is attached.
+    pub available: bool,
+    /// Last successfully applied program revision.
+    pub revision: u64,
+    pub rules_total: usize,
+    pub rules_active: usize,
+    pub rules_unresolved: usize,
+    pub dropped_packets: u64,
+    pub dropped_bytes: u64,
+    pub last_error: Option<String>,
+}
+
+/// One Traffic Rule as the API represents it.
+#[derive(Clone, Debug, Serialize)]
+pub struct TrafficRuleDto {
+    pub id: u32,
+    pub action: &'static str,
+    pub direction: &'static str,
+    #[serde(rename = "match")]
+    pub matcher: TrafficRuleMatchDto,
+    pub rate_bytes_per_s: u64,
+    pub burst_bytes: u64,
+    pub enabled: bool,
+    /// `active`, `unresolved`, `bypassed` or `unavailable`.
+    pub state: &'static str,
+    pub state_reason: Option<String>,
+    pub created_at: i64,
+    pub updated_at: i64,
+    pub counters: Option<TrafficRuleCountersDto>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct TrafficRuleMatchDto {
+    pub kind: &'static str,
+    pub address: Option<String>,
+    pub prefix_len: Option<u8>,
+    pub port: Option<u16>,
+    pub application_id: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Serialize)]
+pub struct TrafficRuleCountersDto {
+    pub matched_packets: u64,
+    pub matched_bytes: u64,
+    pub dropped_packets: u64,
+    pub dropped_bytes: u64,
+}
+
+/// Request body for creating a Traffic Rule.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CreateTrafficRuleRequest {
+    pub action: String,
+    pub direction: String,
+    #[serde(rename = "match")]
+    pub matcher: TrafficRuleMatchRequest,
+    pub rate_bytes_per_s: Option<u64>,
+    pub enabled: Option<bool>,
+}
+
+/// Request body for updating a Traffic Rule.
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct UpdateTrafficRuleRequest {
+    pub action: Option<String>,
+    pub direction: Option<String>,
+    #[serde(rename = "match")]
+    pub matcher: Option<TrafficRuleMatchRequest>,
+    pub rate_bytes_per_s: Option<u64>,
+    pub enabled: Option<bool>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TrafficRuleMatchRequest {
+    pub kind: String,
+    pub address: Option<String>,
+    pub prefix_len: Option<u8>,
+    pub port: Option<u16>,
+    pub application_id: Option<String>,
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct ServiceStatusDto {
     pub service: &'static str,
@@ -683,6 +776,7 @@ pub struct ServiceStatusDto {
     pub enrichment: EnrichmentStatusDto,
     pub fingerprints: FingerprintStatusDto,
     pub proxy: ProxyStatusDto,
+    pub enforcement: EnforcementStatusDto,
     pub settings: SettingsSummaryDto,
     pub recent_operations: Vec<AuditEntryDto>,
 }
