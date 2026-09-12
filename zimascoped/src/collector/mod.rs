@@ -28,6 +28,7 @@ use tokio::{
     task::JoinHandle,
     time::{self, MissedTickBehavior},
 };
+use tokio_util::sync::CancellationToken;
 use zimascope_common::{
     kernel_abi,
     model::{ApplicationHealth, CollectionBatch, CollectorHealth, CollectorState, InterfaceHealth},
@@ -117,7 +118,7 @@ pub(crate) trait KernelSource: Send {
 
 /// Handle for the background collection worker.
 pub struct Collector {
-    shutdown: Option<oneshot::Sender<()>>,
+    shutdown: CancellationToken,
     worker: Option<JoinHandle<Result<CollectorHealth>>>,
     policy: mpsc::Sender<PolicyCommand>,
 }
@@ -187,7 +188,8 @@ impl Collector {
 
     fn run_worker(mut core: CollectorCore, collection_interval: Duration) -> (Self, BatchReceiver) {
         let (batch_tx, batch_rx) = mpsc::channel(BATCH_CHANNEL_CAPACITY);
-        let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
+        let shutdown = CancellationToken::new();
+        let worker_shutdown = shutdown.clone();
         let (policy_tx, mut policy_rx) = mpsc::channel(POLICY_CHANNEL_CAPACITY);
         let worker = tokio::spawn(async move {
             let mut ticker = time::interval(collection_interval);
@@ -196,7 +198,7 @@ impl Collector {
             loop {
                 tokio::select! {
                     biased;
-                    _ = &mut shutdown_rx => break,
+                    _ = worker_shutdown.cancelled() => break,
                     command = policy_rx.recv() => match command {
                         Some(PolicyCommand::Apply { program, reply }) => {
                             let result = core
@@ -219,7 +221,7 @@ impl Collector {
 
                 tokio::select! {
                     biased;
-                    _ = &mut shutdown_rx => break,
+                    _ = worker_shutdown.cancelled() => break,
                     result = batch_tx.send(batch) => {
                         if result.is_err() {
                             break;
@@ -233,7 +235,7 @@ impl Collector {
 
         (
             Self {
-                shutdown: Some(shutdown_tx),
+                shutdown,
                 worker: Some(worker),
                 policy: policy_tx,
             },
@@ -250,24 +252,18 @@ impl Collector {
 
     /// Stops collection, detaches hooks and returns the final health snapshot.
     pub async fn shutdown(mut self) -> Result<CollectorHealth> {
-        self.signal_shutdown();
+        self.shutdown.cancel();
         self.worker
             .take()
             .expect("collector worker handle is present")
             .await
             .context("collector worker task failed")?
     }
-
-    fn signal_shutdown(&mut self) {
-        if let Some(shutdown) = self.shutdown.take() {
-            let _ = shutdown.send(());
-        }
-    }
 }
 
 impl Drop for Collector {
     fn drop(&mut self) {
-        self.signal_shutdown();
+        self.shutdown.cancel();
     }
 }
 

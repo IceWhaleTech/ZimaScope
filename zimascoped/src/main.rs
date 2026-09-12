@@ -57,15 +57,15 @@ async fn main() {
         ..ApiConfig::default()
     });
 
-    let mut servers = Vec::new();
+    let mut servers = tokio::task::JoinSet::new();
     match api::bind_unix(&socket_path) {
         Ok(listener) => {
             let state = state.clone();
-            servers.push(tokio::spawn(async move {
+            servers.spawn(async move {
                 if let Err(error) = api::serve_unix(listener, state).await {
                     eprintln!("zimascoped: api server stopped: {error}");
                 }
-            }));
+            });
         }
         Err(error) => eprintln!(
             "zimascoped: cannot serve API on {}: {error}",
@@ -78,11 +78,11 @@ async fn main() {
             Ok(listener) => {
                 let state = state.clone();
                 eprintln!("zimascoped: dev API listening on http://{address}");
-                servers.push(tokio::spawn(async move {
+                servers.spawn(async move {
                     if let Err(error) = axum::serve(listener, api::router(state)).await {
                         eprintln!("zimascoped: dev API server stopped: {error}");
                     }
-                }));
+                });
             }
             Err(error) => eprintln!("zimascoped: cannot serve dev API on {address}: {error}"),
         }
@@ -106,11 +106,11 @@ async fn main() {
                     None => api::router(state.clone()),
                 };
                 eprintln!("zimascoped: http server listening on http://{address}");
-                servers.push(tokio::spawn(async move {
+                servers.spawn(async move {
                     if let Err(error) = axum::serve(listener, router).await {
                         eprintln!("zimascoped: http server stopped: {error}");
                     }
-                }));
+                });
             }
             Err(error) => eprintln!("zimascoped: cannot serve http on {address}: {error}"),
         }
@@ -128,7 +128,7 @@ async fn main() {
             // unavailable instead of crash-looping (PRD 8.1).
             state.set_collector_error(format!("{error:#}"));
             eprintln!("zimascoped: collection unavailable: {error:#}");
-            wait_for_shutdown().await;
+            shutdown_signal().await;
             shutdown_servers(servers, &socket_path);
             return;
         }
@@ -145,12 +145,7 @@ async fn main() {
                 Some(batch) => state.ingest_batch(batch),
                 None => break,
             },
-            result = tokio::signal::ctrl_c() => {
-                if let Err(error) = result {
-                    eprintln!("zimascoped: wait for shutdown signal: {error}");
-                }
-                break;
-            }
+            () = shutdown_signal() => break,
         }
     }
 
@@ -179,15 +174,13 @@ fn env_address(name: &str) -> Option<SocketAddr> {
     }
 }
 
-async fn wait_for_shutdown() {
+async fn shutdown_signal() {
     if let Err(error) = tokio::signal::ctrl_c().await {
         eprintln!("zimascoped: wait for shutdown signal: {error}");
     }
 }
 
-fn shutdown_servers(servers: Vec<tokio::task::JoinHandle<()>>, socket_path: &std::path::Path) {
-    for server in servers {
-        server.abort();
-    }
+fn shutdown_servers(mut servers: tokio::task::JoinSet<()>, socket_path: &std::path::Path) {
+    servers.abort_all();
     let _ = std::fs::remove_file(socket_path);
 }

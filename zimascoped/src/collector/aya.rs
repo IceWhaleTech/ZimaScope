@@ -53,82 +53,51 @@ const CGROUP_ROOT: &str = "/sys/fs/cgroup";
 /// map requires it for every user-space read and update.
 const BPF_F_LOCK: u64 = 4;
 
-#[repr(transparent)]
-#[derive(Clone, Copy)]
-struct PodFlowKey(FlowKey);
+/// Declares a `#[repr(transparent)]` newtype that makes a `zimascope-common`
+/// ABI type usable as an aya map key or value.
+///
+/// Safety: every wrapped type is `#[repr(C)]` with its size and alignment
+/// asserted in `kernel_abi`; the transparent wrapper inherits that layout.
+macro_rules! pod_newtype {
+    ($($name:ident($inner:ty)),+ $(,)?) => {
+        $(
+            #[repr(transparent)]
+            #[derive(Clone, Copy)]
+            struct $name($inner);
 
-// Safety: `#[repr(transparent)]` over a `#[repr(C)]` POD type with no padding.
-unsafe impl aya::Pod for PodFlowKey {}
+            // Safety: `#[repr(transparent)]` over a `#[repr(C)]` POD type
+            // with no padding.
+            unsafe impl aya::Pod for $name {}
+        )+
+    };
+}
 
-#[repr(transparent)]
-#[derive(Clone, Copy)]
-struct PodFlowValue(FlowValue);
+pod_newtype! {
+    PodFlowKey(FlowKey),
+    PodFlowValue(FlowValue),
+    PodKernelStats(KernelStats),
+    PodAbiMetadata(AbiMetadata),
+    PodOwnerKey(OwnerKey),
+    PodOwnerValue(OwnerValue),
+    PodPolicyConfig(PolicyConfig),
+    PodBucketKey(BucketKey),
+    PodRuleState(RuleState),
+    PodRuleRef(RuleRef),
+    PodEndpointMatchKey(EndpointMatchKey),
+}
 
-// Safety: `#[repr(transparent)]` over a `#[repr(C)]` POD type with no padding.
-unsafe impl aya::Pod for PodFlowValue {}
-
-#[repr(transparent)]
-#[derive(Clone, Copy)]
-struct PodKernelStats(KernelStats);
-
-// Safety: `#[repr(transparent)]` over a `#[repr(C)]` POD type with no padding.
-unsafe impl aya::Pod for PodKernelStats {}
-
-#[repr(transparent)]
-#[derive(Clone, Copy)]
-struct PodAbiMetadata(AbiMetadata);
-
-// Safety: `#[repr(transparent)]` over a `#[repr(C)]` POD type with no padding.
-unsafe impl aya::Pod for PodAbiMetadata {}
-
-#[repr(transparent)]
-#[derive(Clone, Copy)]
-struct PodOwnerKey(OwnerKey);
-
-// Safety: `#[repr(transparent)]` over a `#[repr(C)]` POD type with no padding.
-unsafe impl aya::Pod for PodOwnerKey {}
-
-#[repr(transparent)]
-#[derive(Clone, Copy)]
-struct PodOwnerValue(OwnerValue);
-
-// Safety: `#[repr(transparent)]` over a `#[repr(C)]` POD type with no padding.
-unsafe impl aya::Pod for PodOwnerValue {}
-
-#[repr(transparent)]
-#[derive(Clone, Copy)]
-struct PodPolicyConfig(PolicyConfig);
-
-// Safety: `#[repr(transparent)]` over a `#[repr(C)]` POD type with no padding.
-unsafe impl aya::Pod for PodPolicyConfig {}
-
-#[repr(transparent)]
-#[derive(Clone, Copy)]
-struct PodBucketKey(BucketKey);
-
-// Safety: `#[repr(transparent)]` over a `#[repr(C)]` POD type with no padding.
-unsafe impl aya::Pod for PodBucketKey {}
-
-#[repr(transparent)]
-#[derive(Clone, Copy)]
-struct PodRuleState(RuleState);
-
-// Safety: `#[repr(transparent)]` over a `#[repr(C)]` POD type with no padding.
-unsafe impl aya::Pod for PodRuleState {}
-
-#[repr(transparent)]
-#[derive(Clone, Copy)]
-struct PodRuleRef(RuleRef);
-
-// Safety: `#[repr(transparent)]` over a `#[repr(C)]` POD type with no padding.
-unsafe impl aya::Pod for PodRuleRef {}
-
-#[repr(transparent)]
-#[derive(Clone, Copy)]
-struct PodEndpointMatchKey(EndpointMatchKey);
-
-// Safety: `#[repr(transparent)]` over a `#[repr(C)]` POD type with no padding.
-unsafe impl aya::Pod for PodEndpointMatchKey {}
+/// Reads one fixed-size sample from a ring-buffer slot.
+///
+/// Returns `None` when the slot is shorter than the sample. The bytes come
+/// from ZimaScope's own eBPF maps, so the sample's bit patterns are trusted.
+fn sample_from_ring<T: Copy>(bytes: &[u8]) -> Option<T> {
+    if bytes.len() < core::mem::size_of::<T>() {
+        return None;
+    }
+    // Safety: the length is checked above and `read_unaligned` tolerates any
+    // alignment.
+    Some(unsafe { ptr::read_unaligned(bytes.as_ptr().cast::<T>()) })
+}
 
 /// A policy map for each direction, so direction dispatch happens in one
 /// place instead of once per map kind.
@@ -299,24 +268,18 @@ impl KernelSource for AyaKernelSource {
 
     fn drain_domain_events(&mut self, visitor: &mut dyn FnMut(&DomainSample)) -> Result<()> {
         while let Some(item) = self.domains.next() {
-            let bytes: &[u8] = &item;
-            if bytes.len() < core::mem::size_of::<DomainSample>() {
-                continue;
+            if let Some(sample) = sample_from_ring::<DomainSample>(&item) {
+                visitor(&sample);
             }
-            let sample = unsafe { ptr::read_unaligned(bytes.as_ptr().cast::<DomainSample>()) };
-            visitor(&sample);
         }
         Ok(())
     }
 
     fn drain_service_events(&mut self, visitor: &mut dyn FnMut(&ServiceSample)) -> Result<()> {
         while let Some(item) = self.services.next() {
-            let bytes: &[u8] = &item;
-            if bytes.len() < core::mem::size_of::<ServiceSample>() {
-                continue;
+            if let Some(sample) = sample_from_ring::<ServiceSample>(&item) {
+                visitor(&sample);
             }
-            let sample = unsafe { ptr::read_unaligned(bytes.as_ptr().cast::<ServiceSample>()) };
-            visitor(&sample);
         }
         Ok(())
     }

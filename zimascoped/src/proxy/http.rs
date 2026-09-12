@@ -42,35 +42,46 @@ pub(super) fn fetch_body(target: &Target) -> Result<Vec<u8>, String> {
         .read_to_end(&mut raw)
         .map_err(|error| format!("read response: {error}"))?;
 
-    let (head, body) = split_response(&raw)?;
-    let status = head.lines().next().unwrap_or_default();
-    if !status.contains(" 200") {
-        if status.contains(" 401") {
+    let (status, chunked, body) = parse_response(&raw)?;
+    if status != 200 {
+        if status == 401 {
             return Err("controller rejected the secret (401 Unauthorized)".to_owned());
         }
-        return Err(format!("controller returned {status}"));
+        let status_line = raw.split(|byte| *byte == b'\n').next().unwrap_or_default();
+        let status_line = String::from_utf8_lossy(status_line);
+        return Err(format!("controller returned {}", status_line.trim_end()));
     }
-    decode_body(&head, body)
+    decode_body(chunked, body)
 }
 
-/// Splits an HTTP response into head text and body bytes; the body starts
-/// after the `\r\n\r\n` terminator, not at it.
-fn split_response(raw: &[u8]) -> Result<(String, &[u8]), String> {
-    let separator = raw
-        .windows(4)
-        .position(|window| window == b"\r\n\r\n")
-        .ok_or_else(|| "malformed HTTP response".to_owned())?;
-    let head = String::from_utf8_lossy(&raw[..separator]).into_owned();
-    Ok((head, &raw[separator + 4..]))
+/// Parses the response head with `httparse`, returning the status code, whether
+/// the body is chunked and the body bytes.
+fn parse_response(raw: &[u8]) -> Result<(u16, bool, &[u8]), String> {
+    let mut headers = [httparse::EMPTY_HEADER; 32];
+    let mut response = httparse::Response::new(&mut headers);
+    let head_len = match response.parse(raw) {
+        Ok(httparse::Status::Complete(length)) => length,
+        Ok(httparse::Status::Partial) => {
+            return Err("malformed HTTP response: incomplete head".to_owned());
+        }
+        Err(error) => return Err(format!("malformed HTTP response: {error}")),
+    };
+    let status = response
+        .code
+        .ok_or_else(|| "malformed HTTP response: no status code".to_owned())?;
+    let chunked = response.headers.iter().any(|header| {
+        header.name.eq_ignore_ascii_case("transfer-encoding")
+            && header
+                .value
+                .split(|byte| *byte == b',')
+                .any(|token| token.trim_ascii().eq_ignore_ascii_case(b"chunked"))
+    });
+    Ok((status, chunked, &raw[head_len..]))
 }
 
 /// Decodes `Transfer-Encoding: chunked` bodies; the controller uses chunked
 /// framing even for single JSON documents.
-fn decode_body(head: &str, body: &[u8]) -> Result<Vec<u8>, String> {
-    let chunked = head.lines().any(|line| {
-        let lower = line.to_ascii_lowercase();
-        lower.starts_with("transfer-encoding:") && lower.contains("chunked")
-    });
+fn decode_body(chunked: bool, body: &[u8]) -> Result<Vec<u8>, String> {
     if !chunked {
         return Ok(body.to_vec());
     }
@@ -126,43 +137,60 @@ mod tests {
     #[test]
     fn decodes_chunked_body() {
         let body = b"18\r\n{\"connections\":[],\"a\":1}\r\n0\r\n\r\n";
-        let head = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked";
         assert_eq!(
-            decode_body(head, body).expect("decode"),
+            decode_body(true, body).expect("decode"),
             b"{\"connections\":[],\"a\":1}"
         );
     }
 
     #[test]
-    fn splits_headers_from_chunked_body() {
+    fn parses_status_headers_and_chunked_body() {
         let raw = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n12\r\n{\"connections\":[]}\r\n0\r\n\r\n";
-        let (head, body) = split_response(raw).expect("split");
-        assert_eq!(head.lines().next(), Some("HTTP/1.1 200 OK"));
+        let (status, chunked, body) = parse_response(raw).expect("parse");
+        assert_eq!(status, 200);
+        assert!(chunked);
         assert_eq!(
-            decode_body(&head, body).expect("decode"),
+            decode_body(chunked, body).expect("decode"),
             b"{\"connections\":[]}"
         );
     }
 
     #[test]
+    fn detects_chunked_case_insensitively() {
+        let raw = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip, Chunked\r\n\r\n";
+        let (_, chunked, _) = parse_response(raw).expect("parse");
+        assert!(chunked);
+    }
+
+    #[test]
+    fn reports_non_success_status() {
+        let raw = b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n";
+        let (status, chunked, _) = parse_response(raw).expect("parse");
+        assert_eq!(status, 404);
+        assert!(!chunked);
+    }
+
+    #[test]
+    fn rejects_a_truncated_head() {
+        assert!(parse_response(b"HTTP/1.1 200 OK\r\n").is_err());
+    }
+
+    #[test]
     fn decodes_split_chunks() {
         let body = b"5\r\n{\"a\":\r\n5\r\n1234}\r\n0\r\n\r\n";
-        let head = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked";
-        assert_eq!(decode_body(head, body).expect("decode"), b"{\"a\":1234}");
+        assert_eq!(decode_body(true, body).expect("decode"), b"{\"a\":1234}");
     }
 
     #[test]
     fn passes_through_plain_body() {
         let body = b"{\"connections\":[]}";
-        let head = "HTTP/1.1 200 OK\r\nContent-Length: 18";
-        assert_eq!(decode_body(head, body).expect("decode"), body);
+        assert_eq!(decode_body(false, body).expect("decode"), body);
     }
 
     #[test]
     fn rejects_truncated_chunks() {
         let body = b"20\r\nshort\r\n0\r\n\r\n";
-        let head = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked";
-        assert!(decode_body(head, body).is_err());
+        assert!(decode_body(true, body).is_err());
     }
 
     #[test]

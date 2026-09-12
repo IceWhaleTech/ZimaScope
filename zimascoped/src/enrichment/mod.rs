@@ -5,12 +5,10 @@
 
 pub(crate) mod database;
 
-use std::{
-    collections::VecDeque, net::IpAddr, num::NonZeroUsize, path::Path, sync::Arc, time::SystemTime,
-};
+use std::{net::IpAddr, num::NonZeroUsize, path::Path, sync::Arc, time::SystemTime};
 
 use anyhow::{Context, Result};
-use hashbrown::HashMap;
+use hashlink::LinkedHashMap;
 use zimascope_common::model::{AddressScope, IpProfile};
 
 pub(crate) use database::GeoIpDatabase;
@@ -38,8 +36,7 @@ pub struct EnrichmentStats {
 pub struct Enricher {
     database: Option<GeoIpDatabase>,
     database_loaded_at: Option<SystemTime>,
-    cache: HashMap<IpAddr, Arc<IpProfile>>,
-    insertion_order: VecDeque<IpAddr>,
+    cache: LinkedHashMap<IpAddr, Arc<IpProfile>>,
     cache_capacity: NonZeroUsize,
     stats: EnrichmentStats,
 }
@@ -49,8 +46,7 @@ impl Enricher {
         Self {
             database: None,
             database_loaded_at: None,
-            cache: HashMap::new(),
-            insertion_order: VecDeque::new(),
+            cache: LinkedHashMap::new(),
             cache_capacity,
             stats: EnrichmentStats::default(),
         }
@@ -68,7 +64,6 @@ impl Enricher {
         self.database_loaded_at = Some(SystemTime::now());
         self.database = Some(database);
         self.cache.clear();
-        self.insertion_order.clear();
     }
 
     pub fn database(&self) -> Option<&GeoIpDatabase> {
@@ -150,12 +145,9 @@ impl Enricher {
 
     fn insert_cache(&mut self, address: IpAddr, profile: Arc<IpProfile>) {
         if self.cache.len() >= self.cache_capacity.get() {
-            if let Some(oldest) = self.insertion_order.pop_front() {
-                self.cache.remove(&oldest);
-            }
+            self.cache.pop_front();
         }
         self.cache.insert(address, profile);
-        self.insertion_order.push_back(address);
     }
 }
 

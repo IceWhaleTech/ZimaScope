@@ -3776,20 +3776,16 @@ fn csv_field(value: &str) -> String {
 }
 
 fn encode_uri_component(value: &str) -> String {
-    use std::fmt::Write as _;
+    use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
 
-    let mut output = String::with_capacity(value.len());
-    for byte in value.bytes() {
-        match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                output.push(byte as char);
-            }
-            _ => {
-                let _ = write!(output, "%{byte:02X}");
-            }
-        }
-    }
-    output
+    /// Everything except the RFC 3986 unreserved characters.
+    const URI_COMPONENT: &AsciiSet = &NON_ALPHANUMERIC
+        .remove(b'-')
+        .remove(b'_')
+        .remove(b'.')
+        .remove(b'~');
+
+    utf8_percent_encode(value, URI_COMPONENT).to_string()
 }
 
 #[cfg(test)]
@@ -3929,5 +3925,18 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(path.with_extension("db-wal"));
         let _ = std::fs::remove_file(path.with_extension("db-shm"));
+    }
+
+    #[test]
+    fn uri_encoding_keeps_only_unreserved_characters() {
+        assert_eq!(encode_uri_component("a-b_c.d~e"), "a-b_c.d~e");
+        assert_eq!(
+            encode_uri_component("a b/c?d=e&f#g"),
+            "a%20b%2Fc%3Fd%3De%26f%23g"
+        );
+        assert_eq!(
+            encode_uri_component("Bücher.example"),
+            "B%C3%BCcher.example"
+        );
     }
 }
