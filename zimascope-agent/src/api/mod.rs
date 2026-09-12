@@ -19,6 +19,7 @@ pub mod dto;
 mod error;
 mod settings;
 
+mod application;
 mod db;
 
 use std::{
@@ -38,10 +39,11 @@ use axum::{
         IntoResponse, Response,
         sse::{Event, KeepAlive, Sse},
     },
-    routing::{delete, get},
+    routing::{any, delete, get},
 };
 use tokio::sync::broadcast;
 use tokio_stream::{Stream, StreamExt, wrappers::BroadcastStream};
+use tower_http::services::{ServeDir, ServeFile};
 
 use zimascope_common::model::{AddressScope, CollectionBatch};
 
@@ -50,11 +52,11 @@ use crate::{FingerprintLibrary, SharedFingerprints, proxy::ProxyResolver};
 use self::{
     db::{Db, StreamEvent},
     dto::{
-        API_VERSION, AuditEntryDto, ClearHistoryQuery, CollectorHealthDto, ConnectionDto,
-        CreateExportRequest, DomainDetailDto, DomainSummaryDto, EndpointDetailDto,
-        EndpointSummaryDto, EnrichmentStatusDto, ExportTaskDto, FlowDto, FlowQuery, OverviewDto,
-        Page, ServiceStatusDto, SettingsSummaryDto, StreamQuery, TimeRange, TimelineDto,
-        collector_state_name, unix_millis,
+        API_VERSION, ApplicationDetailDto, ApplicationSummaryDto, AuditEntryDto, ClearHistoryQuery,
+        CollectorHealthDto, ConnectionDto, CreateExportRequest, DomainDetailDto, DomainSummaryDto,
+        EndpointDetailDto, EndpointSummaryDto, EnrichmentStatusDto, ExportTaskDto, FlowDto,
+        FlowQuery, OverviewDto, Page, ServiceStatusDto, SettingsSummaryDto, StreamQuery, TimeRange,
+        TimelineDto, collector_state_name, unix_millis,
     },
     error::ApiError,
     settings::{Settings, SettingsPatch},
@@ -225,8 +227,28 @@ impl Inner {
     }
 }
 
-/// Builds the complete `/v1` router.
+/// Builds the complete `/v1` router (API only).
 pub fn router(state: ApiState) -> Router {
+    api_routes(state)
+        .fallback(not_found)
+        .method_not_allowed_fallback(method_not_allowed)
+}
+
+/// Builds the production router: the `/v1` API plus the built frontend served
+/// from `ui_dir` on the same port. Unknown `/v1` paths still answer with RFC
+/// 9457 problem details; every other path falls back to `index.html` so the
+/// hash-routed SPA boots from any URL.
+pub fn router_with_ui(state: ApiState, ui_dir: &Path) -> Router {
+    let index = ui_dir.join("index.html");
+    api_routes(state)
+        .route("/v1/{*path}", any(not_found))
+        .fallback_service(ServeDir::new(ui_dir).not_found_service(ServeFile::new(index)))
+        .method_not_allowed_fallback(method_not_allowed)
+}
+
+/// All API routes, in one place so the dev and production routers stay in
+/// sync.
+fn api_routes(state: ApiState) -> Router {
     Router::new()
         .route("/v1/status", get(status))
         .route("/v1/overview", get(overview))
@@ -240,6 +262,12 @@ pub fn router(state: ApiState) -> Router {
         .route("/v1/domains", get(list_domains))
         .route("/v1/domains/{domain}", get(get_domain))
         .route("/v1/domains/{domain}/timeline", get(get_domain_timeline))
+        .route("/v1/applications", get(list_applications))
+        .route("/v1/applications/{id}", get(get_application))
+        .route(
+            "/v1/applications/{id}/timeline",
+            get(get_application_timeline),
+        )
         .route(
             "/v1/settings",
             get(get_settings).put(put_settings).patch(patch_settings),
@@ -254,8 +282,6 @@ pub fn router(state: ApiState) -> Router {
         .route("/v1/exports/{id}", get(get_export).delete(delete_export))
         .route("/v1/exports/{id}/content", get(get_export_content))
         .route("/v1/history", delete(clear_history))
-        .fallback(not_found)
-        .method_not_allowed_fallback(method_not_allowed)
         .with_state(state)
 }
 
@@ -444,6 +470,33 @@ async fn get_domain(
     AxumPath(domain): AxumPath<String>,
 ) -> Result<Json<DomainDetailDto>, ApiError> {
     state.lock().db.get_domain(&domain).map(Json)
+}
+
+async fn list_applications(
+    State(state): State<ApiState>,
+    ApiQuery(query): ApiQuery<FlowQuery>,
+) -> Result<Json<Page<ApplicationSummaryDto>>, ApiError> {
+    state.lock().db.list_applications(&query).map(Json)
+}
+
+async fn get_application(
+    State(state): State<ApiState>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<Json<ApplicationDetailDto>, ApiError> {
+    state.lock().db.get_application(&id).map(Json)
+}
+
+async fn get_application_timeline(
+    State(state): State<ApiState>,
+    AxumPath(id): AxumPath<String>,
+    ApiQuery(query): ApiQuery<TimelineQuery>,
+) -> Result<Json<TimelineDto>, ApiError> {
+    let range = query.range.unwrap_or_default();
+    state
+        .lock()
+        .db
+        .application_timeline(&id, range, SystemTime::now())
+        .map(Json)
 }
 
 async fn get_settings(State(state): State<ApiState>) -> Json<Settings> {
@@ -667,16 +720,16 @@ where
 mod tests {
     use std::{
         num::NonZeroU32,
-        time::{Duration, Instant},
+        time::{Duration, Instant, SystemTime},
     };
 
     use axum::body::Body;
     use http_body_util::BodyExt;
     use tower::ServiceExt;
     use zimascope_common::model::{
-        AssociationConfidence, CollectorHealth, CollectorState, DomainEvidence, DomainObservation,
-        Endpoint, FlowDirection, FlowKey, FlowState, FlowUpdate, InterfaceHealth, Protocol,
-        TrafficCounters,
+        ApplicationRef, AssociationConfidence, CollectorHealth, CollectorState, DomainEvidence,
+        DomainObservation, Endpoint, FlowDirection, FlowKey, FlowState, FlowUpdate,
+        InterfaceHealth, Protocol, TrafficCounters,
     };
 
     use super::*;
@@ -752,6 +805,7 @@ mod tests {
             last_seen: now - age,
             state: FlowState::Active,
             service: None,
+            application: None,
         }
     }
 
@@ -804,6 +858,7 @@ mod tests {
                 map_capacity: 128,
                 kernel: Default::default(),
                 gaps: Vec::new(),
+                application: Default::default(),
             },
         }
     }
@@ -1150,6 +1205,88 @@ mod tests {
 
         let response = call(&state, get("/v1/endpoints/not-an-ip/timeline")).await;
         assert_problem(&response, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn applications_aggregate_flow_traffic_and_domains() {
+        let state = state();
+        let mut incoming = batch(
+            1,
+            vec![outbound(("93.184.216.34", 443), 40, 4_000, Duration::ZERO)],
+        );
+        incoming.flows[0].application = Some(ApplicationRef {
+            tgid: 4242,
+            uid: 1000,
+            cgroup_id: 0,
+            comm: "curl".into(),
+        });
+        incoming.domains = vec![observation(
+            "example.com",
+            "93.184.216.34",
+            DomainEvidence::TlsSni,
+            AssociationConfidence::Direct,
+        )];
+        state.ingest_batch(incoming);
+
+        let body = body_json(call(&state, get("/v1/applications")).await).await;
+        assert_eq!(body["total"], 1);
+        assert_eq!(body["items"][0]["id"], "proc:comm:curl");
+        assert_eq!(body["items"][0]["name"], "curl");
+        assert_eq!(body["items"][0]["kind"], "process");
+        assert_eq!(body["items"][0]["traffic"]["outbound"]["bytes"], 4_000);
+        assert_eq!(body["items"][0]["flow_count"], 1);
+
+        let body = body_json(call(&state, get("/v1/applications/proc:comm:curl")).await).await;
+        assert_eq!(body["domains"][0]["domain"], "example.com");
+        assert_eq!(
+            body["flows_url"],
+            "/v1/flows?application_id=proc%3Acomm%3Acurl"
+        );
+
+        let body = body_json(
+            call(
+                &state,
+                get("/v1/applications/proc:comm:curl/timeline?range=15m"),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(timeline_bytes(&body, "outbound"), 4_000);
+
+        let body =
+            body_json(call(&state, get("/v1/flows?application_id=proc:comm:curl")).await).await;
+        assert_eq!(body["total"], 1);
+        assert_eq!(body["items"][0]["application"]["name"], "curl");
+
+        let body = body_json(call(&state, get("/v1/flows?application_id=proc:other")).await).await;
+        assert_eq!(body["total"], 0);
+
+        let response = call(&state, get("/v1/applications/proc:missing")).await;
+        assert_problem(&response, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn tick_carries_touched_application_summaries() {
+        let state = state();
+        let response = call(&state, get("/v1/stream")).await;
+        assert_event_stream(&response);
+        let mut body = response.into_body();
+
+        let mut incoming = batch(
+            1,
+            vec![outbound(("1.1.1.1", 443), 10, 1_000, Duration::ZERO)],
+        );
+        incoming.flows[0].application = Some(ApplicationRef {
+            tgid: 4242,
+            uid: 0,
+            cgroup_id: 0,
+            comm: "wget".into(),
+        });
+        state.ingest_batch(incoming);
+
+        let frame = next_frame(&mut body).await;
+        assert!(frame.contains("event: tick"), "frame: {frame}");
+        assert!(frame.contains("proc:comm:wget"), "frame: {frame}");
     }
 
     #[tokio::test]
@@ -1585,6 +1722,7 @@ mod tests {
             last_seen: now,
             state: FlowState::Active,
             service: None,
+            application: None,
         }
     }
 
@@ -2207,5 +2345,55 @@ mod tests {
         assert!(frame.contains("event: tick"), "frame: {frame}");
         assert!(frame.contains("8.8.8.8"), "frame: {frame}");
         assert!(!frame.contains("1.1.1.1"), "frame: {frame}");
+    }
+
+    #[tokio::test]
+    async fn router_with_ui_serves_the_spa_and_keeps_the_api() {
+        let unique = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_nanos();
+        let dir =
+            std::env::temp_dir().join(format!("zimascope-ui-{}-{unique}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create ui dir");
+        std::fs::write(dir.join("index.html"), "<html>spa</html>").expect("write index");
+        std::fs::write(dir.join("app.js"), "console.log('spa')").expect("write asset");
+
+        let app = router_with_ui(state(), &dir);
+
+        let response = app.clone().oneshot(get("/")).await.expect("index");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(body_text(response).await.contains("spa"));
+
+        let response = app.clone().oneshot(get("/app.js")).await.expect("asset");
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // Hash-routed deep links still boot the SPA.
+        let response = app
+            .clone()
+            .oneshot(get("/explore"))
+            .await
+            .expect("deep link");
+        assert!(body_text(response).await.contains("spa"));
+
+        // The API stays JSON, including unknown paths.
+        let response = app
+            .clone()
+            .oneshot(get("/v1/status"))
+            .await
+            .expect("status");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some("application/json")
+        );
+
+        let response = app.oneshot(get("/v1/nope")).await.expect("api 404");
+        assert_problem(&response, StatusCode::NOT_FOUND);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

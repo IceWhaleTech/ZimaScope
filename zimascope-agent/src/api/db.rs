@@ -31,14 +31,16 @@ use crate::enrichment::{DEFAULT_CACHE_CAPACITY, Enricher, EnrichmentStats};
 use crate::SharedFingerprints;
 use crate::proxy::{ProxyKey, ProxyResolver};
 
+use super::application::{ApplicationResolver, ResolvedApplication};
 use super::dto::{
-    AsnCountDto, CollectorHealthDto, ConnectionDto, CountersDto, CountryCountDto,
-    CreateExportRequest, DirectionTotalsDto, DomainAddressDto, DomainDetailDto,
-    DomainObservationDto, DomainRefDto, DomainSummaryDto, DomainVisibilityDto, EndpointDetailDto,
-    EndpointDto, EndpointSummaryDto, EvidenceCountDto, ExportFormat, ExportTaskDto, FlowDto,
-    FlowQuery, FlowStateParam, IpProfileDto, OverviewDto, Page, PortUsageDto, ProxiedTrafficDto,
-    RateDto, TickDto, TickOverviewDto, TickTrafficDto, TimeRange, TimelineDto, TimelinePointDto,
-    enum_from_value, enum_value, flow_state_name, unix_millis,
+    ApplicationDetailDto, ApplicationRefDto, ApplicationSummaryDto, AsnCountDto,
+    CollectorHealthDto, ConnectionDto, CountersDto, CountryCountDto, CreateExportRequest,
+    DirectionTotalsDto, DomainAddressDto, DomainDetailDto, DomainObservationDto, DomainRefDto,
+    DomainSummaryDto, DomainVisibilityDto, EndpointDetailDto, EndpointDto, EndpointSummaryDto,
+    EvidenceCountDto, ExportFormat, ExportTaskDto, FlowDto, FlowQuery, FlowStateParam,
+    IpProfileDto, OverviewDto, Page, PortUsageDto, ProxiedTrafficDto, RateDto, TickDto,
+    TickOverviewDto, TickTrafficDto, TimeRange, TimelineDto, TimelinePointDto, enum_from_value,
+    enum_value, flow_state_name, unix_millis,
 };
 use super::error::ApiError;
 use super::settings::Settings;
@@ -60,7 +62,7 @@ const MINUTE_BUCKET_RETENTION_MS: i64 = 2 * 60 * 60 * 1000;
 const HOUR_BUCKET_RETENTION_MS: i64 = 8 * 24 * 60 * 60 * 1000;
 const MS_PER_DAY: i64 = 24 * 60 * 60 * 1000;
 
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
 
 const SCHEMA_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS flows (
@@ -95,6 +97,19 @@ CREATE TABLE IF NOT EXISTS flows (
 CREATE INDEX IF NOT EXISTS idx_flows_last_seen ON flows(last_seen_ms);
 CREATE INDEX IF NOT EXISTS idx_flows_remote ON flows(remote_addr);
 CREATE INDEX IF NOT EXISTS idx_flows_state ON flows(state);
+
+CREATE TABLE IF NOT EXISTS applications (
+    id TEXT PRIMARY KEY,
+    kind TEXT NOT NULL,
+    name TEXT NOT NULL,
+    exe TEXT,
+    comm TEXT,
+    uid INTEGER,
+    container_id TEXT,
+    first_seen_ms INTEGER NOT NULL,
+    last_seen_ms INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_applications_last_seen ON applications(last_seen_ms);
 
 CREATE TABLE IF NOT EXISTS observations (
     domain TEXT NOT NULL,
@@ -152,7 +167,27 @@ CREATE TABLE IF NOT EXISTS exports (
 const FLOW_COLUMNS: &str = "id, direction, protocol, src_addr, src_port, dst_addr, dst_port, \
      ifindex, interface, packets, bytes, first_seen_ms, last_seen_ms, state, end_reason, \
      remote_addr, remote_port, remote_scope, remote_country, remote_region, remote_city, \
-     remote_asn, remote_org, remote_db_version, remote_enriched_at_ms, domains_json, service";
+     remote_asn, remote_org, remote_db_version, remote_enriched_at_ms, domains_json, service, \
+     app_id, \
+     (SELECT name FROM applications WHERE applications.id = flows.app_id) AS app_name, \
+     (SELECT kind FROM applications WHERE applications.id = flows.app_id) AS app_kind";
+
+/// Aggregate projection of Flows grouped by `flows.app_id`, joined to the
+/// Application record for display metadata.
+const APPLICATION_COLUMNS: &str = "flows.app_id AS app_id, \
+     MAX(a.name) AS app_name, MAX(a.kind) AS app_kind, MAX(a.exe) AS app_exe, \
+     MAX(a.comm) AS app_comm, MAX(a.uid) AS app_uid, MAX(a.container_id) AS app_container_id, \
+     SUM(flows.packets) AS total_packets, SUM(flows.bytes) AS total_bytes, \
+     COALESCE(SUM(CASE WHEN flows.direction = 'inbound' THEN flows.packets ELSE 0 END), 0) \
+         AS in_packets, \
+     COALESCE(SUM(CASE WHEN flows.direction = 'inbound' THEN flows.bytes ELSE 0 END), 0) \
+         AS in_bytes, \
+     COALESCE(SUM(CASE WHEN flows.direction = 'outbound' THEN flows.packets ELSE 0 END), 0) \
+         AS out_packets, \
+     COALESCE(SUM(CASE WHEN flows.direction = 'outbound' THEN flows.bytes ELSE 0 END), 0) \
+         AS out_bytes, \
+     COUNT(*) AS flow_count, MIN(flows.first_seen_ms) AS first_seen_ms, \
+     MAX(flows.last_seen_ms) AS last_seen_ms";
 
 /// Canonical unordered endpoint pair of a connection, as SQL expressions.
 const PAIR_LO: &str =
@@ -217,6 +252,8 @@ pub(crate) struct StreamEvent {
     /// Refreshed aggregates for every Associated Domain touched by this
     /// interval.
     pub domain_summaries: Vec<DomainSummaryDto>,
+    /// Refreshed aggregates for every Application touched by this interval.
+    pub applications: Vec<ApplicationSummaryDto>,
     /// New or refreshed domain associations observed in the interval.
     pub observations: Vec<DomainObservationDto>,
     pub overview: TickOverviewDto,
@@ -257,6 +294,17 @@ impl StreamEvent {
                 .cloned()
                 .collect()
         };
+        let applications: Vec<ApplicationSummaryDto> = {
+            let keys: HashSet<&str> = flows
+                .iter()
+                .filter_map(|flow| flow.application.as_ref().map(|app| app.id.as_str()))
+                .collect();
+            self.applications
+                .iter()
+                .filter(|application| keys.contains(application.id.as_str()))
+                .cloned()
+                .collect()
+        };
 
         TickDto {
             sequence: self.sequence,
@@ -277,6 +325,7 @@ impl StreamEvent {
             flows,
             endpoints,
             domains: domain_summaries,
+            applications,
             observations: self
                 .observations
                 .iter()
@@ -299,6 +348,7 @@ pub(crate) struct ExportContent {
 pub(crate) struct Db {
     conn: Connection,
     enricher: Enricher,
+    applications: ApplicationResolver,
     enrichment_error: Option<String>,
     database_error: Option<String>,
     interfaces: HashMap<u32, Box<str>>,
@@ -343,6 +393,7 @@ impl Db {
             // Upgraded databases keep their rows: new columns are added in
             // place instead of recreating tables.
             add_column_if_missing(&conn, "flows", "service", "TEXT")?;
+            add_column_if_missing(&conn, "flows", "app_id", "TEXT")?;
             conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         }
 
@@ -358,6 +409,7 @@ impl Db {
         Ok(Self {
             conn,
             enricher,
+            applications: ApplicationResolver::default(),
             enrichment_error,
             database_error: None,
             interfaces: HashMap::new(),
@@ -401,6 +453,7 @@ impl Db {
                     flows: Vec::new(),
                     endpoints: Vec::new(),
                     domain_summaries: Vec::new(),
+                    applications: Vec::new(),
                     observations: Vec::new(),
                     overview: TickOverviewDto::default(),
                     health,
@@ -490,6 +543,7 @@ impl Db {
 
             let mut writer = FlowWriter {
                 enricher: &mut self.enricher,
+                applications: &mut self.applications,
                 interfaces: &self.interfaces,
                 proxy,
             };
@@ -549,6 +603,17 @@ impl Db {
                         *direction,
                         *delta,
                     )?;
+                    if let Some(application) = &dto.application {
+                        add_entity_bucket(
+                            &tx,
+                            "application",
+                            &application.id,
+                            resolution,
+                            start,
+                            *direction,
+                            *delta,
+                        )?;
+                    }
                     for domain in &dto.domains {
                         add_entity_bucket(
                             &tx,
@@ -571,8 +636,12 @@ impl Db {
             .iter()
             .map(|event| event.domain.clone())
             .collect();
+        let mut touched_applications: HashSet<String> = HashSet::new();
         for (_, flow) in &updated {
             touched_addresses.insert(flow.remote.address.clone());
+            if let Some(application) = &flow.application {
+                touched_applications.insert(application.id.clone());
+            }
             for domain in &flow.domains {
                 touched_domains.insert(domain.domain.clone());
             }
@@ -580,6 +649,7 @@ impl Db {
 
         let endpoints = self.endpoint_summaries_for(&touched_addresses)?;
         let domain_summaries = self.domain_summaries_for(&touched_domains)?;
+        let applications = self.application_summaries_for(&touched_applications)?;
         let overview = self.tick_overview()?;
 
         Ok(StreamEvent {
@@ -593,6 +663,7 @@ impl Db {
             flows: updated.into_iter().map(|(_, dto)| dto).collect(),
             endpoints,
             domain_summaries,
+            applications,
             observations: domain_events,
             overview,
             health: health_dto,
@@ -619,9 +690,16 @@ impl Db {
                 "DELETE FROM flows WHERE state = 'ended' AND last_seen_ms < ?1",
                 [cutoff],
             )?;
+            self.conn
+                .execute("DELETE FROM applications WHERE last_seen_ms < ?1", [cutoff])?;
         } else {
             self.conn
                 .execute("DELETE FROM flows WHERE state = 'ended'", [])?;
+            self.conn.execute(
+                "DELETE FROM applications WHERE id NOT IN (SELECT DISTINCT app_id FROM flows \
+                 WHERE app_id IS NOT NULL)",
+                [],
+            )?;
         }
         self.conn.execute(
             "DELETE FROM observations WHERE expires_at_ms <= ?1",
@@ -673,6 +751,154 @@ impl Db {
             .query_row(&sql, [id as i64], flow_dto_from_row)
             .optional()
             .map_err(Into::into)
+    }
+
+    // ---------------------------------------------------------- applications
+
+    pub(crate) fn list_applications(
+        &self,
+        query: &FlowQuery,
+    ) -> Result<Page<ApplicationSummaryDto>, ApiError> {
+        let limit = page_limit(query.limit)?;
+        let offset = query.offset.unwrap_or(0);
+        let (items, total) = self.application_rows(query, limit, offset)?;
+        Ok(Page {
+            items,
+            total,
+            limit,
+            offset,
+        })
+    }
+
+    pub(crate) fn get_application(&self, id: &str) -> Result<ApplicationDetailDto, ApiError> {
+        if id.trim().is_empty() {
+            return Err(ApiError::bad_request("application id must not be empty"));
+        }
+        let query = FlowQuery {
+            application_id: Some(id.to_owned()),
+            ..FlowQuery::default()
+        };
+        let (summaries, _) = self.application_rows(&query, 1, 0)?;
+        let summary = summaries
+            .into_iter()
+            .next()
+            .ok_or_else(|| ApiError::not_found(format!("no Flow observed for application {id}")))?;
+
+        let mut statement = self
+            .conn
+            .prepare("SELECT domains_json FROM flows WHERE app_id = ?1")?;
+        let mut domains: Vec<DomainRefDto> = Vec::new();
+        for row in statement.query_map([id], |row| row.get::<_, String>(0))? {
+            let parsed: Vec<DomainRefDto> = serde_json::from_str(&row?).unwrap_or_default();
+            for association in parsed {
+                push_domain(&mut domains, &association);
+            }
+        }
+        domains.sort_by(|left, right| left.domain.cmp(&right.domain));
+
+        Ok(ApplicationDetailDto {
+            id: summary.id.clone(),
+            name: summary.name,
+            kind: summary.kind,
+            exe: summary.exe,
+            comm: summary.comm,
+            uid: summary.uid,
+            container_id: summary.container_id,
+            packets: summary.packets,
+            bytes: summary.bytes,
+            traffic: summary.traffic,
+            flow_count: summary.flow_count,
+            first_seen: summary.first_seen,
+            last_seen: summary.last_seen,
+            domains,
+            flows_url: format!("/v1/flows?application_id={}", encode_uri_component(id)),
+        })
+    }
+
+    pub(crate) fn application_timeline(
+        &self,
+        id: &str,
+        range: TimeRange,
+        now: SystemTime,
+    ) -> Result<TimelineDto, ApiError> {
+        self.buckets_timeline(range, now, Some(("application", id)))
+    }
+
+    fn application_rows(
+        &self,
+        query: &FlowQuery,
+        limit: usize,
+        offset: usize,
+    ) -> Result<(Vec<ApplicationSummaryDto>, usize), ApiError> {
+        let now = SystemTime::now();
+        let mut row_query = query.clone();
+        let search = row_query
+            .q
+            .take()
+            .map(|q| q.trim().to_ascii_lowercase())
+            .filter(|q| !q.is_empty());
+        let (mut clauses, mut params) = self.flow_clauses(&row_query, now, "flows.", false);
+        clauses.push("flows.app_id IS NOT NULL".to_owned());
+        if let Some(search) = search {
+            clauses.push(
+                "instr(lower(coalesce(a.name, '') || ' ' || coalesce(a.exe, '') || ' ' || \
+                 coalesce(a.comm, '') || ' ' || coalesce(flows.app_id, '')), ?) > 0"
+                    .to_owned(),
+            );
+            params.push(Value::Text(search));
+        }
+        let where_clause = where_sql(&clauses);
+
+        let total: i64 = self.conn.query_row(
+            &format!(
+                "SELECT COUNT(*) FROM (SELECT 1 FROM flows LEFT JOIN applications a \
+                 ON a.id = flows.app_id {where_clause} GROUP BY flows.app_id)"
+            ),
+            params_from_iter(params.clone()),
+            |row| row.get(0),
+        )?;
+
+        let order = application_order(query.sort.as_deref())?;
+        let sql = format!(
+            "SELECT {APPLICATION_COLUMNS} FROM flows LEFT JOIN applications a \
+             ON a.id = flows.app_id {where_clause} GROUP BY flows.app_id \
+             ORDER BY {order} LIMIT ?{} OFFSET ?{}",
+            params.len() + 1,
+            params.len() + 2
+        );
+        params.push(Value::Integer(limit as i64));
+        params.push(Value::Integer(offset as i64));
+
+        let mut statement = self.conn.prepare(&sql)?;
+        let items = statement
+            .query_map(params_from_iter(params), application_summary_from_row)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok((items, total as usize))
+    }
+
+    /// Refreshed Application summaries for the given ids, used by the SSE tick
+    /// so Application lists update without polling.
+    fn application_summaries_for(
+        &self,
+        applications: &HashSet<String>,
+    ) -> Result<Vec<ApplicationSummaryDto>, ApiError> {
+        if applications.is_empty() {
+            return Ok(Vec::new());
+        }
+        let keys = json_key_list(applications.iter())?;
+        let mut statement = self.conn.prepare(&format!(
+            "SELECT {APPLICATION_COLUMNS} FROM flows LEFT JOIN applications a \
+             ON a.id = flows.app_id \
+             WHERE flows.app_id IN (SELECT value FROM json_each(?1)) \
+             GROUP BY flows.app_id ORDER BY total_bytes DESC, flows.app_id LIMIT ?2"
+        ))?;
+        let items = statement
+            .query_map(
+                params![keys, TICK_AGGREGATE_LIMIT as i64],
+                application_summary_from_row,
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(items)
     }
 
     // ------------------------------------------------------------ connections
@@ -1949,7 +2175,7 @@ impl Db {
         let result = (|| -> Result<(), ApiError> {
             self.conn.execute_batch(
                 "DELETE FROM flows; DELETE FROM observations; DELETE FROM traffic_buckets; \
-                 DELETE FROM entity_buckets; DELETE FROM exports;",
+                 DELETE FROM entity_buckets; DELETE FROM applications; DELETE FROM exports;",
             )?;
             Ok(())
         })();
@@ -2130,7 +2356,7 @@ impl Db {
                  coalesce({prefix}end_reason, '') || ' ' || {prefix}src_addr || ' ' || \
                  coalesce({prefix}src_port, '') || ' ' || {prefix}dst_addr || ' ' || \
                  coalesce({prefix}dst_port, '') || ' ' || coalesce({prefix}interface, '') || \
-                 ' ' || {prefix}domains_json), ?) > 0"
+                 ' ' || coalesce({prefix}app_id, '') || ' ' || {prefix}domains_json), ?) > 0"
             ));
             params.push(Value::Text(q));
         }
@@ -2163,6 +2389,10 @@ impl Db {
             clauses.push(format!("({prefix}src_port = ? OR {prefix}dst_port = ?)"));
             params.push(Value::Integer(port as i64));
             params.push(Value::Integer(port as i64));
+        }
+        if let Some(application_id) = &query.application_id {
+            clauses.push(format!("{prefix}app_id = ?"));
+            params.push(Value::Text(application_id.clone()));
         }
         if association_filters {
             if let Some(domain) = query.domain.as_deref().map(normalize_domain) {
@@ -2326,6 +2556,7 @@ fn associate_address(
 /// Collaborators shared by every upsert of one collection interval.
 struct FlowWriter<'a> {
     enricher: &'a mut Enricher,
+    applications: &'a mut ApplicationResolver,
     interfaces: &'a HashMap<u32, Box<str>>,
     proxy: &'a ProxyResolver,
 }
@@ -2348,15 +2579,19 @@ fn upsert_flow(
         FlowState::Active => None,
     };
     let interface = writer.interfaces.get(&update.key.interface_index.get());
+    let application = writer.applications.resolve(update.application.as_ref());
+    if let Some(application) = &application {
+        upsert_application(tx, application, first_seen, last_seen)?;
+    }
 
     tx.execute(
         "INSERT INTO flows (id, direction, protocol, src_addr, src_port, dst_addr, dst_port, \
          ifindex, interface, packets, bytes, first_seen_ms, last_seen_ms, state, end_reason, \
          remote_addr, remote_port, remote_scope, remote_country, remote_region, remote_city, \
          remote_asn, remote_org, remote_db_version, remote_enriched_at_ms, domains_json, \
-         service) \
+         service, app_id) \
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, \
-         ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27) \
+         ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28) \
          ON CONFLICT(id) DO UPDATE SET \
          packets = excluded.packets, bytes = excluded.bytes, \
          first_seen_ms = MIN(flows.first_seen_ms, excluded.first_seen_ms), \
@@ -2364,6 +2599,7 @@ fn upsert_flow(
          state = excluded.state, end_reason = excluded.end_reason, \
          interface = excluded.interface, domains_json = excluded.domains_json, \
          service = COALESCE(excluded.service, flows.service), \
+         app_id = COALESCE(excluded.app_id, flows.app_id), \
          remote_scope = excluded.remote_scope, \
          remote_country = CASE WHEN excluded.remote_scope = 'fake_ip' \
              THEN COALESCE(excluded.remote_country, flows.remote_country) \
@@ -2416,6 +2652,45 @@ fn upsert_flow(
             unix_millis(profile.enriched_at),
             domains_json,
             update.service.as_deref(),
+            application
+                .as_ref()
+                .map(|application| application.id.as_str()),
+        ],
+    )?;
+    Ok(())
+}
+
+/// Inserts or refreshes one Application row.
+///
+/// `kind` and `name` follow the latest observation (a container name may be
+/// upgraded later), while the first/last timestamps keep history.
+fn upsert_application(
+    tx: &rusqlite::Transaction<'_>,
+    application: &ResolvedApplication,
+    first_seen: SystemTime,
+    last_seen: SystemTime,
+) -> Result<(), ApiError> {
+    tx.execute(
+        "INSERT INTO applications (id, kind, name, exe, comm, uid, container_id, first_seen_ms, \
+         last_seen_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9) \
+         ON CONFLICT(id) DO UPDATE SET \
+         kind = excluded.kind, name = excluded.name, \
+         exe = COALESCE(excluded.exe, applications.exe), \
+         comm = COALESCE(excluded.comm, applications.comm), \
+         uid = excluded.uid, \
+         container_id = COALESCE(excluded.container_id, applications.container_id), \
+         first_seen_ms = MIN(applications.first_seen_ms, excluded.first_seen_ms), \
+         last_seen_ms = MAX(applications.last_seen_ms, excluded.last_seen_ms)",
+        params![
+            application.id.as_str(),
+            application.kind,
+            application.name.as_str(),
+            application.exe.as_deref(),
+            application.comm.as_str(),
+            application.uid as i64,
+            application.container_id.as_deref(),
+            unix_millis(first_seen),
+            unix_millis(last_seen),
         ],
     )?;
     Ok(())
@@ -2530,6 +2805,55 @@ fn flow_dto_from_row(row: &Row<'_>) -> rusqlite::Result<FlowDto> {
         last_seen,
         duration_ms: (last_seen - first_seen).max(0) as u64,
         domains: serde_json::from_str(&domains_json).unwrap_or_default(),
+        application: flow_application_from_row(row)?,
+    })
+}
+
+fn flow_application_from_row(row: &Row<'_>) -> rusqlite::Result<Option<ApplicationRefDto>> {
+    let Some(id) = row.get::<_, Option<String>>(27)? else {
+        return Ok(None);
+    };
+    Ok(Some(ApplicationRefDto {
+        id,
+        name: row.get::<_, Option<String>>(28)?.unwrap_or_default(),
+        kind: match row.get::<_, Option<String>>(29)?.as_deref() {
+            Some("container") => "container",
+            _ => "process",
+        },
+    }))
+}
+
+fn application_summary_from_row(row: &Row<'_>) -> rusqlite::Result<ApplicationSummaryDto> {
+    let id: String = row.get(0)?;
+    let name: Option<String> = row.get(1)?;
+    Ok(ApplicationSummaryDto {
+        name: name
+            .filter(|name| !name.is_empty())
+            .unwrap_or_else(|| id.clone()),
+        id,
+        kind: match row.get::<_, Option<String>>(2)?.as_deref() {
+            Some("container") => "container",
+            _ => "process",
+        },
+        exe: row.get(3)?,
+        comm: row.get(4)?,
+        uid: row.get::<_, Option<i64>>(5)?.map(|uid| uid as u32),
+        container_id: row.get(6)?,
+        packets: row.get::<_, i64>(7)? as u64,
+        bytes: row.get::<_, i64>(8)? as u64,
+        traffic: DirectionTotalsDto {
+            inbound: CountersDto {
+                packets: row.get::<_, i64>(9)? as u64,
+                bytes: row.get::<_, i64>(10)? as u64,
+            },
+            outbound: CountersDto {
+                packets: row.get::<_, i64>(11)? as u64,
+                bytes: row.get::<_, i64>(12)? as u64,
+            },
+        },
+        flow_count: row.get::<_, i64>(13)? as u64,
+        first_seen: row.get(14)?,
+        last_seen: row.get(15)?,
     })
 }
 
@@ -2562,7 +2886,8 @@ fn export_csv(flows: &[FlowDto]) -> String {
 
     let mut csv = String::from(
         "id,direction,protocol,state,end_reason,src_ip,src_port,dst_ip,dst_port,remote_ip,\
-         remote_port,interface,packets,bytes,first_seen_ms,last_seen_ms,domain,evidence,confidence\n",
+         remote_port,interface,packets,bytes,first_seen_ms,last_seen_ms,domain,evidence,confidence,\
+         application\n",
     );
     for flow in flows {
         let (domain, evidence, confidence) = flow
@@ -2578,7 +2903,7 @@ fn export_csv(flows: &[FlowDto]) -> String {
             .unwrap_or_default();
         let _ = writeln!(
             csv,
-            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
+            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
             flow.id,
             enum_value(flow.direction),
             enum_value(flow.protocol),
@@ -2598,6 +2923,12 @@ fn export_csv(flows: &[FlowDto]) -> String {
             csv_field(domain),
             evidence,
             confidence,
+            csv_field(
+                flow.application
+                    .as_ref()
+                    .map(|application| application.id.as_str())
+                    .unwrap_or("")
+            ),
         );
     }
     csv
@@ -2631,11 +2962,28 @@ fn flow_order(sort: Option<&str>) -> Result<String, ApiError> {
         "packets" => "packets",
         "direction" => "direction",
         "remote" => "ip_sort_key(remote_addr)",
+        "application" => "app_id",
         "domain" => "domain_sort_key(json_extract(domains_json, '$[0].domain'))",
         _ => return Err(unsupported_sort(field)),
     };
     let direction = if descending { "DESC" } else { "ASC" };
     Ok(format!("{column} {direction}, id {direction}"))
+}
+
+fn application_order(sort: Option<&str>) -> Result<String, ApiError> {
+    let (field, descending) = split_sort(sort, "-bytes");
+    let column = match field {
+        "bytes" => "total_bytes",
+        "packets" => "total_packets",
+        "in_bytes" => "in_bytes",
+        "out_bytes" => "out_bytes",
+        "flows" => "flow_count",
+        "last_seen" => "last_seen_ms",
+        "name" => "app_name COLLATE NOCASE",
+        _ => return Err(unsupported_sort(field)),
+    };
+    let direction = if descending { "DESC" } else { "ASC" };
+    Ok(format!("{column} {direction}, app_id {direction}"))
 }
 
 fn endpoint_order(sort: Option<&str>) -> Result<String, ApiError> {

@@ -7,7 +7,7 @@
 
 /// Version of the kernel/user-space contract. Bump this whenever the layout of
 /// any type in this module changes.
-pub const ABI_VERSION: u16 = 2;
+pub const ABI_VERSION: u16 = 3;
 
 /// Maximum normalized domain length. A DNS name is at most 253 characters.
 pub const DOMAIN_MAX_LEN: usize = 253;
@@ -30,16 +30,26 @@ pub const SERVICE_SAMPLED_FLAG: u16 = 1 << 0;
 /// when [`crate::model`]-side configuration asks for a different value.
 pub const DEFAULT_FLOW_CAPACITY: u32 = 65_536;
 
+/// Default number of owning-socket entries the eBPF map is compiled with.
+pub const DEFAULT_OWNER_CAPACITY: u32 = 65_536;
+
+/// Default number of listening-port entries the eBPF map is compiled with.
+pub const DEFAULT_LISTENER_CAPACITY: u32 = 4_096;
+
 /// Program names include the ABI version so a stale object is rejected at
 /// lookup instead of running with mismatched struct layouts.
 pub const TC_INGRESS_PROGRAM: &str = "tc_ingress_v1";
 pub const TC_EGRESS_PROGRAM: &str = "tc_egress_v1";
+pub const SOCK_OWNER_PROGRAM: &str = "sock_owner_v1";
+pub const UDP_OWNER_PROGRAM: &str = "udp_owner_v1";
 
 pub const ABI_METADATA_MAP: &str = "abi_metadata";
 pub const FLOW_MAP: &str = "flow_map";
 pub const KERNEL_STATS_MAP: &str = "kernel_stats";
 pub const DOMAIN_EVENTS_MAP: &str = "domain_events";
 pub const SERVICE_EVENTS_MAP: &str = "service_events";
+pub const OWNER_MAP: &str = "owner_map";
+pub const LISTENER_MAP: &str = "listener_map";
 
 /// Compile-time description of the ABI layout, stored in the eBPF object so a
 /// version mismatch can be rejected before any collection starts.
@@ -52,7 +62,8 @@ pub struct AbiMetadata {
     pub domain_sample_size: u16,
     pub kernel_stats_size: u16,
     pub service_sample_size: u16,
-    pub reserved: [u8; 4],
+    pub owner_key_size: u16,
+    pub owner_value_size: u16,
 }
 
 #[repr(u8)]
@@ -84,6 +95,14 @@ pub enum SampleKind {
     HttpRequest = 3,
 }
 
+/// Whether an [`OwnerKey`] identifies a connected socket or a listening port.
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OwnerKind {
+    Socket = 1,
+    Listener = 2,
+}
+
 impl AbiMetadata {
     /// Metadata describing the current build.
     pub const CURRENT: Self = Self {
@@ -93,7 +112,8 @@ impl AbiMetadata {
         domain_sample_size: core::mem::size_of::<DomainSample>() as u16,
         kernel_stats_size: core::mem::size_of::<KernelStats>() as u16,
         service_sample_size: core::mem::size_of::<ServiceSample>() as u16,
-        reserved: [0; 4],
+        owner_key_size: core::mem::size_of::<OwnerKey>() as u16,
+        owner_value_size: core::mem::size_of::<OwnerValue>() as u16,
     };
 }
 
@@ -142,6 +162,17 @@ impl SampleKind {
     }
 }
 
+impl OwnerKind {
+    /// Validates a raw ABI discriminant.
+    pub const fn from_abi(value: u8) -> Option<Self> {
+        match value {
+            1 => Some(Self::Socket),
+            2 => Some(Self::Listener),
+            _ => None,
+        }
+    }
+}
+
 /// Identity of one direction of a Flow as observed at the Device Boundary.
 ///
 /// IPv4 addresses occupy the final four bytes of the 16-byte storage and are
@@ -173,6 +204,39 @@ pub struct FlowValue {
     /// Collection-side flags such as [`SERVICE_SAMPLED_FLAG`].
     pub service_flags: u16,
     pub reserved: u16,
+}
+
+/// Identity of a socket owner as captured in process context.
+///
+/// The local address is deliberately excluded so a port-preserving SNAT (for
+/// example Docker `MASQUERADE`) still joins a container socket to its Flow at
+/// the Device Boundary. `kind = Listener` entries carry the local port only.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct OwnerKey {
+    pub remote_addr: [u8; 16],
+    pub remote_port_be: u16,
+    pub local_port_be: u16,
+    pub protocol: u8,
+    pub kind: u8,
+    pub ip_family: u8,
+    pub reserved: u8,
+}
+
+/// The process that owns a socket, captured at connect or listen time.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct OwnerValue {
+    /// Thread-group id: the process that called connect/listen.
+    pub tgid: u32,
+    /// Thread id that produced the observation.
+    pub pid: u32,
+    pub uid: u32,
+    pub reserved: u32,
+    pub cgroup_id: u64,
+    /// `bpf_get_current_comm` at observation time, NUL padded.
+    pub comm: [u8; 16],
+    pub observed_mono_ns: u64,
 }
 
 /// One bounded payload sample emitted from the packet path.
@@ -225,6 +289,8 @@ pub struct KernelStats {
     pub domain_events_dropped: u64,
     pub service_events_emitted: u64,
     pub service_events_dropped: u64,
+    pub owner_events_inserted: u64,
+    pub owner_events_dropped: u64,
 }
 
 const _: () = {
@@ -237,13 +303,19 @@ const _: () = {
     assert!(core::mem::size_of::<FlowValue>() == 40);
     assert!(core::mem::align_of::<FlowValue>() == 8);
 
+    assert!(core::mem::size_of::<OwnerKey>() == 24);
+    assert!(core::mem::align_of::<OwnerKey>() == 2);
+
+    assert!(core::mem::size_of::<OwnerValue>() == 48);
+    assert!(core::mem::align_of::<OwnerValue>() == 8);
+
     assert!(core::mem::size_of::<DomainSample>() == 552);
     assert!(core::mem::align_of::<DomainSample>() == 8);
 
     assert!(core::mem::size_of::<ServiceSample>() == 128);
     assert!(core::mem::align_of::<ServiceSample>() == 8);
 
-    assert!(core::mem::size_of::<KernelStats>() == 72);
+    assert!(core::mem::size_of::<KernelStats>() == 88);
     assert!(core::mem::align_of::<KernelStats>() == 8);
 
     assert!(core::mem::offset_of!(FlowKey, src_addr) == 0);
@@ -255,6 +327,17 @@ const _: () = {
     assert!(core::mem::offset_of!(FlowKey, direction) == 41);
     assert!(core::mem::offset_of!(FlowKey, ip_family) == 42);
     assert!(core::mem::offset_of!(FlowKey, reserved) == 43);
+
+    assert!(core::mem::offset_of!(OwnerKey, remote_addr) == 0);
+    assert!(core::mem::offset_of!(OwnerKey, remote_port_be) == 16);
+    assert!(core::mem::offset_of!(OwnerKey, local_port_be) == 18);
+    assert!(core::mem::offset_of!(OwnerKey, protocol) == 20);
+    assert!(core::mem::offset_of!(OwnerKey, kind) == 21);
+    assert!(core::mem::offset_of!(OwnerKey, ip_family) == 22);
+
+    assert!(core::mem::offset_of!(OwnerValue, cgroup_id) == 16);
+    assert!(core::mem::offset_of!(OwnerValue, comm) == 24);
+    assert!(core::mem::offset_of!(OwnerValue, observed_mono_ns) == 40);
 
     assert!(core::mem::offset_of!(DomainSample, address) == 24);
     assert!(core::mem::offset_of!(DomainSample, payload) == 40);
@@ -290,6 +373,8 @@ mod tests {
             metadata.kernel_stats_size as usize,
             size_of::<KernelStats>()
         );
+        assert_eq!(metadata.owner_key_size as usize, size_of::<OwnerKey>());
+        assert_eq!(metadata.owner_value_size as usize, size_of::<OwnerValue>());
     }
 
     #[test]
@@ -313,6 +398,10 @@ mod tests {
         assert_eq!(SampleKind::from_abi(2), Some(SampleKind::TlsClientHello));
         assert_eq!(SampleKind::from_abi(3), Some(SampleKind::HttpRequest));
         assert_eq!(SampleKind::from_abi(4), None);
+
+        assert_eq!(OwnerKind::from_abi(1), Some(OwnerKind::Socket));
+        assert_eq!(OwnerKind::from_abi(2), Some(OwnerKind::Listener));
+        assert_eq!(OwnerKind::from_abi(3), None);
     }
 
     #[test]

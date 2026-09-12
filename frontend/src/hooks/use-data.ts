@@ -24,6 +24,10 @@ export const queryKeys = {
   domainsPage: (query: FlowQuery) => ["domains-page", query] as const,
   domain: (name: string) => ["domain", name] as const,
   domainTimeline: (name: string, range: TimeRange) => ["domain-timeline", name, range] as const,
+  applications: (query: FlowQuery) => ["applications", query] as const,
+  applicationsPage: (query: FlowQuery) => ["applications-page", query] as const,
+  application: (id: string) => ["application", id] as const,
+  applicationTimeline: (id: string, range: TimeRange) => ["application-timeline", id, range] as const,
   status: () => ["status"] as const,
   settings: () => ["settings"] as const,
   exports: () => ["exports"] as const,
@@ -158,6 +162,40 @@ export function useDomainTimeline(name: string | null, range: TimeRange) {
     queryKey: queryKeys.domainTimeline(name ?? "", range),
     queryFn: () => data.domainTimeline(name!, range),
     enabled: Boolean(name),
+  });
+}
+
+export function useApplications(query: FlowQuery) {
+  return useQuery({
+    queryKey: queryKeys.applications(query),
+    queryFn: () => data.applications(query),
+    placeholderData: keepPreviousData,
+  });
+}
+
+export function useApplicationsInfinite(query: FlowQuery) {
+  return useInfiniteQuery({
+    queryKey: queryKeys.applicationsPage(query),
+    queryFn: ({ pageParam }) => data.applications({ ...query, offset: pageParam }),
+    initialPageParam: 0,
+    getNextPageParam: nextPageParam,
+    placeholderData: keepPreviousData,
+  });
+}
+
+export function useApplication(id: string | null) {
+  return useQuery({
+    queryKey: queryKeys.application(id ?? ""),
+    queryFn: () => data.application(id!),
+    enabled: Boolean(id),
+  });
+}
+
+export function useApplicationTimeline(id: string | null, range: TimeRange) {
+  return useQuery({
+    queryKey: queryKeys.applicationTimeline(id ?? "", range),
+    queryFn: () => data.applicationTimeline(id!, range),
+    enabled: Boolean(id),
   });
 }
 

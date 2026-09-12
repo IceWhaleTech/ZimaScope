@@ -79,6 +79,22 @@ pub struct FlowUpdate {
     pub state: FlowState,
     /// Fingerprint library match for this Flow, once a sample is classified.
     pub service: Option<Box<str>>,
+    /// Application Identity resolved from socket ownership, when observed.
+    pub application: Option<ApplicationRef>,
+}
+
+/// The process observed to own a Flow, before user-space enrichment.
+///
+/// `tgid` is the process (thread group) id in the host PID namespace; `comm`
+/// was captured in the kernel so a process that exits before the next poll is
+/// still identified. Name, executable path and container attribution are
+/// resolved downstream where the filesystem is available.
+#[derive(Clone, Debug)]
+pub struct ApplicationRef {
+    pub tgid: u32,
+    pub uid: u32,
+    pub cgroup_id: u64,
+    pub comm: Box<str>,
 }
 
 /// An Association between a domain and an Endpoint.
@@ -163,6 +179,18 @@ pub struct CollectorHealth {
     pub map_capacity: usize,
     pub kernel: KernelCounters,
     pub gaps: Vec<ObservationGap>,
+    /// Whether Application Identity capture is attached. Attribution is
+    /// advisory: collection runs with or without it.
+    pub application: ApplicationHealth,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct ApplicationHealth {
+    /// TCP connect/listen ownership capture is attached.
+    pub attached: bool,
+    /// UDP send ownership capture is attached.
+    pub udp_attached: bool,
+    pub last_error: Option<Box<str>>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -195,6 +223,8 @@ pub struct KernelCounters {
     pub domain_events_dropped: u64,
     pub service_events_emitted: u64,
     pub service_events_dropped: u64,
+    pub owner_events_inserted: u64,
+    pub owner_events_dropped: u64,
 }
 
 /// A known interval in which ZimaScope could not observe complete metadata.

@@ -13,9 +13,14 @@ use std::{fs, num::NonZeroU32, ptr};
 use anyhow::{Context, Result, bail};
 use aya::{
     Ebpf,
-    maps::{Array, IterableMap, MapData, PerCpuArray, PerCpuHashMap, RingBuf},
+    maps::{
+        Array, HashMap as AyaHashMap, IterableMap, MapData, PerCpuArray, PerCpuHashMap, RingBuf,
+    },
     programs::{
-        Link, ProgramError, SchedClassifier, TcAttachType,
+        CgroupAttachMode, CgroupSockAddr, Link, ProgramError, SchedClassifier, SockOps,
+        TcAttachType,
+        cgroup_sock_addr::CgroupSockAddrLink,
+        sock_ops::SockOpsLink,
         tc::{self, SchedClassifierLink as TcLink},
     },
     util::KernelVersion,
@@ -23,9 +28,10 @@ use aya::{
 use zimascope_common::{
     kernel_abi::{
         self, ABI_METADATA_MAP, AbiMetadata, DOMAIN_EVENTS_MAP, DomainSample, FLOW_MAP, FlowKey,
-        FlowValue, KERNEL_STATS_MAP, KernelStats, SERVICE_EVENTS_MAP, ServiceSample,
+        FlowValue, KERNEL_STATS_MAP, KernelStats, LISTENER_MAP, OWNER_MAP, OwnerKey, OwnerValue,
+        SERVICE_EVENTS_MAP, SOCK_OWNER_PROGRAM, ServiceSample, UDP_OWNER_PROGRAM,
     },
-    model::InterfaceHealth,
+    model::{ApplicationHealth, InterfaceHealth},
 };
 
 use super::{CollectorConfig, InterfaceSelector, KernelSource};
@@ -33,6 +39,9 @@ use super::{CollectorConfig, InterfaceSelector, KernelSource};
 mod object {
     include!(concat!(env!("OUT_DIR"), "/ebpf_object.rs"));
 }
+
+/// The cgroup v2 root every process belongs to.
+const CGROUP_ROOT: &str = "/sys/fs/cgroup";
 
 #[repr(transparent)]
 #[derive(Clone, Copy)]
@@ -62,6 +71,20 @@ struct PodAbiMetadata(AbiMetadata);
 // Safety: `#[repr(transparent)]` over a `#[repr(C)]` POD type with no padding.
 unsafe impl aya::Pod for PodAbiMetadata {}
 
+#[repr(transparent)]
+#[derive(Clone, Copy)]
+struct PodOwnerKey(OwnerKey);
+
+// Safety: `#[repr(transparent)]` over a `#[repr(C)]` POD type with no padding.
+unsafe impl aya::Pod for PodOwnerKey {}
+
+#[repr(transparent)]
+#[derive(Clone, Copy)]
+struct PodOwnerValue(OwnerValue);
+
+// Safety: `#[repr(transparent)]` over a `#[repr(C)]` POD type with no padding.
+unsafe impl aya::Pod for PodOwnerValue {}
+
 /// Owns every Aya object required for one collection session.
 pub(crate) struct AyaKernelSource {
     ebpf: Ebpf,
@@ -69,6 +92,12 @@ pub(crate) struct AyaKernelSource {
     stats: PerCpuArray<MapData, PodKernelStats>,
     domains: RingBuf<MapData>,
     services: RingBuf<MapData>,
+    owners: AyaHashMap<MapData, PodOwnerKey, PodOwnerValue>,
+    listeners: AyaHashMap<MapData, PodOwnerKey, PodOwnerValue>,
+    owner_link: Option<SockOpsLink>,
+    owner_error: Option<Box<str>>,
+    udp_link: Option<CgroupSockAddrLink>,
+    udp_error: Option<Box<str>>,
     attached: Vec<AttachedInterface>,
 }
 
@@ -126,7 +155,21 @@ impl AyaKernelSource {
         )
         .context("convert service event ring buffer")?;
 
+        let owners = take_owner_map(&mut ebpf, OWNER_MAP)?;
+        let listeners = take_owner_map(&mut ebpf, LISTENER_MAP)?;
+
         load_programs(&mut ebpf)?;
+
+        // Application Identity is advisory: TC collection starts even when the
+        // cgroup attach is unavailable, and health explains why.
+        let (owner_link, owner_error) = match attach_owner_program(&mut ebpf) {
+            Ok(link) => (Some(link), None),
+            Err(error) => (None, Some(format!("{error:#}").into())),
+        };
+        let (udp_link, udp_error) = match attach_udp_owner_program(&mut ebpf) {
+            Ok(link) => (Some(link), None),
+            Err(error) => (None, Some(format!("{error:#}").into())),
+        };
 
         let interfaces = resolve_interfaces(&config.interfaces)?;
         let attached = attach_interfaces(&mut ebpf, &interfaces)
@@ -138,6 +181,12 @@ impl AyaKernelSource {
             stats,
             domains,
             services,
+            owners,
+            listeners,
+            owner_link,
+            owner_error,
+            udp_link,
+            udp_error,
             attached,
         })
     }
@@ -156,6 +205,21 @@ impl KernelSource for AyaKernelSource {
             entries += 1;
         }
 
+        Ok(entries)
+    }
+
+    fn visit_owners(&mut self, visitor: &mut dyn FnMut(OwnerKey, &OwnerValue)) -> Result<usize> {
+        let mut entries = 0usize;
+        for item in self.owners.iter() {
+            let (key, value) = item.context("read owner map entry")?;
+            visitor(key.0, &value.0);
+            entries += 1;
+        }
+        for item in self.listeners.iter() {
+            let (key, value) = item.context("read listener map entry")?;
+            visitor(key.0, &value.0);
+            entries += 1;
+        }
         Ok(entries)
     }
 
@@ -251,8 +315,28 @@ impl KernelSource for AyaKernelSource {
             .collect()
     }
 
+    fn application_health(&self) -> ApplicationHealth {
+        ApplicationHealth {
+            attached: self.owner_link.is_some(),
+            udp_attached: self.udp_link.is_some(),
+            last_error: self.owner_error.clone().or_else(|| self.udp_error.clone()),
+        }
+    }
+
     fn detach(&mut self) -> Result<()> {
         let mut first_error = None;
+        if let Some(link) = self.owner_link.take() {
+            if let Err(error) = link.detach() {
+                first_error = Some(anyhow::anyhow!("detach socket owner program: {error}"));
+            }
+        }
+        if let Some(link) = self.udp_link.take() {
+            if let Err(error) = link.detach() {
+                if first_error.is_none() {
+                    first_error = Some(anyhow::anyhow!("detach UDP owner program: {error}"));
+                }
+            }
+        }
         for attached in self.attached.drain(..) {
             for (direction, link) in [("ingress", attached.ingress), ("egress", attached.egress)] {
                 let Some(link) = link else { continue };
@@ -306,6 +390,8 @@ fn verify_abi(ebpf: &mut Ebpf) -> Result<()> {
         || published.flow_value_size != expected.flow_value_size
         || published.domain_sample_size != expected.domain_sample_size
         || published.kernel_stats_size != expected.kernel_stats_size
+        || published.owner_key_size != expected.owner_key_size
+        || published.owner_value_size != expected.owner_value_size
     {
         bail!("eBPF ABI mismatch: recorded struct sizes do not match user space");
     }
@@ -318,6 +404,16 @@ fn take_flow_map(ebpf: &mut Ebpf) -> Result<PerCpuHashMap<MapData, PodFlowKey, P
         .take_map(FLOW_MAP)
         .with_context(|| format!("eBPF map {FLOW_MAP:?} is missing"))?;
     PerCpuHashMap::try_from(map).context("convert flow map")
+}
+
+fn take_owner_map(
+    ebpf: &mut Ebpf,
+    name: &str,
+) -> Result<AyaHashMap<MapData, PodOwnerKey, PodOwnerValue>> {
+    let map = ebpf
+        .take_map(name)
+        .with_context(|| format!("eBPF map {name:?} is missing"))?;
+    AyaHashMap::try_from(map).context("convert owner map")
 }
 
 fn load_programs(ebpf: &mut Ebpf) -> Result<()> {
@@ -334,7 +430,70 @@ fn load_programs(ebpf: &mut Ebpf) -> Result<()> {
             .load()
             .with_context(|| format!("load eBPF program {name:?}"))?;
     }
+
+    let owner: &mut SockOps = ebpf
+        .program_mut(SOCK_OWNER_PROGRAM)
+        .with_context(|| format!("eBPF program {SOCK_OWNER_PROGRAM:?} is missing"))?
+        .try_into()
+        .context("convert program to SockOps")?;
+    owner
+        .load()
+        .with_context(|| format!("load eBPF program {SOCK_OWNER_PROGRAM:?}"))?;
+
+    let udp: &mut CgroupSockAddr = ebpf
+        .program_mut(UDP_OWNER_PROGRAM)
+        .with_context(|| format!("eBPF program {UDP_OWNER_PROGRAM:?} is missing"))?
+        .try_into()
+        .context("convert program to CgroupSockAddr")?;
+    udp.load()
+        .with_context(|| format!("load eBPF program {UDP_OWNER_PROGRAM:?}"))?;
+
     Ok(())
+}
+
+/// Attaches the socket-owner program to the cgroup v2 root.
+///
+/// The kernel rejects attach flags on the `bpf_link` path
+/// (`cgroup_bpf_link_attach` returns `EINVAL` for nonzero flags), and each
+/// link is independent, so `Single` (flags 0) never replaces a program owned
+/// by another tool. A conflict is reported through Application health instead
+/// of failing collection.
+fn attach_owner_program(ebpf: &mut Ebpf) -> Result<SockOpsLink> {
+    let program: &mut SockOps = ebpf
+        .program_mut(SOCK_OWNER_PROGRAM)
+        .with_context(|| format!("eBPF program {SOCK_OWNER_PROGRAM:?} is missing"))?
+        .try_into()
+        .context("convert program to SockOps")?;
+    let cgroup =
+        fs::File::open(CGROUP_ROOT).with_context(|| format!("open cgroup root {CGROUP_ROOT:?}"))?;
+    let link_id = program
+        .attach(&cgroup, CgroupAttachMode::Single)
+        .context("attach socket owner program to the cgroup root")?;
+    program
+        .take_link(link_id)
+        .context("take socket owner program link")
+}
+
+/// Attaches the UDP send-owner program to the cgroup v2 root.
+///
+/// `cgroup/sendmsg4` reports the destination in the sending process context,
+/// which is what UDP attribution needs; `connect4` is not required because
+/// every UDP send passes through `udp_sendmsg`.
+fn attach_udp_owner_program(ebpf: &mut Ebpf) -> Result<CgroupSockAddrLink> {
+    let program: &mut CgroupSockAddr = ebpf
+        .program_mut(UDP_OWNER_PROGRAM)
+        .with_context(|| format!("eBPF program {UDP_OWNER_PROGRAM:?} is missing"))?
+        .try_into()
+        .context("convert program to CgroupSockAddr")?;
+
+    let cgroup =
+        fs::File::open(CGROUP_ROOT).with_context(|| format!("open cgroup root {CGROUP_ROOT:?}"))?;
+    let link_id = program
+        .attach(&cgroup, CgroupAttachMode::Single)
+        .context("attach UDP owner program to the cgroup root")?;
+    program
+        .take_link(link_id)
+        .context("take UDP owner program link")
 }
 
 fn attach_interfaces(

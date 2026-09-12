@@ -48,6 +48,10 @@ _Avoid_: Proxy IP, virtual server
 The process, ZimaOS application, container or workload associated with a Flow when the system has sufficient evidence.
 _Avoid_: App owner
 
+**Attribution Coverage**:
+The share of boundary traffic that carries an Application Identity. Unattributed traffic is still a valid Flow; the remainder is reported, never redistributed or guessed.
+_Avoid_: Attribution accuracy
+
 **Observation Gap**:
 A known interval or protocol condition in which ZimaScope could not observe, process or retain complete network metadata.
 _Avoid_: No traffic

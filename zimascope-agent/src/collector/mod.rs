@@ -10,6 +10,7 @@ mod aya;
 mod domain;
 pub(crate) mod fingerprint;
 mod health;
+mod listeners;
 mod tracker;
 
 #[cfg(test)]
@@ -28,7 +29,7 @@ use tokio::{
 };
 use zimascope_common::{
     kernel_abi,
-    model::{CollectionBatch, CollectorHealth, CollectorState, InterfaceHealth},
+    model::{ApplicationHealth, CollectionBatch, CollectorHealth, CollectorState, InterfaceHealth},
 };
 
 use domain::DomainDecoder;
@@ -68,11 +69,23 @@ pub type BatchReceiver = mpsc::Receiver<CollectionBatch>;
 
 const BATCH_CHANNEL_CAPACITY: usize = 4;
 
+/// How often the startup listener sweep is repeated.
+///
+/// Owner entries expire after `max(2 * idle_timeout, 30s)`; a pre-existing
+/// listener never fires `TCP_LISTEN_CB` again, so its seeded entry must be
+/// refreshed well before that window closes.
+const LISTENER_SEED_INTERVAL: Duration = Duration::from_secs(20);
+
 /// Private seam between the production Aya adapter and deterministic tests.
 pub(crate) trait KernelSource: Send {
     fn visit_flows(
         &mut self,
         visitor: &mut dyn FnMut(kernel_abi::FlowKey, &[kernel_abi::FlowValue]),
+    ) -> Result<usize>;
+
+    fn visit_owners(
+        &mut self,
+        visitor: &mut dyn FnMut(kernel_abi::OwnerKey, &kernel_abi::OwnerValue),
     ) -> Result<usize>;
 
     fn drain_domain_events(
@@ -87,6 +100,7 @@ pub(crate) trait KernelSource: Send {
 
     fn read_stats(&mut self) -> Result<kernel_abi::KernelStats>;
     fn attachment_health(&self) -> Vec<InterfaceHealth>;
+    fn application_health(&self) -> ApplicationHealth;
     fn detach(&mut self) -> Result<()>;
 }
 
@@ -182,6 +196,10 @@ struct CollectorCore {
     last_poll: Instant,
     map_entries: usize,
     map_capacity: usize,
+    owner_entries: usize,
+    /// `Some` once listener seeding is enabled (Linux collection start);
+    /// `None` keeps tests deterministic.
+    listener_seed: Option<Instant>,
     shutdown_complete: bool,
 }
 
@@ -192,7 +210,14 @@ impl CollectorCore {
     fn open(config: CollectorConfig) -> Result<Self> {
         let source =
             aya::AyaKernelSource::open(&config).context("open ZimaScope eBPF collector")?;
-        Ok(Self::new(config, Box::new(source)))
+        let mut core = Self::new(config, Box::new(source));
+        // Services already listening at startup never emit TCP_LISTEN_CB, so
+        // seed their ownership once before the first poll; poll_once refreshes
+        // the sweep periodically because owner entries expire.
+        let now = Instant::now();
+        listeners::seed(&mut core.tracker, now);
+        core.listener_seed = Some(now);
+        Ok(core)
     }
 
     #[cfg(not(target_os = "linux"))]
@@ -211,6 +236,8 @@ impl CollectorCore {
             last_poll: Instant::now(),
             map_entries: 0,
             map_capacity: kernel_abi::DEFAULT_FLOW_CAPACITY as usize,
+            owner_entries: 0,
+            listener_seed: None,
             shutdown_complete: false,
         }
     }
@@ -230,6 +257,15 @@ impl CollectorCore {
         let interval = poll_started.saturating_duration_since(self.last_poll);
         self.last_poll = poll_started;
         self.sequence = self.sequence.wrapping_add(1);
+
+        // Refresh pre-existing listener ownership before Flow reconciliation,
+        // so refreshed entries outlive this poll's owner-cache purge.
+        if let Some(last_seed) = self.listener_seed {
+            if poll_started.saturating_duration_since(last_seed) >= LISTENER_SEED_INTERVAL {
+                listeners::seed(&mut self.tracker, poll_started);
+                self.listener_seed = Some(poll_started);
+            }
+        }
 
         let mut flows = Vec::new();
         let mut domains = Vec::new();
@@ -271,6 +307,29 @@ impl CollectorCore {
                 degraded = true;
                 self.health
                     .open_gap(GapKey::ServiceEventsReadFailed, collected_at);
+            }
+        }
+
+        // Owners are read after Flows so a socket observed in the same poll is
+        // already cached when deltas are reconciled.
+        let owner_result = {
+            let source = &mut self.source;
+            let tracker = &mut self.tracker;
+            source.visit_owners(&mut |key, value| {
+                tracker.record_owner(&key, value, poll_started);
+            })
+        };
+
+        match owner_result {
+            Ok(entries) => {
+                self.owner_entries = entries;
+                self.health
+                    .close_gap(GapKey::OwnerMapReadFailed, collected_at);
+            }
+            Err(_) => {
+                degraded = true;
+                self.health
+                    .open_gap(GapKey::OwnerMapReadFailed, collected_at);
             }
         }
 
@@ -340,9 +399,14 @@ impl CollectorCore {
         } else {
             CollectorState::Running
         };
-        let health = self
-            .health
-            .snapshot(state, interfaces, self.map_entries, self.map_capacity);
+        let application = self.source.application_health();
+        let health = self.health.snapshot(
+            state,
+            interfaces,
+            self.map_entries,
+            self.map_capacity,
+            application,
+        );
 
         CollectionBatch {
             sequence: self.sequence,
@@ -357,6 +421,7 @@ impl CollectorCore {
     /// Detaches hooks and returns a final health snapshot.
     fn shutdown(mut self) -> Result<CollectorHealth> {
         let interfaces = self.source.attachment_health();
+        let application = self.source.application_health();
         let detach_result = self
             .source
             .detach()
@@ -368,6 +433,7 @@ impl CollectorCore {
             interfaces,
             self.map_entries,
             self.map_capacity,
+            application,
         );
         detach_result.map(|()| health)
     }
@@ -387,7 +453,7 @@ mod tests {
 
     use tokio::time::timeout;
     use zimascope_common::{
-        kernel_abi::{self, Direction},
+        kernel_abi::{self, Direction, OwnerKind},
         model::{
             AssociationConfidence, CollectorState, DomainEvidence, EndReason, FlowState, GapReason,
         },
@@ -395,7 +461,10 @@ mod tests {
 
     use super::{
         Collector, CollectorConfig, CollectorCore,
-        test_source::{InMemoryKernelSource, abi_dns_sample, abi_key, abi_tls_sample, abi_value},
+        test_source::{
+            InMemoryKernelSource, abi_dns_sample, abi_key, abi_owner_key, abi_owner_value,
+            abi_tls_sample, abi_value,
+        },
     };
 
     fn open_collector(source: InMemoryKernelSource, idle_timeout: Duration) -> CollectorCore {
@@ -805,5 +874,78 @@ mod tests {
         let second = collector.poll_once();
         assert_eq!(second.health.kernel.packets_seen, 50);
         assert_eq!(second.health.kernel.parse_failures, 10);
+    }
+
+    #[test]
+    fn flow_updates_carry_application_identity() {
+        let key = abi_key(
+            Direction::Outbound,
+            [10, 0, 0, 2],
+            [1, 1, 1, 1],
+            40_000,
+            443,
+            6,
+        );
+        let source = InMemoryKernelSource::new()
+            .with_flow(key, vec![abi_value(3, 300, 100, 200, 0)])
+            .with_owner(
+                abi_owner_key(6, OwnerKind::Socket, 40_000, Some(([1, 1, 1, 1], 443))),
+                abi_owner_value(4242, 1000, "curl"),
+            )
+            .with_interface(7, "eth0");
+        let mut collector = open_collector(source, Duration::from_secs(30));
+
+        let batch = collector.poll_once();
+
+        let application = batch.flows[0].application.as_ref().expect("application");
+        assert_eq!(application.tgid, 4242);
+        assert_eq!(application.uid, 1000);
+        assert_eq!(application.comm.as_ref(), "curl");
+        assert!(batch.health.application.attached);
+    }
+
+    #[test]
+    fn failed_owner_read_creates_a_gap_without_stopping_collection() {
+        let source = InMemoryKernelSource::new().with_interface(7, "eth0");
+        let handle = source.handle();
+        let mut collector = open_collector(source, Duration::from_secs(30));
+
+        assert_eq!(collector.poll_once().health.state, CollectorState::Running);
+
+        handle.set_owners_failing(true);
+        let degraded = collector.poll_once();
+
+        assert_eq!(degraded.health.state, CollectorState::Degraded);
+        assert_eq!(
+            degraded
+                .health
+                .gaps
+                .iter()
+                .filter(|gap| matches!(gap.reason, GapReason::MapReadFailed))
+                .count(),
+            1
+        );
+
+        handle.set_owners_failing(false);
+        let recovered = collector.poll_once();
+        assert_eq!(recovered.health.state, CollectorState::Running);
+    }
+
+    #[test]
+    fn application_health_reports_attach_failures() {
+        let source = InMemoryKernelSource::new().with_interface(7, "eth0");
+        let handle = source.handle();
+        handle.set_application_health(false, Some("cgroup attach conflict"));
+        let mut collector = open_collector(source, Duration::from_secs(30));
+
+        let batch = collector.poll_once();
+
+        assert!(!batch.health.application.attached);
+        assert_eq!(
+            batch.health.application.last_error.as_deref(),
+            Some("cgroup attach conflict")
+        );
+        // Attribution is advisory: collection is still running.
+        assert_eq!(batch.health.state, CollectorState::Running);
     }
 }

@@ -2,6 +2,8 @@
 // reverse proxy or the Vite dev proxy).
 
 import type {
+  ApplicationDetail,
+  ApplicationSummary,
   CollectorHealth,
   Connection,
   DomainDetail,
@@ -79,6 +81,8 @@ export interface FlowQuery {
   dst_ip?: string;
   port?: number;
   domain?: string;
+  /** Application Identity key (`proc:<exe>` or `cont:<container id>`). */
+  application_id?: string;
   country?: string;
   asn?: number;
   organization?: string;
@@ -146,6 +150,21 @@ export function fetchDomains(query: FlowQuery = {}): Promise<Page<DomainSummary>
   return request(`/v1/domains?${queryString(query)}`);
 }
 
+export function fetchApplications(query: FlowQuery = {}): Promise<Page<ApplicationSummary>> {
+  return request(`/v1/applications?${queryString(query)}`);
+}
+
+export function fetchApplication(id: string): Promise<ApplicationDetail> {
+  return request(`/v1/applications/${encodeURIComponent(id)}`);
+}
+
+export function fetchApplicationTimeline(
+  id: string,
+  range: TimeRange = "15m",
+): Promise<Timeline> {
+  return request(`/v1/applications/${encodeURIComponent(id)}/timeline?range=${range}`);
+}
+
 export function fetchDomain(domain: string): Promise<DomainDetail> {
   return request(`/v1/domains/${encodeURIComponent(domain)}`);
 }
@@ -204,6 +223,7 @@ export interface StreamQuery {
   dst_ip?: string;
   port?: number;
   domain?: string;
+  application_id?: string;
   exclude_scope?: string;
   state?: string;
   has_domain?: boolean;

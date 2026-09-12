@@ -139,6 +139,8 @@ pub struct FlowQuery {
     pub dst_ip: Option<std::net::IpAddr>,
     pub port: Option<u16>,
     pub domain: Option<String>,
+    /// Application Identity key (`proc:<exe>` or `cont:<container id>`).
+    pub application_id: Option<String>,
     pub country: Option<String>,
     pub asn: Option<u32>,
     pub organization: Option<String>,
@@ -197,6 +199,53 @@ pub struct DomainRefDto {
     pub confidence: AssociationConfidence,
 }
 
+/// Compact Application Identity attached to a Flow or Connection.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ApplicationRefDto {
+    pub id: String,
+    pub name: String,
+    pub kind: &'static str,
+}
+
+/// One Application Identity with its traffic over the requested window.
+#[derive(Clone, Debug, Serialize)]
+pub struct ApplicationSummaryDto {
+    pub id: String,
+    pub name: String,
+    pub kind: &'static str,
+    pub exe: Option<String>,
+    pub comm: Option<String>,
+    pub uid: Option<u32>,
+    pub container_id: Option<String>,
+    pub packets: u64,
+    pub bytes: u64,
+    /// Directional split relative to the Device Boundary.
+    pub traffic: DirectionTotalsDto,
+    pub flow_count: u64,
+    pub first_seen: i64,
+    pub last_seen: i64,
+}
+
+/// Application detail: profile fields plus the domains it contacted.
+#[derive(Clone, Debug, Serialize)]
+pub struct ApplicationDetailDto {
+    pub id: String,
+    pub name: String,
+    pub kind: &'static str,
+    pub exe: Option<String>,
+    pub comm: Option<String>,
+    pub uid: Option<u32>,
+    pub container_id: Option<String>,
+    pub packets: u64,
+    pub bytes: u64,
+    pub traffic: DirectionTotalsDto,
+    pub flow_count: u64,
+    pub first_seen: i64,
+    pub last_seen: i64,
+    pub domains: Vec<DomainRefDto>,
+    pub flows_url: String,
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct FlowDto {
     pub id: String,
@@ -219,6 +268,8 @@ pub struct FlowDto {
     pub last_seen: i64,
     pub duration_ms: u64,
     pub domains: Vec<DomainRefDto>,
+    /// Application Identity resolved from socket ownership, when observed.
+    pub application: Option<ApplicationRefDto>,
 }
 
 /// One connection: both directions of a Flow merged into a single record.
@@ -466,6 +517,16 @@ pub struct KernelCountersDto {
     pub domain_events_dropped: u64,
     pub service_events_emitted: u64,
     pub service_events_dropped: u64,
+    pub owner_events_inserted: u64,
+    pub owner_events_dropped: u64,
+}
+
+/// Application Identity capture health.
+#[derive(Clone, Debug, Serialize)]
+pub struct ApplicationHealthDto {
+    pub attached: bool,
+    pub udp_attached: bool,
+    pub last_error: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -483,6 +544,7 @@ pub struct CollectorHealthDto {
     pub map: MapUsageDto,
     pub kernel: KernelCountersDto,
     pub gaps: Vec<ObservationGapDto>,
+    pub application: ApplicationHealthDto,
 }
 
 impl CollectorHealthDto {
@@ -514,6 +576,8 @@ impl CollectorHealthDto {
                 domain_events_dropped: health.kernel.domain_events_dropped,
                 service_events_emitted: health.kernel.service_events_emitted,
                 service_events_dropped: health.kernel.service_events_dropped,
+                owner_events_inserted: health.kernel.owner_events_inserted,
+                owner_events_dropped: health.kernel.owner_events_dropped,
             },
             gaps: health
                 .gaps
@@ -533,6 +597,15 @@ impl CollectorHealthDto {
                     }
                 })
                 .collect(),
+            application: ApplicationHealthDto {
+                attached: health.application.attached,
+                udp_attached: health.application.udp_attached,
+                last_error: health
+                    .application
+                    .last_error
+                    .as_ref()
+                    .map(ToString::to_string),
+            },
         }
     }
 }
@@ -675,6 +748,7 @@ pub struct TickDto {
     pub flows: Vec<FlowDto>,
     pub endpoints: Vec<EndpointSummaryDto>,
     pub domains: Vec<DomainSummaryDto>,
+    pub applications: Vec<ApplicationSummaryDto>,
     pub observations: Vec<DomainObservationDto>,
     pub overview: TickOverviewDto,
     pub health: Option<CollectorHealthDto>,
@@ -724,6 +798,7 @@ pub struct StreamQuery {
     pub dst_ip: Option<std::net::IpAddr>,
     pub port: Option<u16>,
     pub domain: Option<String>,
+    pub application_id: Option<String>,
     #[serde(default, deserialize_with = "deserialize_scope_list")]
     pub exclude_scope: Vec<AddressScope>,
     pub state: Option<FlowStateParam>,
@@ -748,6 +823,12 @@ impl StreamQuery {
                 .domain
                 .as_deref()
                 .map(|domain| domain.trim().trim_end_matches('.').to_ascii_lowercase()),
+            application_id: self
+                .application_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|id| !id.is_empty())
+                .map(ToOwned::to_owned),
             exclude_scope: self.exclude_scope.clone(),
             state: self.state,
             has_domain: self.has_domain,
@@ -766,6 +847,7 @@ pub struct StreamFilter {
     dst_ip: Option<String>,
     port: Option<u16>,
     domain: Option<String>,
+    application_id: Option<String>,
     exclude_scope: Vec<AddressScope>,
     state: Option<FlowStateParam>,
     has_domain: Option<bool>,
@@ -821,6 +903,11 @@ impl StreamFilter {
                 return false;
             }
         }
+        if let Some(application_id) = &self.application_id {
+            if flow.application.as_ref().map(|app| &app.id) != Some(application_id) {
+                return false;
+            }
+        }
         if let Some(state) = self.state {
             if flow.state != state.as_str() {
                 return false;
@@ -868,6 +955,9 @@ fn flow_search_text(flow: &FlowDto) -> String {
     }
     if let Some(interface) = &flow.interface {
         let _ = write!(text, "{interface} ");
+    }
+    if let Some(application) = &flow.application {
+        let _ = write!(text, "{} {} ", application.id, application.name);
     }
     for domain in &flow.domains {
         let _ = write!(text, "{} ", domain.domain);

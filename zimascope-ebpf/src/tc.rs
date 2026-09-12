@@ -1,14 +1,17 @@
 //! TC ingress and egress entry points.
 //!
-//! Every path returns `TC_ACT_OK`: ZimaScope V1 observes traffic and never
-//! drops, delays or modifies a packet.
+//! Every path returns `TC_ACT_UNSPEC`: ZimaScope observes traffic and never
+//! drops, delays or modifies a packet. Under tcx multiprog a program that
+//! returns `TC_ACT_OK` also stops the chain, so `TC_ACT_UNSPEC` is what lets
+//! other classifiers attached to the same interface still run; when ZimaScope
+//! is last the kernel treats it as pass.
 //!
 //! The packet path never parses domain evidence. For candidate packets it
 //! peeks at constant offsets and copies a bounded L4 payload sample into a
 //! ring buffer; DNS, TLS SNI and HTTP Host are parsed in user space.
 
 use aya_ebpf::{
-    bindings::{BPF_ANY, TC_ACT_OK},
+    bindings::{BPF_ANY, TC_ACT_UNSPEC},
     cty::c_void,
     helpers::{bpf_ktime_get_ns, bpf_skb_load_bytes},
     macros::classifier,
@@ -74,7 +77,7 @@ fn process(ctx: &TcContext, direction: u8) -> i32 {
         }
     }
 
-    TC_ACT_OK as i32
+    TC_ACT_UNSPEC as i32
 }
 
 #[inline(always)]

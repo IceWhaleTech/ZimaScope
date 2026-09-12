@@ -8,7 +8,7 @@ import { useEffect, useState } from "react";
 import { useNavigate } from "react-router";
 import { motion } from "motion/react";
 import { toast } from "sonner";
-import { ArrowLeftRight, ChevronRight, Globe, X } from "lucide-react";
+import { ArrowLeftRight, Boxes, ChevronRight, Globe, Terminal, X } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { Skeleton } from "@/components/ui/skeleton";
@@ -18,7 +18,15 @@ import { CountryLabel, DirectionBadge, EvidenceChip, ScopeChip, StateBadge } fro
 import { Segmented } from "@/components/segmented";
 import { DefList, PanelSection, StatTiles } from "@/components/stat-tiles";
 import { useDetails } from "@/hooks/use-details";
-import { useDomain, useDomainTimeline, useEndpoint, useEndpointTimeline, useFlow } from "@/hooks/use-data";
+import {
+  useApplication,
+  useApplicationTimeline,
+  useDomain,
+  useDomainTimeline,
+  useEndpoint,
+  useEndpointTimeline,
+  useFlow,
+} from "@/hooks/use-data";
 import {
   formatBytes,
   formatClock,
@@ -27,7 +35,7 @@ import {
   relativeTime,
   evidenceTitle,
 } from "@/lib/format";
-import type { DomainDetail, EndpointDetail, Flow, TimeRange } from "@/types";
+import type { ApplicationDetail, DomainDetail, EndpointDetail, Flow, TimeRange } from "@/types";
 
 const enter = {
   initial: { opacity: 0, y: 6 },
@@ -58,6 +66,9 @@ export function DetailSheet() {
           <EndpointDetail key={`endpoint:${target.address}`} address={target.address} />
         )}
         {target?.kind === "domain" && <DomainDetail key={`domain:${target.name}`} name={target.name} />}
+        {target?.kind === "application" && (
+          <ApplicationDetailPanel key={`application:${target.id}`} id={target.id} />
+        )}
       </SheetContent>
     </Sheet>
   );
@@ -98,12 +109,20 @@ const TREND_RANGES = [
   { value: "7d", label: "7d" },
 ];
 
-/** Bytes observed for one Endpoint or Domain over the selected range. */
-function EntityTrend({ kind, target }: { kind: "endpoint" | "domain"; target: string }) {
+/** Bytes observed for one Endpoint, Domain or Application over the range. */
+function EntityTrend({
+  kind,
+  target,
+}: {
+  kind: "endpoint" | "domain" | "application";
+  target: string;
+}) {
   const [range, setRange] = useState<TimeRange>("15m");
   const endpointQuery = useEndpointTimeline(kind === "endpoint" ? target : null, range);
   const domainQuery = useDomainTimeline(kind === "domain" ? target : null, range);
-  const query = kind === "endpoint" ? endpointQuery : domainQuery;
+  const applicationQuery = useApplicationTimeline(kind === "application" ? target : null, range);
+  const query =
+    kind === "endpoint" ? endpointQuery : kind === "domain" ? domainQuery : applicationQuery;
 
   return (
     <PanelSection title="Traffic trend" subtitle="Bytes at the device boundary per interval">
@@ -164,7 +183,7 @@ function FlowDetail({ id }: { id: string }) {
 }
 
 function FlowDetailBody({ flow }: { flow: Flow }) {
-  const { close } = useDetails();
+  const { close, open } = useDetails();
   const navigate = useNavigate();
   const domain = flow.domains[0];
   const network = flow.remote_profile;
@@ -249,6 +268,28 @@ function FlowDetailBody({ flow }: { flow: Flow }) {
         <PanelSection title="Path" subtitle="Direction relative to the device boundary">
           <DefList
             rows={[
+              ...(flow.application
+                ? [
+                    {
+                      label: "Application",
+                      value: (
+                        <button
+                          type="button"
+                          onClick={() => open({ kind: "application", id: flow.application!.id })}
+                          className="inline-flex max-w-full items-center gap-1 truncate text-xs font-medium text-foreground underline-offset-2 hover:underline"
+                          title={flow.application.id}
+                        >
+                          {flow.application.kind === "container" ? (
+                            <Boxes className="size-3 shrink-0" />
+                          ) : (
+                            <Terminal className="size-3 shrink-0" />
+                          )}
+                          <span className="truncate">{flow.application.name}</span>
+                        </button>
+                      ),
+                    },
+                  ]
+                : []),
               {
                 label: flow.direction === "outbound" ? "From" : "Remote source",
                 value: <span className="font-mono text-xs">{source}</span>,
@@ -568,5 +609,129 @@ function UsageBar({ ratio }: { ratio: number }) {
         style={{ width: `${Math.max(2, Math.min(100, ratio * 100)).toFixed(1)}%` }}
       />
     </div>
+  );
+}
+
+/* ---------------------------- Application --------------------------------- */
+
+function ApplicationDetailPanel({ id }: { id: string }) {
+  const query = useApplication(id);
+  const { close } = useDetails();
+  useEffect(() => {
+    if (query.isSuccess && !query.data) {
+      toast.error("Application not found in retained history");
+      close();
+    }
+  }, [query.isSuccess, query.data, close]);
+  const detail = query.data;
+  return (
+    <>
+      <PanelHead
+        eyebrow="Application detail"
+        title={detail?.name ?? id}
+        subtitle={
+          detail
+            ? `${detail.kind} · ${detail.flow_count} flows · seen ${relativeTime(detail.last_seen)}`
+            : "Process attributed through observed socket ownership"
+        }
+      />
+      {detail ? <ApplicationDetailBody detail={detail} /> : query.isLoading ? <PanelLoading /> : null}
+    </>
+  );
+}
+
+function ApplicationDetailBody({ detail }: { detail: ApplicationDetail }) {
+  const { close, open } = useDetails();
+  const navigate = useNavigate();
+  const Icon = detail.kind === "container" ? Boxes : Terminal;
+  return (
+    <ScrollArea className="min-h-0 min-w-0 max-w-full flex-1 overflow-hidden">
+      <motion.div {...enter} className="flex w-full min-w-0 max-w-full flex-col gap-5 p-4">
+        <div className="flex flex-wrap items-center gap-2">
+          <span className="inline-flex items-center gap-1.5 rounded-md border border-border/60 px-2 py-0.5 text-2xs text-muted-foreground">
+            <Icon className="size-3" />
+            {detail.kind === "container" ? "Container" : "Process"}
+          </span>
+        </div>
+
+        <StatTiles
+          tiles={[
+            { label: "Total traffic", value: formatBytes(detail.bytes) },
+            { label: "Packets", value: formatNumber(detail.packets) },
+            { label: "Flows", value: String(detail.flow_count) },
+            { label: "First seen", value: relativeTime(detail.first_seen) },
+          ]}
+        />
+
+        <EntityTrend kind="application" target={detail.id} />
+
+        <PanelSection title="Identity" subtitle="Observed evidence for this Application">
+          <DefList
+            rows={[
+              {
+                label: "Key",
+                value: (
+                  <span className="font-mono text-xs" title={detail.id}>
+                    {detail.id}
+                  </span>
+                ),
+              },
+              {
+                label: "Executable",
+                value: detail.exe ? <span className="font-mono text-xs">{detail.exe}</span> : "—",
+              },
+              { label: "Process name", value: detail.comm ?? "—" },
+              { label: "UID", value: detail.uid !== null ? String(detail.uid) : "—" },
+              ...(detail.container_id
+                ? [
+                    {
+                      label: "Container",
+                      value: <span className="font-mono text-xs">{detail.container_id}</span>,
+                    },
+                  ]
+                : []),
+            ]}
+          />
+          <p className="text-2xs text-muted-foreground">
+            Attribution comes from observed socket ownership; the executable path is best-effort
+            and a process that exited before resolution keeps its captured name.
+          </p>
+        </PanelSection>
+
+        <PanelSection title="Associated domains" subtitle="Names contacted by this Application">
+          {detail.domains.length ? (
+            <ul className="flex flex-col">
+              {detail.domains.slice(0, 8).map((ref) => (
+                <li key={ref.domain}>
+                  <button
+                    type="button"
+                    onClick={() => open({ kind: "domain", name: ref.domain })}
+                    className="flex w-full items-center gap-2 rounded-md px-1 py-2 text-left transition-colors hover:bg-accent"
+                  >
+                    <span className="min-w-0 flex-1 truncate text-xs font-medium">{ref.domain}</span>
+                    <EvidenceChip evidence={ref.evidence} confidence={ref.confidence} />
+                    <ChevronRight className="size-3.5 shrink-0 text-muted-foreground" />
+                  </button>
+                </li>
+              ))}
+            </ul>
+          ) : (
+            <p className="text-xs text-muted-foreground">
+              No Associated Domain was observed for this Application yet.
+            </p>
+          )}
+        </PanelSection>
+
+        <Button
+          onClick={() => {
+            close();
+            navigate(`/flows?application=${encodeURIComponent(detail.id)}`);
+          }}
+        >
+          <ArrowLeftRight className="size-3.5" />
+          View all flows
+        </Button>
+      </motion.div>
+    </ScrollArea>
   );
 }

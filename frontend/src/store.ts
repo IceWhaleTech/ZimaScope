@@ -9,6 +9,8 @@
 import * as api from "./api";
 import type { CreateExportRequest, FlowQuery, StreamQuery } from "./api";
 import type {
+  ApplicationDetail,
+  ApplicationSummary,
   Connection,
   DomainDetail,
   DomainSummary,
@@ -89,6 +91,18 @@ export const data = {
   },
   domainTimeline: (name: string, range: TimeRange): Promise<Timeline> =>
     api.fetchDomainTimeline(name, range),
+  applications: (query: FlowQuery): Promise<Page<ApplicationSummary>> =>
+    api.fetchApplications(query),
+  application: async (id: string): Promise<ApplicationDetail | null> => {
+    try {
+      return await api.fetchApplication(id);
+    } catch (error) {
+      if (isNotFound(error)) return null;
+      throw error;
+    }
+  },
+  applicationTimeline: (id: string, range: TimeRange): Promise<Timeline> =>
+    api.fetchApplicationTimeline(id, range),
   status: (): Promise<ServiceStatus> => api.fetchStatus(),
   settings: (): Promise<Settings> => api.fetchSettings(),
   saveSettings: (patch: SettingsPatch): Promise<Settings> => api.patchSettings(patch),

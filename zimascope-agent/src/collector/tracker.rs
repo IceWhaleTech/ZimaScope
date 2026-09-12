@@ -1,13 +1,17 @@
 //! Flow reconciliation between kernel map snapshots and user-space state.
 
-use std::time::{Duration, Instant};
+use std::{
+    net::{IpAddr, Ipv4Addr},
+    time::{Duration, Instant},
+};
 
 use hashbrown::HashMap;
 use zimascope_common::{
     kernel_abi,
+    kernel_abi::{IpFamily, OwnerKind, TransportProtocol},
     model::{
-        EndReason, Endpoint, FlowDirection, FlowKey, FlowState, FlowUpdate, Protocol,
-        TrafficCounters,
+        ApplicationRef, EndReason, Endpoint, FlowDirection, FlowKey, FlowState, FlowUpdate,
+        Protocol, TrafficCounters,
     },
 };
 
@@ -66,7 +70,20 @@ struct PreviousFlow {
     state: FlowState,
     generation: u64,
     service: Option<Box<str>>,
+    application: Option<ApplicationRef>,
 }
+
+/// One owner observation kept until it is older than any Flow it may explain.
+#[derive(Clone, Debug)]
+struct OwnerRecord {
+    application: ApplicationRef,
+    observed_at: Instant,
+}
+
+/// Hard bound on cached owner entries; kernel maps are LRU-bounded, so a
+/// user-space cache that exceeds the same scale drops entries wholesale rather
+/// than growing without limit.
+const OWNER_CACHE_CAPACITY: usize = 65_536;
 
 const TCP_FIN: u16 = 0x001;
 const TCP_RST: u16 = 0x004;
@@ -77,6 +94,11 @@ pub(crate) struct FlowTracker {
     /// Services classified before their Flow's first map snapshot arrived;
     /// consumed when the Flow is first observed.
     pending_services: HashMap<FlowKey, Box<str>>,
+    /// Socket owners captured in process context, keyed like the kernel map.
+    owners: HashMap<kernel_abi::OwnerKey, OwnerRecord>,
+    /// Listening-port owners used as the fallback for server-side Flows.
+    listeners: HashMap<kernel_abi::OwnerKey, OwnerRecord>,
+    owner_retention: Duration,
     idle_timeout: Duration,
     generation: u64,
     clock: MonoClock,
@@ -88,6 +110,9 @@ impl FlowTracker {
         Self {
             previous: HashMap::new(),
             pending_services: HashMap::new(),
+            owners: HashMap::new(),
+            listeners: HashMap::new(),
+            owner_retention: idle_timeout.saturating_mul(2).max(Duration::from_secs(30)),
             idle_timeout,
             generation: 0,
             clock: MonoClock::default(),
@@ -179,10 +204,13 @@ impl FlowTracker {
                 last_seen: previous.last_seen,
                 state: FlowState::Ended(EndReason::EvictedOrUnknown),
                 service: previous.service.clone(),
+                application: previous.application.clone(),
             });
 
             false
         });
+
+        self.purge_owners(now);
 
         updates
     }
@@ -195,6 +223,7 @@ impl FlowTracker {
     ) -> Option<FlowUpdate> {
         let first_seen = self.clock.to_instant(merged.first_seen_ns);
         let last_seen = self.clock.to_instant(merged.last_seen_ns);
+        let application = self.resolve_application(&merged.key);
 
         let previous = match self.previous.get_mut(&merged.key) {
             Some(previous) => previous,
@@ -213,6 +242,7 @@ impl FlowTracker {
                         state: FlowState::Active,
                         generation,
                         service: service.clone(),
+                        application: application.clone(),
                     },
                 );
                 return Some(FlowUpdate {
@@ -223,10 +253,16 @@ impl FlowTracker {
                     last_seen,
                     state: FlowState::Active,
                     service,
+                    application,
                 });
             }
         };
 
+        // An owner may arrive in a later poll than the Flow itself; fill it in
+        // once and keep it for the life of the Flow.
+        if previous.application.is_none() {
+            previous.application = application;
+        }
         previous.generation = generation;
 
         let recreated = merged.total.packets < previous.total.packets
@@ -282,7 +318,109 @@ impl FlowTracker {
             last_seen,
             state,
             service: previous.service.clone(),
+            application: previous.application.clone(),
         })
+    }
+
+    /// Records one socket-owner observation for later Flow joins.
+    pub fn record_owner(
+        &mut self,
+        key: &kernel_abi::OwnerKey,
+        value: &kernel_abi::OwnerValue,
+        observed_at: Instant,
+    ) {
+        let Some(kind) = OwnerKind::from_abi(key.kind) else {
+            return;
+        };
+        let Some(application) = application_ref(value) else {
+            return;
+        };
+        let record = OwnerRecord {
+            application,
+            observed_at,
+        };
+        match kind {
+            OwnerKind::Socket => {
+                self.owners.insert(*key, record);
+            }
+            OwnerKind::Listener => {
+                self.listeners.insert(*key, record);
+            }
+        }
+    }
+
+    /// Resolves the Application Identity for one Flow.
+    ///
+    /// The exact socket entry is tried first; server-side Flows whose accept
+    /// happened in softirq context fall back to the listener entry for their
+    /// local port.
+    fn resolve_application(&self, key: &FlowKey) -> Option<ApplicationRef> {
+        let (local_port, remote_address, remote_port) = match key.direction {
+            FlowDirection::Outbound => (
+                key.source.port?,
+                key.destination.address,
+                key.destination.port,
+            ),
+            FlowDirection::Inbound => (key.destination.port?, key.source.address, key.source.port),
+        };
+        let protocol = match key.protocol {
+            Protocol::Tcp => TransportProtocol::Tcp as u8,
+            Protocol::Udp => TransportProtocol::Udp as u8,
+        };
+
+        let socket_key = owner_key(
+            protocol,
+            OwnerKind::Socket,
+            local_port,
+            remote_address,
+            remote_port,
+        );
+        if let Some(record) = self.owners.get(&socket_key) {
+            return Some(record.application.clone());
+        }
+
+        // UDP owner entries carry the remote endpoint only: the sendmsg hook
+        // has no stable local port. Join those by remote while keeping the
+        // exact-tuple lookup above for any future local-port capture.
+        if key.protocol == Protocol::Udp {
+            let remote_key = owner_key(
+                TransportProtocol::Udp as u8,
+                OwnerKind::Socket,
+                0,
+                remote_address,
+                remote_port,
+            );
+            if let Some(record) = self.owners.get(&remote_key) {
+                return Some(record.application.clone());
+            }
+        }
+
+        let listener_key = owner_key(
+            protocol,
+            OwnerKind::Listener,
+            local_port,
+            IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            None,
+        );
+        self.listeners
+            .get(&listener_key)
+            .map(|record| record.application.clone())
+    }
+
+    /// Drops owner observations older than any Flow they could still explain.
+    fn purge_owners(&mut self, now: Instant) {
+        let retention = self.owner_retention;
+        self.owners
+            .retain(|_, record| now.saturating_duration_since(record.observed_at) < retention);
+        self.listeners
+            .retain(|_, record| now.saturating_duration_since(record.observed_at) < retention);
+
+        if self.owners.len() > OWNER_CACHE_CAPACITY {
+            self.owners.clear();
+        }
+        if self.listeners.len() > OWNER_CACHE_CAPACITY {
+            self.listeners.clear();
+        }
     }
 
     /// Records a fingerprinted service for a flow. The value rides every later
@@ -302,6 +440,57 @@ impl FlowTracker {
     pub fn merged_buffer(&mut self) -> &mut Vec<MergedFlow> {
         self.merged.clear();
         &mut self.merged
+    }
+}
+
+/// Converts a kernel owner observation into the user-space Application Identity.
+fn application_ref(value: &kernel_abi::OwnerValue) -> Option<ApplicationRef> {
+    if value.tgid == 0 {
+        // Kernel-originated sockets have no user-space process.
+        return None;
+    }
+    Some(ApplicationRef {
+        tgid: value.tgid,
+        uid: value.uid,
+        cgroup_id: value.cgroup_id,
+        comm: comm_text(&value.comm),
+    })
+}
+
+fn comm_text(raw: &[u8; 16]) -> Box<str> {
+    let end = raw.iter().position(|byte| *byte == 0).unwrap_or(raw.len());
+    let text = std::str::from_utf8(&raw[..end]).unwrap_or_default();
+    text.trim().into()
+}
+
+/// Builds the kernel-shaped lookup key for one side of a Flow.
+fn owner_key(
+    protocol: u8,
+    kind: OwnerKind,
+    local_port: u16,
+    remote: IpAddr,
+    remote_port: Option<u16>,
+) -> kernel_abi::OwnerKey {
+    let mut remote_addr = [0u8; 16];
+    let ip_family = match remote {
+        IpAddr::V4(address) => {
+            remote_addr[12..].copy_from_slice(&address.octets());
+            IpFamily::V4
+        }
+        IpAddr::V6(address) => {
+            remote_addr.copy_from_slice(&address.octets());
+            IpFamily::V6
+        }
+    };
+
+    kernel_abi::OwnerKey {
+        remote_addr,
+        remote_port_be: remote_port.map(u16::to_be).unwrap_or(0),
+        local_port_be: local_port.to_be(),
+        protocol,
+        kind: kind as u8,
+        ip_family: ip_family as u8,
+        reserved: 0,
     }
 }
 
@@ -342,7 +531,7 @@ pub(crate) fn decode_key(key: &kernel_abi::FlowKey) -> Option<FlowKey> {
 
 #[cfg(test)]
 mod tests {
-    use zimascope_common::kernel_abi::{Direction, IpFamily, TransportProtocol};
+    use zimascope_common::kernel_abi::{Direction, IpFamily, OwnerKind, TransportProtocol};
 
     use super::*;
 
@@ -374,6 +563,23 @@ mod tests {
             parse_flags: 0,
             service_flags: 0,
             reserved: 0,
+        }
+    }
+
+    fn owner_value(tgid: u32, uid: u32, comm: &str) -> kernel_abi::OwnerValue {
+        let mut raw = [0u8; 16];
+        let bytes = comm.as_bytes();
+        let length = bytes.len().min(raw.len());
+        raw[..length].copy_from_slice(&bytes[..length]);
+
+        kernel_abi::OwnerValue {
+            tgid,
+            pid: tgid,
+            uid,
+            reserved: 0,
+            cgroup_id: 0,
+            comm: raw,
+            observed_mono_ns: 1_000,
         }
     }
 
@@ -584,5 +790,226 @@ mod tests {
 
         observe(&mut tracker, &key, &[value(1, 100, 100, 200, 0)], now);
         assert!(tracker.reconcile(now + Duration::from_secs(1)).is_empty());
+    }
+
+    #[test]
+    fn socket_owner_joins_outbound_flows() {
+        let mut tracker = FlowTracker::new(Duration::from_secs(30));
+        let now = Instant::now();
+        let kernel_key = key();
+        let lookup = super::owner_key(
+            TransportProtocol::Tcp as u8,
+            OwnerKind::Socket,
+            40_000,
+            "1.1.1.1".parse().expect("remote"),
+            Some(443),
+        );
+
+        tracker.record_owner(&lookup, &owner_value(4321, 1000, "curl"), now);
+        let updates = observe(
+            &mut tracker,
+            &kernel_key,
+            &[value(1, 100, 100, 200, 0)],
+            now,
+        );
+
+        let application = updates[0].application.as_ref().expect("application");
+        assert_eq!(application.tgid, 4321);
+        assert_eq!(application.uid, 1000);
+        assert_eq!(application.comm.as_ref(), "curl");
+    }
+
+    #[test]
+    fn listener_owner_joins_inbound_flows() {
+        let mut tracker = FlowTracker::new(Duration::from_secs(30));
+        let now = Instant::now();
+        let mut kernel_key = key();
+        kernel_key.direction = kernel_abi::Direction::Inbound as u8;
+        kernel_key.src_addr = addr([9, 9, 9, 9]);
+        kernel_key.src_port_be = 55_000u16.to_be();
+        kernel_key.dst_addr = addr([10, 0, 0, 2]);
+        kernel_key.dst_port_be = 8443u16.to_be();
+
+        let lookup = super::owner_key(
+            TransportProtocol::Tcp as u8,
+            OwnerKind::Listener,
+            8443,
+            "0.0.0.0".parse().expect("unspecified"),
+            None,
+        );
+        tracker.record_owner(&lookup, &owner_value(777, 0, "nginx"), now);
+
+        let updates = observe(
+            &mut tracker,
+            &kernel_key,
+            &[value(1, 100, 100, 200, 0)],
+            now,
+        );
+
+        let application = updates[0].application.as_ref().expect("application");
+        assert_eq!(application.tgid, 777);
+        assert_eq!(application.comm.as_ref(), "nginx");
+    }
+
+    #[test]
+    fn exact_socket_owner_wins_over_the_listener_fallback() {
+        let mut tracker = FlowTracker::new(Duration::from_secs(30));
+        let now = Instant::now();
+        let mut kernel_key = key();
+        kernel_key.direction = kernel_abi::Direction::Inbound as u8;
+        kernel_key.src_addr = addr([9, 9, 9, 9]);
+        kernel_key.src_port_be = 55_000u16.to_be();
+        kernel_key.dst_addr = addr([10, 0, 0, 2]);
+        kernel_key.dst_port_be = 8443u16.to_be();
+
+        let listener = super::owner_key(
+            TransportProtocol::Tcp as u8,
+            OwnerKind::Listener,
+            8443,
+            "0.0.0.0".parse().expect("unspecified"),
+            None,
+        );
+        tracker.record_owner(&listener, &owner_value(777, 0, "nginx"), now);
+
+        let socket = super::owner_key(
+            TransportProtocol::Tcp as u8,
+            OwnerKind::Socket,
+            8443,
+            "9.9.9.9".parse().expect("remote"),
+            Some(55_000),
+        );
+        tracker.record_owner(&socket, &owner_value(888, 0, "worker"), now);
+
+        let updates = observe(
+            &mut tracker,
+            &kernel_key,
+            &[value(1, 100, 100, 200, 0)],
+            now,
+        );
+        assert_eq!(
+            updates[0].application.as_ref().expect("application").tgid,
+            888
+        );
+    }
+
+    #[test]
+    fn late_owner_fills_in_missing_application() {
+        let mut tracker = FlowTracker::new(Duration::from_secs(30));
+        let now = Instant::now();
+        let kernel_key = key();
+
+        let first = observe(
+            &mut tracker,
+            &kernel_key,
+            &[value(1, 100, 100, 200, 0)],
+            now,
+        );
+        assert!(first[0].application.is_none());
+
+        let lookup = super::owner_key(
+            TransportProtocol::Tcp as u8,
+            OwnerKind::Socket,
+            40_000,
+            "1.1.1.1".parse().expect("remote"),
+            Some(443),
+        );
+        tracker.record_owner(&lookup, &owner_value(4321, 0, "curl"), now);
+
+        let second = observe(
+            &mut tracker,
+            &kernel_key,
+            &[value(2, 200, 100, 300, 0)],
+            now + Duration::from_millis(10),
+        );
+        assert_eq!(
+            second[0].application.as_ref().expect("application").tgid,
+            4321
+        );
+    }
+
+    #[test]
+    fn owners_expire_after_the_retention_window() {
+        let mut tracker = FlowTracker::new(Duration::from_secs(10));
+        let now = Instant::now();
+        let lookup = super::owner_key(
+            TransportProtocol::Tcp as u8,
+            OwnerKind::Socket,
+            40_000,
+            "1.1.1.1".parse().expect("remote"),
+            Some(443),
+        );
+        tracker.record_owner(&lookup, &owner_value(4321, 0, "curl"), now);
+
+        // Reconcile past the retention window (max(2 * idle_timeout, 30s)).
+        tracker.reconcile(now + Duration::from_secs(31));
+
+        let updates = observe(
+            &mut tracker,
+            &key(),
+            &[value(1, 100, 100, 200, 0)],
+            now + Duration::from_secs(31),
+        );
+        assert!(updates[0].application.is_none());
+    }
+
+    #[test]
+    fn udp_owner_joins_by_remote_endpoint() {
+        let mut tracker = FlowTracker::new(Duration::from_secs(30));
+        let now = Instant::now();
+        let mut kernel_key = key();
+        kernel_key.protocol = TransportProtocol::Udp as u8;
+        kernel_key.dst_addr = addr([8, 8, 8, 8]);
+        kernel_key.dst_port_be = 53u16.to_be();
+
+        // The sendmsg hook has no local port, so UDP owner entries are keyed
+        // by remote endpoint only.
+        let lookup = super::owner_key(
+            TransportProtocol::Udp as u8,
+            OwnerKind::Socket,
+            0,
+            "8.8.8.8".parse().expect("remote"),
+            Some(53),
+        );
+        tracker.record_owner(&lookup, &owner_value(555, 0, "dig"), now);
+
+        let updates = observe(
+            &mut tracker,
+            &kernel_key,
+            &[value(1, 100, 100, 200, 0)],
+            now,
+        );
+        assert_eq!(
+            updates[0]
+                .application
+                .as_ref()
+                .expect("application")
+                .comm
+                .as_ref(),
+            "dig"
+        );
+    }
+
+    #[test]
+    fn udp_entries_do_not_resolve_tcp_flows() {
+        let mut tracker = FlowTracker::new(Duration::from_secs(30));
+        let now = Instant::now();
+
+        let lookup = super::owner_key(
+            TransportProtocol::Udp as u8,
+            OwnerKind::Socket,
+            0,
+            "1.1.1.1".parse().expect("remote"),
+            Some(443),
+        );
+        tracker.record_owner(&lookup, &owner_value(555, 0, "dig"), now);
+
+        let updates = observe(&mut tracker, &key(), &[value(1, 100, 100, 200, 0)], now);
+        assert!(updates[0].application.is_none());
+    }
+
+    fn addr(octets: [u8; 4]) -> [u8; 16] {
+        let mut storage = [0u8; 16];
+        storage[12..].copy_from_slice(&octets);
+        storage
     }
 }

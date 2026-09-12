@@ -1,7 +1,8 @@
 /**
- * Detail panel controller. Any view can ask to inspect a flow, endpoint or
- * domain; the shell renders the right builder inside the side Sheet. Deep
- * links (`?flow=`, `?address=`, `?domain=`) open it on mount the same way.
+ * Detail panel controller. Any view can ask to inspect a flow, endpoint,
+ * domain or application; the shell renders the right builder inside the side
+ * Sheet. Deep links (`?flow=`, `?address=`, `?domain=`) open it on mount the
+ * same way.
  */
 
 import { createContext, useCallback, useContext, useMemo, useState, type ReactNode } from "react";
@@ -9,7 +10,8 @@ import { createContext, useCallback, useContext, useMemo, useState, type ReactNo
 export type DetailTarget =
   | { kind: "flow"; id: string }
   | { kind: "endpoint"; address: string }
-  | { kind: "domain"; name: string };
+  | { kind: "domain"; name: string }
+  | { kind: "application"; id: string };
 
 interface DetailsContextValue {
   target: DetailTarget | null;

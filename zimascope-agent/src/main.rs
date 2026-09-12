@@ -15,6 +15,12 @@ const SOCKET_ENV: &str = "ZIMASCOPE_API_SOCKET";
 /// browser or Vite proxy can reach the Unix-socket API. Never set in
 /// production: the daemon is meant to be reached through ZimaOS only.
 const TCP_ENV: &str = "ZIMASCOPE_API_TCP";
+/// Production HTTP listener (e.g. `0.0.0.0:8080`). When set, the full `/v1`
+/// API and, if [`UI_ENV`] points at a built frontend, the SPA are served on
+/// this address.
+const HTTP_ENV: &str = "ZIMASCOPE_HTTP_LISTEN";
+/// Directory of the built frontend (`dist/`) served by [`HTTP_ENV`].
+const UI_ENV: &str = "ZIMASCOPE_UI_DIR";
 /// One `.mmdb` file or a directory of them (country and ASN databases are
 /// merged per lookup). Missing or invalid files degrade to scope-only
 /// profiles instead of failing startup.
@@ -82,6 +88,34 @@ async fn main() {
         }
     }
 
+    if let Some(address) = http_address() {
+        match tokio::net::TcpListener::bind(address).await {
+            Ok(listener) => {
+                let router = match std::env::var_os(UI_ENV).map(PathBuf::from) {
+                    Some(ui_dir) if ui_dir.is_dir() => {
+                        eprintln!("zimascope-agent: serving UI from {}", ui_dir.display());
+                        api::router_with_ui(state.clone(), &ui_dir)
+                    }
+                    Some(ui_dir) => {
+                        eprintln!(
+                            "zimascope-agent: UI directory {} is missing; serving API only",
+                            ui_dir.display()
+                        );
+                        api::router(state.clone())
+                    }
+                    None => api::router(state.clone()),
+                };
+                eprintln!("zimascope-agent: http server listening on http://{address}");
+                servers.push(tokio::spawn(async move {
+                    if let Err(error) = axum::serve(listener, router).await {
+                        eprintln!("zimascope-agent: http server stopped: {error}");
+                    }
+                }));
+            }
+            Err(error) => eprintln!("zimascope-agent: cannot serve http on {address}: {error}"),
+        }
+    }
+
     let (collector, mut batches) = match Collector::start(CollectorConfig {
         fingerprints,
         ..CollectorConfig::default()
@@ -122,11 +156,19 @@ async fn main() {
 }
 
 fn tcp_address() -> Option<SocketAddr> {
-    let value = std::env::var(TCP_ENV).ok()?;
+    env_address(TCP_ENV)
+}
+
+fn http_address() -> Option<SocketAddr> {
+    env_address(HTTP_ENV)
+}
+
+fn env_address(name: &str) -> Option<SocketAddr> {
+    let value = std::env::var(name).ok()?;
     match value.parse() {
         Ok(address) => Some(address),
         Err(error) => {
-            eprintln!("zimascope-agent: invalid {TCP_ENV} {value:?}: {error}");
+            eprintln!("zimascope-agent: invalid {name} {value:?}: {error}");
             None
         }
     }

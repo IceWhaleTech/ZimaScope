@@ -40,11 +40,13 @@ import { DomainRow, DOMAIN_COLUMNS } from "@/components/domain-table";
 import { EmptyState } from "@/components/empty-state";
 import { EndpointRow, ENDPOINT_COLUMNS } from "@/components/endpoint-table";
 import { FlowRow, FLOW_COLUMNS } from "@/components/flow-table";
+import { ApplicationRow, APPLICATION_COLUMNS } from "@/components/application-table";
 import { Segmented } from "@/components/segmented";
 import { TableSkeleton } from "@/components/skeletons";
 import { FOCUS_SEARCH_EVENT } from "@/components/app-layout";
 import {
   queryKeys,
+  useApplicationsInfinite,
   useConnectionsInfinite,
   useCreateExport,
   useDomainsInfinite,
@@ -60,7 +62,15 @@ import { excludeScopeParam } from "@/lib/filters";
 import { downloadExport } from "@/lib/download";
 import { formatBytes, formatNumber, rangeLabel } from "@/lib/format";
 import { cn } from "@/lib/utils";
-import type { Connection, DomainSummary, EndpointSummary, Evidence, Flow, TimeRange } from "@/types";
+import type {
+  ApplicationSummary,
+  Connection,
+  DomainSummary,
+  EndpointSummary,
+  Evidence,
+  Flow,
+  TimeRange,
+} from "@/types";
 import type { FlowQuery } from "@/api";
 
 const LIMIT = 50;
@@ -70,6 +80,7 @@ const SCOPES = [
   { value: "flows", label: "Flows" },
   { value: "endpoints", label: "Endpoints" },
   { value: "domains", label: "Domains" },
+  { value: "applications", label: "Applications" },
 ] as const;
 
 type Scope = (typeof SCOPES)[number]["value"];
@@ -122,6 +133,16 @@ const SCOPE_META: Record<
         "Encrypted traffic without visible DNS or SNI will not appear here. That is expected, not a failure.",
     },
     unit: "domains",
+  },
+  applications: {
+    title: "Applications",
+    placeholder: "Search application, executable, container…",
+    empty: {
+      title: "No applications attributed yet",
+      message:
+        "Application Identity comes from observed socket ownership. UDP and container traffic under address translation may stay unattributed.",
+    },
+    unit: "applications",
   },
 };
 
@@ -249,7 +270,9 @@ export function ExplorerView() {
   const [searchParams, setSearchParams] = useSearchParams();
   const scopeParam = searchParams.get("scope");
   const scope: Scope =
-    scopeParam === "endpoints" || scopeParam === "domains" ? scopeParam : "flows";
+    scopeParam === "endpoints" || scopeParam === "domains" || scopeParam === "applications"
+      ? scopeParam
+      : "flows";
   const viewParam = searchParams.get("view");
   const view: View = viewParam === "raw" ? "raw" : "connections";
   const meta = SCOPE_META[scope];
@@ -258,6 +281,7 @@ export function ExplorerView() {
     domain: searchParams.get("domain") ?? "",
     country: searchParams.get("country") ?? "",
     asn: searchParams.get("asn") ?? "",
+    application: searchParams.get("application") ?? "",
   };
 
   const [search, setSearch] = useState(searchParams.get("q") ?? "");
@@ -335,12 +359,13 @@ export function ExplorerView() {
       has_domain: visibility === "visible" ? true : visibility === "hidden" ? false : undefined,
       ip: pinned.ip || undefined,
       domain: pinned.domain || undefined,
+      application_id: pinned.application || undefined,
       country: pinned.country || undefined,
       asn: pinned.asn ? Number(pinned.asn) : undefined,
       sort: scope === "flows" ? sort : "-last_seen",
       limit: LIMIT,
     }),
-    [appliedQ, range, direction, state, visibility, protocol, port, evidence, confidence, scopeFilter, hideLan, sort, scope, pinned.ip, pinned.domain, pinned.country, pinned.asn],
+    [appliedQ, range, direction, state, visibility, protocol, port, evidence, confidence, scopeFilter, hideLan, sort, scope, pinned.ip, pinned.domain, pinned.application, pinned.country, pinned.asn],
   );
   const flowsQuery = useFlowsInfinite(flowsFilter);
   const connectionsFilter = useMemo<FlowQuery>(
@@ -358,15 +383,23 @@ export function ExplorerView() {
     sort: scope === "domains" ? sort : "-bytes",
     limit: LIMIT,
   });
+  const applicationsQuery = useApplicationsInfinite({
+    q: appliedQ || undefined,
+    range,
+    sort: scope === "applications" ? sort : "-bytes",
+    limit: LIMIT,
+  });
 
   const activeQuery =
     scope === "endpoints"
       ? endpointsQuery
       : scope === "domains"
         ? domainsQuery
-        : view === "connections"
-          ? connectionsQuery
-          : flowsQuery;
+        : scope === "applications"
+          ? applicationsQuery
+          : view === "connections"
+            ? connectionsQuery
+            : flowsQuery;
   const total = activeQuery.data?.pages[0]?.total ?? 0;
   const searchRef = useRef<HTMLInputElement>(null);
   useEffect(() => {
@@ -408,7 +441,11 @@ export function ExplorerView() {
         : pinned.domain && total
           ? `${formatNumber(total)} ${view === "connections" ? "connections" : "flows"} · ${pinned.domain}`
           : `${formatNumber(total)} ${view === "connections" ? "connections" : "flows"} in last ${rangeLabel(range)}`
-      : `${formatNumber(total)} ${scope === "endpoints" ? "remote peers" : "associated domains"}`,
+      : scope === "endpoints"
+        ? `${formatNumber(total)} remote peers`
+        : scope === "domains"
+          ? `${formatNumber(total)} associated domains`
+          : `${formatNumber(total)} applications`,
     searchField,
   );
 
@@ -427,6 +464,13 @@ export function ExplorerView() {
     if (domainsQuery.data) setDomainItems(domainsQuery.data.pages.flatMap((page) => page.items));
   }, [domainsQuery.data]);
 
+  const [applicationItems, setApplicationItems] = useState<ApplicationSummary[]>([]);
+  useEffect(() => {
+    if (applicationsQuery.data) {
+      setApplicationItems(applicationsQuery.data.pages.flatMap((page) => page.items));
+    }
+  }, [applicationsQuery.data]);
+
   const [connectionItems, setConnectionItems] = useState<Connection[]>([]);
   useEffect(() => {
     if (connectionsQuery.data) {
@@ -439,9 +483,11 @@ export function ExplorerView() {
       ? endpointItems.length
       : scope === "domains"
         ? domainItems.length
-        : view === "connections"
-          ? connectionItems.length
-          : items.length;
+        : scope === "applications"
+          ? applicationItems.length
+          : view === "connections"
+            ? connectionItems.length
+            : items.length;
 
   // Connections fold into group headers; expanding a group adds child rows.
   const connectionGroups = useMemo(
@@ -462,7 +508,9 @@ export function ExplorerView() {
         : items.length
       : displayedScope === "endpoints"
         ? endpointItems.length
-        : domainItems.length;
+        : displayedScope === "domains"
+          ? domainItems.length
+          : applicationItems.length;
   const rowWindow = useWindowedRows(bodyRef, rowCount);
 
   // The live stream is retargeted to the same filters the Flow list uses, so
@@ -478,8 +526,9 @@ export function ExplorerView() {
       has_domain: visibility === "visible" ? true : visibility === "hidden" ? false : undefined,
       ip: pinned.ip || undefined,
       domain: pinned.domain || undefined,
+      application_id: pinned.application || undefined,
     });
-  }, [appliedQ, direction, state, visibility, protocol, port, hideLan, pinned.ip, pinned.domain]);
+  }, [appliedQ, direction, state, visibility, protocol, port, hideLan, pinned.ip, pinned.domain, pinned.application]);
 
   // Clear the stream filters only when leaving the view, not between filter
   // updates (a per-update reset caused an extra reconnect on every change).
@@ -541,6 +590,23 @@ export function ExplorerView() {
             });
           });
         }
+        if (tick.applications.length) {
+          const updates = new Map(
+            tick.applications.map((application) => [application.id, application]),
+          );
+          startTransition(() => {
+            setApplicationItems((previous) => {
+              let changed = false;
+              const next = previous.map((application) => {
+                const update = updates.get(application.id);
+                if (!update) return application;
+                changed = true;
+                return update;
+              });
+              return changed ? next : previous;
+            });
+          });
+        }
 
         tickCount.current += 1;
         if (tickCount.current % 6 === 0 && pagesLoadedRef.current === 1) {
@@ -548,6 +614,8 @@ export function ExplorerView() {
             void queryClient.invalidateQueries({ queryKey: ["endpoints-page"] });
           } else if (scopeRef.current === "domains") {
             void queryClient.invalidateQueries({ queryKey: ["domains-page"] });
+          } else if (scopeRef.current === "applications") {
+            void queryClient.invalidateQueries({ queryKey: ["applications-page"] });
           } else if (viewRef.current === "connections") {
             if (liveRef.current) {
               void queryClient.invalidateQueries({ queryKey: ["connections-page"] });
@@ -668,14 +736,17 @@ export function ExplorerView() {
       ? searchParams.get("flow")
       : scope === "endpoints"
         ? searchParams.get("address")
-        : searchParams.get("domain");
+        : scope === "domains"
+          ? searchParams.get("domain")
+          : searchParams.get("application");
   const openedDeepLink = useRef(false);
   useEffect(() => {
     if (!detailParam || !activeQuery.isSuccess || openedDeepLink.current) return;
     openedDeepLink.current = true;
     if (scope === "flows") open({ kind: "flow", id: detailParam });
     else if (scope === "endpoints") open({ kind: "endpoint", address: detailParam });
-    else open({ kind: "domain", name: detailParam });
+    else if (scope === "domains") open({ kind: "domain", name: detailParam });
+    else open({ kind: "application", id: detailParam });
   }, [detailParam, scope, activeQuery.isSuccess, open]);
 
   const unpin = (key: keyof typeof pinned) => {
@@ -731,7 +802,9 @@ export function ExplorerView() {
         : FLOW_COLUMNS
       : scope === "endpoints"
         ? ENDPOINT_COLUMNS
-        : DOMAIN_COLUMNS;
+        : scope === "domains"
+          ? DOMAIN_COLUMNS
+          : APPLICATION_COLUMNS;
   const pinnedChips = (Object.entries(pinned) as Array<[keyof typeof pinned, string]>).filter(([, value]) => value);
 
   const renderRows = (active: Scope) => {
@@ -765,6 +838,17 @@ export function ExplorerView() {
           <EndpointRow key={endpoint.address} endpoint={endpoint} onOpen={(address) => open({ kind: "endpoint", address })} />
         ));
     }
+    if (active === "applications") {
+      return applicationItems
+        .slice(rowWindow.start, rowWindow.end)
+        .map((application) => (
+          <ApplicationRow
+            key={application.id}
+            application={application}
+            onOpen={(id) => open({ kind: "application", id })}
+          />
+        ));
+    }
     return domainItems
       .slice(rowWindow.start, rowWindow.end)
       .map((domain) => (
@@ -781,7 +865,9 @@ export function ExplorerView() {
         : FLOW_COLUMNS
       : displayedScope === "endpoints"
         ? ENDPOINT_COLUMNS
-        : DOMAIN_COLUMNS;
+        : displayedScope === "domains"
+          ? DOMAIN_COLUMNS
+          : APPLICATION_COLUMNS;
   const bodyQuery =
     displayedScope === "flows"
       ? view === "connections"
@@ -789,7 +875,9 @@ export function ExplorerView() {
         : flowsQuery
       : displayedScope === "endpoints"
         ? endpointsQuery
-        : domainsQuery;
+        : displayedScope === "domains"
+          ? domainsQuery
+          : applicationsQuery;
   const bodyRows = (
     <>
       <SpacerRow height={rowWindow.start * TABLE_ROW_HEIGHT} columns={displayedColumns.length} />
@@ -807,7 +895,9 @@ export function ExplorerView() {
         : items.length === 0
       : displayedScope === "endpoints"
         ? endpointItems.length === 0
-        : domainItems.length === 0;
+        : displayedScope === "domains"
+          ? domainItems.length === 0
+          : applicationItems.length === 0;
   const emptyCopy = bodyQuery.isError
     ? {
         title: "Agent unavailable",
@@ -886,10 +976,15 @@ export function ExplorerView() {
                   <Info className="size-3.5" />
                   Public addresses enriched locally
                 </span>
-              ) : (
+              ) : scope === "domains" ? (
                 <span className="inline-flex items-center gap-1.5 text-2xs text-muted-foreground">
                   <Lock className="size-3.5" />
                   Domains stay on this device
+                </span>
+              ) : (
+                <span className="inline-flex items-center gap-1.5 text-2xs text-muted-foreground">
+                  <Info className="size-3.5" />
+                  From observed socket ownership; unattributed traffic stays visible in Flows
                 </span>
               )}
             </motion.div>

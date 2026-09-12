@@ -6,13 +6,15 @@ use hashbrown::HashMap;
 use zimascope_common::{
     kernel_abi,
     model::{
-        CollectorHealth, CollectorState, GapReason, InterfaceHealth, KernelCounters, ObservationGap,
+        ApplicationHealth, CollectorHealth, CollectorState, GapReason, InterfaceHealth,
+        KernelCounters, ObservationGap,
     },
 };
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(crate) enum GapKey {
     FlowMapReadFailed,
+    OwnerMapReadFailed,
     KernelStatsReadFailed,
     DomainEventsReadFailed,
     ServiceEventsReadFailed,
@@ -45,6 +47,7 @@ impl HealthTracker {
 
         let reason = match key {
             GapKey::FlowMapReadFailed
+            | GapKey::OwnerMapReadFailed
             | GapKey::KernelStatsReadFailed
             | GapKey::DomainEventsReadFailed
             | GapKey::ServiceEventsReadFailed => GapReason::MapReadFailed,
@@ -92,6 +95,8 @@ impl HealthTracker {
             domain_events_dropped: stats.domain_events_dropped,
             service_events_emitted: stats.service_events_emitted,
             service_events_dropped: stats.service_events_dropped,
+            owner_events_inserted: stats.owner_events_inserted,
+            owner_events_dropped: stats.owner_events_dropped,
         };
 
         let delta = if self.kernel_seen && is_monotonic(self.last_kernel, current) {
@@ -110,6 +115,10 @@ impl HealthTracker {
                     - self.last_kernel.service_events_emitted,
                 service_events_dropped: current.service_events_dropped
                     - self.last_kernel.service_events_dropped,
+                owner_events_inserted: current.owner_events_inserted
+                    - self.last_kernel.owner_events_inserted,
+                owner_events_dropped: current.owner_events_dropped
+                    - self.last_kernel.owner_events_dropped,
             }
         } else {
             current
@@ -127,6 +136,7 @@ impl HealthTracker {
         interfaces: Vec<InterfaceHealth>,
         map_entries: usize,
         map_capacity: usize,
+        application: ApplicationHealth,
     ) -> CollectorHealth {
         let mut gaps: Vec<ObservationGap> = self.open_gaps.values().cloned().collect();
         gaps.append(&mut self.closed_gaps);
@@ -138,6 +148,7 @@ impl HealthTracker {
             map_capacity,
             kernel: self.last_delta,
             gaps,
+            application,
         }
     }
 }
@@ -152,4 +163,6 @@ fn is_monotonic(previous: KernelCounters, current: KernelCounters) -> bool {
         && current.domain_events_dropped >= previous.domain_events_dropped
         && current.service_events_emitted >= previous.service_events_emitted
         && current.service_events_dropped >= previous.service_events_dropped
+        && current.owner_events_inserted >= previous.owner_events_inserted
+        && current.owner_events_dropped >= previous.owner_events_dropped
 }

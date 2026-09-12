@@ -9,9 +9,10 @@ use std::{
 use anyhow::{Result, bail};
 use zimascope_common::{
     kernel_abi::{
-        self, Direction, FlowKey, FlowValue, IpFamily, KernelStats, SampleKind, TransportProtocol,
+        self, Direction, FlowKey, FlowValue, IpFamily, KernelStats, OwnerKey, OwnerKind,
+        OwnerValue, SampleKind, TransportProtocol,
     },
-    model::InterfaceHealth,
+    model::{ApplicationHealth, InterfaceHealth},
 };
 
 use super::KernelSource;
@@ -19,11 +20,16 @@ use super::KernelSource;
 #[derive(Default)]
 struct State {
     flows: Vec<(FlowKey, Vec<FlowValue>)>,
+    owners: Vec<(OwnerKey, OwnerValue)>,
     events: Vec<kernel_abi::DomainSample>,
     services: Vec<kernel_abi::ServiceSample>,
     stats: KernelStats,
     interfaces: Vec<InterfaceHealth>,
+    application_attached: bool,
+    udp_attached: bool,
+    application_error: Option<Box<str>>,
     fail_flow_read: bool,
+    fail_owner_read: bool,
     fail_domain_read: bool,
     fail_service_read: bool,
     fail_stats_read: bool,
@@ -37,8 +43,13 @@ pub(crate) struct InMemoryKernelSource {
 
 impl Default for InMemoryKernelSource {
     fn default() -> Self {
+        let state = State {
+            application_attached: true,
+            udp_attached: true,
+            ..State::default()
+        };
         Self {
-            state: Arc::new(Mutex::new(State::default())),
+            state: Arc::new(Mutex::new(state)),
             detach_count: Arc::new(AtomicUsize::new(0)),
         }
     }
@@ -51,6 +62,11 @@ impl InMemoryKernelSource {
 
     pub fn with_flow(self, key: FlowKey, values: Vec<FlowValue>) -> Self {
         self.handle().set_flow(key, values);
+        self
+    }
+
+    pub fn with_owner(self, key: OwnerKey, value: OwnerValue) -> Self {
+        self.handle().push_owner(key, value);
         self
     }
 
@@ -114,6 +130,24 @@ impl InMemoryHandle {
         self.state.lock().expect("test state").fail_flow_read = fail;
     }
 
+    pub fn push_owner(&self, key: OwnerKey, value: OwnerValue) {
+        self.state
+            .lock()
+            .expect("test state")
+            .owners
+            .push((key, value));
+    }
+
+    pub fn set_owners_failing(&self, fail: bool) {
+        self.state.lock().expect("test state").fail_owner_read = fail;
+    }
+
+    pub fn set_application_health(&self, attached: bool, error: Option<&str>) {
+        let mut state = self.state.lock().expect("test state");
+        state.application_attached = attached;
+        state.application_error = error.map(Into::into);
+    }
+
     pub fn set_stats(&self, stats: KernelStats) {
         self.state.lock().expect("test state").stats = stats;
     }
@@ -169,6 +203,17 @@ impl KernelSource for InMemoryKernelSource {
         Ok(state.flows.len())
     }
 
+    fn visit_owners(&mut self, visitor: &mut dyn FnMut(OwnerKey, &OwnerValue)) -> Result<usize> {
+        let state = self.state.lock().expect("test state");
+        if state.fail_owner_read {
+            bail!("injected owner map read failure");
+        }
+        for (key, value) in &state.owners {
+            visitor(*key, value);
+        }
+        Ok(state.owners.len())
+    }
+
     fn drain_domain_events(
         &mut self,
         visitor: &mut dyn FnMut(&kernel_abi::DomainSample),
@@ -209,6 +254,15 @@ impl KernelSource for InMemoryKernelSource {
 
     fn attachment_health(&self) -> Vec<InterfaceHealth> {
         self.state.lock().expect("test state").interfaces.clone()
+    }
+
+    fn application_health(&self) -> ApplicationHealth {
+        let state = self.state.lock().expect("test state");
+        ApplicationHealth {
+            attached: state.application_attached,
+            udp_attached: state.udp_attached,
+            last_error: state.application_error.clone(),
+        }
     }
 
     fn detach(&mut self) -> Result<()> {
@@ -259,6 +313,49 @@ pub(crate) fn abi_value(
         parse_flags: 0,
         service_flags: 0,
         reserved: 0,
+    }
+}
+
+pub(crate) fn abi_owner_key(
+    protocol: u8,
+    kind: OwnerKind,
+    local_port: u16,
+    remote: Option<([u8; 4], u16)>,
+) -> OwnerKey {
+    let mut remote_addr = [0u8; 16];
+    let remote_port_be = match remote {
+        Some((address, port)) => {
+            remote_addr[12..].copy_from_slice(&address);
+            port.to_be()
+        }
+        None => 0,
+    };
+
+    OwnerKey {
+        remote_addr,
+        remote_port_be,
+        local_port_be: local_port.to_be(),
+        protocol,
+        kind: kind as u8,
+        ip_family: IpFamily::V4 as u8,
+        reserved: 0,
+    }
+}
+
+pub(crate) fn abi_owner_value(tgid: u32, uid: u32, comm: &str) -> OwnerValue {
+    let mut raw = [0u8; 16];
+    let bytes = comm.as_bytes();
+    let length = bytes.len().min(raw.len());
+    raw[..length].copy_from_slice(&bytes[..length]);
+
+    OwnerValue {
+        tgid,
+        pid: tgid,
+        uid,
+        reserved: 0,
+        cgroup_id: 0,
+        comm: raw,
+        observed_mono_ns: 1_000,
     }
 }
 

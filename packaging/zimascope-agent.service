@@ -1,0 +1,18 @@
+[Unit]
+Description=ZimaScope network observability agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+Environment=ZIMASCOPE_HTTP_LISTEN=0.0.0.0:8080
+Environment=ZIMASCOPE_UI_DIR=/opt/zimascope/web
+Environment=ZIMASCOPE_DATABASE=/var/lib/zimascope/zimascope.db
+Environment=ZIMASCOPE_GEOIP_DATABASE=/var/lib/zimascope/geoip
+ExecStart=/opt/zimascope/bin/zimascope-agent
+Restart=on-failure
+RestartSec=2
+LimitMEMLOCK=infinity
+
+[Install]
+WantedBy=multi-user.target

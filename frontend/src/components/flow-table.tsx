@@ -8,7 +8,7 @@
  */
 
 import { memo } from "react";
-import { ArrowDown, ArrowUp } from "lucide-react";
+import { ArrowDown, ArrowUp, Boxes, Terminal } from "lucide-react";
 import { TableCell, TableRow } from "@/components/ui/table";
 import { DirectionBadge, EvidenceChip, FlowStateDot } from "@/components/flow-bits";
 import { flagEmoji, formatBytes, formatDuration, formatNumber, relativeTime } from "@/lib/format";
@@ -66,6 +66,25 @@ export const FlowRow = memo(function FlowRow({
         </span>
       </TableCell>
       <TableCell>
+        {flow.application ? (
+          <span
+            className="flex min-w-0 items-center gap-1.5"
+            title={`${flow.application.kind === "container" ? "Container" : "Process"} · ${flow.application.id}`}
+          >
+            {flow.application.kind === "container" ? (
+              <Boxes className="size-3 shrink-0 text-muted-foreground" />
+            ) : (
+              <Terminal className="size-3 shrink-0 text-muted-foreground" />
+            )}
+            <span className="truncate font-medium">{flow.application.name}</span>
+          </span>
+        ) : (
+          <span className="text-muted-foreground italic" title="No socket ownership observed">
+            Unattributed
+          </span>
+        )}
+      </TableCell>
+      <TableCell>
         {domain ? (
           <span className="flex min-w-0 items-center gap-1.5">
             <span className="truncate font-medium">{domain.domain}</span>
@@ -103,9 +122,10 @@ export const FlowRow = memo(function FlowRow({
 });
 
 export const FLOW_COLUMNS = [
-  { label: "Direction", sort: "direction", width: "10%" },
-  { label: "Remote endpoint", sort: "remote", width: "30%" },
-  { label: "Associated domain", sort: "domain", width: "28%" },
-  { label: "Traffic", sort: "bytes", width: "16%" },
-  { label: "Last seen", sort: "last_seen", width: "16%" },
+  { label: "Direction", sort: "direction", width: "9%" },
+  { label: "Remote endpoint", sort: "remote", width: "22%" },
+  { label: "Application", sort: "application", width: "16%" },
+  { label: "Associated domain", sort: "domain", width: "24%" },
+  { label: "Traffic", sort: "bytes", width: "14%" },
+  { label: "Last seen", sort: "last_seen", width: "15%" },
 ] as const;

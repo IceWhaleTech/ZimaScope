@@ -53,6 +53,13 @@ export interface DomainRef {
   confidence: Confidence;
 }
 
+/** Application Identity attached to a Flow when socket ownership was observed. */
+export interface ApplicationRef {
+  id: string;
+  name: string;
+  kind: "process" | "container";
+}
+
 export interface Flow {
   id: string;
   direction: Direction;
@@ -70,6 +77,7 @@ export interface Flow {
   last_seen: number;
   duration_ms: number;
   domains: DomainRef[];
+  application: ApplicationRef | null;
 }
 
 /**
@@ -134,6 +142,41 @@ export interface EndpointDetail {
   first_seen: number;
   last_seen: number;
   ports: PortUsage[];
+  domains: DomainRef[];
+  flows_url: string;
+}
+
+/** One Application Identity with its traffic over the requested window. */
+export interface ApplicationSummary {
+  id: string;
+  name: string;
+  kind: "process" | "container";
+  exe: string | null;
+  comm: string | null;
+  uid: number | null;
+  container_id: string | null;
+  packets: number;
+  bytes: number;
+  traffic: DirectionTotals;
+  flow_count: number;
+  first_seen: number;
+  last_seen: number;
+}
+
+export interface ApplicationDetail {
+  id: string;
+  name: string;
+  kind: "process" | "container";
+  exe: string | null;
+  comm: string | null;
+  uid: number | null;
+  container_id: string | null;
+  packets: number;
+  bytes: number;
+  traffic: DirectionTotals;
+  flow_count: number;
+  first_seen: number;
+  last_seen: number;
   domains: DomainRef[];
   flows_url: string;
 }
@@ -257,6 +300,8 @@ export interface KernelCounters {
   domain_events_dropped: number;
   service_events_emitted: number;
   service_events_dropped: number;
+  owner_events_inserted: number;
+  owner_events_dropped: number;
 }
 
 export interface ObservationGap {
@@ -266,12 +311,19 @@ export interface ObservationGap {
   ended_at: number | null;
 }
 
+export interface ApplicationHealth {
+  attached: boolean;
+  udp_attached: boolean;
+  last_error: string | null;
+}
+
 export interface CollectorHealth {
   state: CollectorState;
   interfaces: InterfaceHealth[];
   map: MapUsage;
   kernel: KernelCounters;
   gaps: ObservationGap[];
+  application: ApplicationHealth;
 }
 
 export interface Overview {
@@ -429,6 +481,8 @@ export interface Tick {
   endpoints: EndpointSummary[];
   /** Refreshed aggregates for every Associated Domain touched. */
   domains: DomainSummary[];
+  /** Refreshed aggregates for every Application touched. */
+  applications: ApplicationSummary[];
   observations: DomainObservation[];
   overview: TickOverview;
   health: CollectorHealth | null;
