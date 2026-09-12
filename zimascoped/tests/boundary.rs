@@ -24,7 +24,10 @@ use std::{
 use anyhow::{Context, Result, bail};
 use aya::{
     Ebpf,
-    maps::{Array, HashMap as AyaHashMap, MapData, PerCpuArray, PerCpuHashMap},
+    maps::{
+        Array, HashMap as AyaHashMap, LpmTrie, MapData, PerCpuArray, PerCpuHashMap,
+        lpm_trie::Key as LpmKey,
+    },
     programs::{
         SchedClassifier, TcAttachType,
         tc::{self, SchedClassifierLink},
@@ -32,9 +35,10 @@ use aya::{
     util::KernelVersion,
 };
 use zimascope_common::kernel_abi::{
-    BucketKey, Direction, ENDPOINT_EXACT_EGRESS_MAP, EndpointMatchKey, FLOW_MAP, FlowKey,
-    FlowValue, KERNEL_STATS_MAP, KernelStats, POLICY_CONFIG_MAP, PolicyConfig, RULE_STATES_MAP,
-    RuleAction, RuleRef, RuleState, TC_EGRESS_PROGRAM, TC_INGRESS_PROGRAM,
+    APP_COMM_EGRESS_MAP, BucketKey, Direction, ENDPOINT_CIDR_EGRESS_MAP, ENDPOINT_EXACT_EGRESS_MAP,
+    EndpointMatchKey, FLOW_MAP, FlowKey, FlowValue, IpFamily, KERNEL_STATS_MAP, KernelStats,
+    OWNER_MAP, OwnerKey, OwnerKind, OwnerValue, POLICY_CONFIG_MAP, PolicyConfig, RULE_STATES_MAP,
+    RuleAction, RuleRef, RuleState, TC_EGRESS_PROGRAM, TC_INGRESS_PROGRAM, TransportProtocol,
 };
 
 const NS: &str = "zs-boundary";
@@ -109,6 +113,20 @@ struct PodRuleRef(RuleRef);
 
 // Safety: `#[repr(transparent)]` over a `#[repr(C)]` POD type with no padding.
 unsafe impl aya::Pod for PodRuleRef {}
+
+#[repr(transparent)]
+#[derive(Clone, Copy)]
+struct PodOwnerKey(OwnerKey);
+
+// Safety: `#[repr(transparent)]` over a `#[repr(C)]` POD type with no padding.
+unsafe impl aya::Pod for PodOwnerKey {}
+
+#[repr(transparent)]
+#[derive(Clone, Copy)]
+struct PodOwnerValue(OwnerValue);
+
+// Safety: `#[repr(transparent)]` over a `#[repr(C)]` POD type with no padding.
+unsafe impl aya::Pod for PodOwnerValue {}
 
 #[test]
 #[ignore = "requires root, iproute2 and a kernel with BPF/tcx"]
@@ -215,6 +233,89 @@ fn limit_drops_traffic_above_the_burst() -> Result<()> {
 }
 
 #[test]
+#[ignore = "requires root, iproute2 and a kernel with BPF/tcx"]
+fn blocks_a_matching_cidr() -> Result<()> {
+    let _guard = serialized();
+    let mut harness = Harness::new()?;
+    harness.insert_state(4, 0, 0)?;
+    harness.insert_cidr(4, RuleAction::Block, 24)?;
+    harness.write_config(true, false, true)?;
+
+    send_outbound()?;
+    thread::sleep(Duration::from_millis(200));
+
+    let outbound = harness.flow_totals(Direction::Outbound, HOST_ADDR, PEER_ADDR, UDP_PORT)?;
+    assert_eq!(outbound.0, 0, "CIDR-blocked packets reached the Flow map");
+    let state = harness.rule_state(4, Direction::Outbound)?;
+    assert!(state.dropped_packets >= PACKETS as u64);
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires root, iproute2 and a kernel with BPF/tcx"]
+fn blocks_a_matching_application() -> Result<()> {
+    let _guard = serialized();
+    let mut harness = Harness::new()?;
+    harness.insert_state(5, 0, 0)?;
+    harness.insert_comm(5, RuleAction::Block, "zs-harness")?;
+    harness.insert_owner("zs-harness")?;
+    harness.write_config(true, true, false)?;
+
+    send_outbound()?;
+    thread::sleep(Duration::from_millis(200));
+
+    let outbound = harness.flow_totals(Direction::Outbound, HOST_ADDR, PEER_ADDR, UDP_PORT)?;
+    assert_eq!(
+        outbound.0, 0,
+        "application-blocked packets reached the Flow map"
+    );
+    let state = harness.rule_state(5, Direction::Outbound)?;
+    assert!(state.dropped_packets >= PACKETS as u64);
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires root, iproute2 and a kernel with BPF/tcx"]
+fn missing_rule_state_fails_open() -> Result<()> {
+    let _guard = serialized();
+    let mut harness = Harness::new()?;
+    harness.insert_exact(9, RuleAction::Block, UDP_PORT)?;
+    harness.write_config(true, false, true)?;
+
+    send_outbound()?;
+    thread::sleep(Duration::from_millis(200));
+
+    let outbound = harness.flow_totals(Direction::Outbound, HOST_ADDR, PEER_ADDR, UDP_PORT)?;
+    assert!(
+        outbound.0 >= PACKETS as u64,
+        "missing state blocked traffic"
+    );
+    let missing = harness.policy_missing_state()?;
+    assert!(missing >= PACKETS as u64, "policy_missing_state: {missing}");
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires root, iproute2 and a kernel with BPF/tcx"]
+fn limit_allows_traffic_below_the_rate() -> Result<()> {
+    let _guard = serialized();
+    let mut harness = Harness::new()?;
+    harness.set_rule(6, RuleAction::Limit, 1_000_000, 1_000_000)?;
+
+    send_outbound()?;
+    thread::sleep(Duration::from_millis(200));
+
+    let outbound = harness.flow_totals(Direction::Outbound, HOST_ADDR, PEER_ADDR, UDP_PORT)?;
+    assert!(
+        outbound.0 >= PACKETS as u64,
+        "below-rate traffic was dropped"
+    );
+    let state = harness.rule_state(6, Direction::Outbound)?;
+    assert_eq!(state.dropped_packets, 0);
+    Ok(())
+}
+
+#[test]
 #[ignore = "helper process invoked inside the peer namespace"]
 fn sends_udp_from_peer() {
     if env::var_os(CHILD_ENV).is_none() {
@@ -236,6 +337,9 @@ struct Harness {
     config: Array<MapData, PodPolicyConfig>,
     states: AyaHashMap<MapData, PodBucketKey, PodRuleState>,
     exact_egress: AyaHashMap<MapData, PodEndpointMatchKey, PodRuleRef>,
+    cidr_egress: LpmTrie<MapData, [u8; 4], PodRuleRef>,
+    comm_egress: AyaHashMap<MapData, [u8; 16], PodRuleRef>,
+    owners: AyaHashMap<MapData, PodOwnerKey, PodOwnerValue>,
     _links: Vec<SchedClassifierLink>,
     _boundary: Boundary,
 }
@@ -268,6 +372,18 @@ impl Harness {
                 .context("take endpoint exact egress map")?,
         )
         .context("convert endpoint exact egress map")?;
+        let cidr_egress = LpmTrie::try_from(
+            ebpf.take_map(ENDPOINT_CIDR_EGRESS_MAP)
+                .context("take endpoint CIDR egress map")?,
+        )
+        .context("convert endpoint CIDR egress map")?;
+        let comm_egress = AyaHashMap::try_from(
+            ebpf.take_map(APP_COMM_EGRESS_MAP)
+                .context("take application comm egress map")?,
+        )
+        .context("convert application comm egress map")?;
+        let owners = AyaHashMap::try_from(ebpf.take_map(OWNER_MAP).context("take owner map")?)
+            .context("convert owner map")?;
 
         Ok(Self {
             _ebpf: ebpf,
@@ -276,6 +392,9 @@ impl Harness {
             config,
             states,
             exact_egress,
+            cidr_egress,
+            comm_egress,
+            owners,
             _links: links,
             _boundary: boundary,
         })
@@ -284,6 +403,12 @@ impl Harness {
     /// Installs one outbound exact-endpoint rule with fail-open ordering:
     /// state first, match entry second, configuration last.
     fn set_rule(&mut self, rule_id: u32, action: RuleAction, rate: u64, burst: u64) -> Result<()> {
+        self.insert_state(rule_id, rate, burst)?;
+        self.insert_exact(rule_id, action, UDP_PORT)?;
+        self.write_config(true, false, true)
+    }
+
+    fn insert_state(&mut self, rule_id: u32, rate: u64, burst: u64) -> Result<()> {
         let state = RuleState {
             rate_bytes_per_s: rate,
             burst_bytes: burst,
@@ -297,48 +422,105 @@ impl Harness {
         };
         self.states
             .insert(PodBucketKey(key), PodRuleState(state), 0)
-            .context("insert rule state")?;
+            .context("insert rule state")
+    }
 
+    fn insert_exact(&mut self, rule_id: u32, action: RuleAction, port: u16) -> Result<()> {
         let mut addr = [0u8; 16];
         addr[12..].copy_from_slice(&PEER_ADDR.parse::<std::net::Ipv4Addr>()?.octets());
         let match_key = EndpointMatchKey {
             addr,
-            port_be: UDP_PORT.to_be(),
+            port_be: port.to_be(),
             reserved: [0; 6],
         };
         self.exact_egress
             .insert(
                 PodEndpointMatchKey(match_key),
-                PodRuleRef(RuleRef {
-                    rule_id,
-                    action: action as u8,
-                    reserved: [0; 3],
+                PodRuleRef(rule_ref(rule_id, action)),
+                0,
+            )
+            .context("insert endpoint match")
+    }
+
+    fn insert_cidr(&mut self, rule_id: u32, action: RuleAction, prefix_len: u32) -> Result<()> {
+        let octets = PEER_ADDR.parse::<std::net::Ipv4Addr>()?.octets();
+        let mut network = [0u8; 4];
+        network[..3].copy_from_slice(&octets[..3]);
+        self.cidr_egress
+            .insert(
+                &LpmKey::new(prefix_len, network),
+                PodRuleRef(rule_ref(rule_id, action)),
+                0,
+            )
+            .context("insert CIDR match")
+    }
+
+    fn insert_comm(&mut self, rule_id: u32, action: RuleAction, comm: &str) -> Result<()> {
+        let mut bytes = [0u8; 16];
+        let length = comm.len().min(15);
+        bytes[..length].copy_from_slice(&comm.as_bytes()[..length]);
+        self.comm_egress
+            .insert(bytes, PodRuleRef(rule_ref(rule_id, action)), 0)
+            .context("insert comm match")
+    }
+
+    fn insert_owner(&mut self, comm: &str) -> Result<()> {
+        let mut remote_addr = [0u8; 16];
+        remote_addr[12..].copy_from_slice(&PEER_ADDR.parse::<std::net::Ipv4Addr>()?.octets());
+        let mut comm_bytes = [0u8; 16];
+        let length = comm.len().min(15);
+        comm_bytes[..length].copy_from_slice(&comm.as_bytes()[..length]);
+        self.owners
+            .insert(
+                PodOwnerKey(OwnerKey {
+                    remote_addr,
+                    remote_port_be: UDP_PORT.to_be(),
+                    local_port_be: 0,
+                    protocol: TransportProtocol::Udp as u8,
+                    kind: OwnerKind::Socket as u8,
+                    ip_family: IpFamily::V4 as u8,
+                    reserved: 0,
+                }),
+                PodOwnerValue(OwnerValue {
+                    tgid: 4_242,
+                    pid: 4_242,
+                    uid: 1_000,
+                    reserved: 0,
+                    cgroup_id: 0,
+                    comm: comm_bytes,
+                    observed_mono_ns: 1,
                 }),
                 0,
             )
-            .context("insert endpoint match")?;
-
-        self.write_config(true)
+            .context("insert owner")
     }
 
     fn disable_policy(&mut self) -> Result<()> {
-        self.write_config(false)
+        self.write_config(false, false, false)
     }
 
-    fn write_config(&mut self, enabled: bool) -> Result<()> {
+    fn write_config(&mut self, enabled: bool, app_rules: bool, endpoint_rules: bool) -> Result<()> {
         self.config
             .set(
                 0,
                 PodPolicyConfig(PolicyConfig {
                     enabled: u8::from(enabled),
-                    app_rules: 0,
-                    endpoint_rules: 1,
+                    app_rules: u8::from(app_rules),
+                    endpoint_rules: u8::from(endpoint_rules),
                     reserved: 0,
                     revision: 1,
                 }),
                 0,
             )
             .context("write policy config")
+    }
+
+    fn policy_missing_state(&self) -> Result<u64> {
+        let values = self.stats.get(&0, 0).context("read kernel stats")?;
+        Ok(values
+            .iter()
+            .map(|value| value.0.policy_missing_state)
+            .sum())
     }
 
     fn rule_state(&self, rule_id: u32, direction: Direction) -> Result<RuleState> {
@@ -523,6 +705,14 @@ fn load_and_attach(ebpf: &mut Ebpf, interface: &str) -> Result<Vec<SchedClassifi
         );
     }
     Ok(links)
+}
+
+fn rule_ref(rule_id: u32, action: RuleAction) -> RuleRef {
+    RuleRef {
+        rule_id,
+        action: action as u8,
+        reserved: [0; 3],
+    }
 }
 
 fn ipv4(addr: &str) -> [u8; 16] {
