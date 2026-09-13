@@ -26,6 +26,10 @@ tokio-util = "0.7"
 tower-http = { version = "0.6", features = ["fs"] }
 
 [profile.release]
+# Size budget matters: this ships as one self-contained binary (frontend and
+# eBPF object included). "s" costs a little throughput versus "3" and saves
+# about a quarter of the artifact; "z" only buys another ~5%.
+opt-level = "s"
 lto = true
 codegen-units = 1
 panic = "abort"
