@@ -83,7 +83,7 @@ const MINUTE_BUCKET_RETENTION_MS: i64 = 2 * 60 * 60 * 1000;
 const HOUR_BUCKET_RETENTION_MS: i64 = 8 * 24 * 60 * 60 * 1000;
 const MS_PER_DAY: i64 = 24 * 60 * 60 * 1000;
 
-const SCHEMA_VERSION: i64 = 7;
+const SCHEMA_VERSION: i64 = 8;
 
 const SCHEMA_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS flows (
@@ -167,6 +167,14 @@ CREATE TABLE IF NOT EXISTS entity_buckets (
     out_bytes INTEGER NOT NULL,
     PRIMARY KEY (kind, key, resolution, start_ms)
 );
+
+CREATE TABLE IF NOT EXISTS entity_rates (
+    kind TEXT NOT NULL,
+    key TEXT NOT NULL,
+    inbound_bps INTEGER NOT NULL,
+    outbound_bps INTEGER NOT NULL,
+    PRIMARY KEY (kind, key)
+) WITHOUT ROWID;
 
 CREATE TABLE IF NOT EXISTS settings (
     id INTEGER PRIMARY KEY CHECK (id = 1),
@@ -795,6 +803,8 @@ impl Db {
             tx.commit()?;
         }
 
+        self.store_entity_rates()?;
+
         let mut touched_addresses: HashSet<String> =
             changed_addresses.iter().map(ToString::to_string).collect();
         let mut touched_domains: HashSet<String> = domain_events
@@ -849,6 +859,46 @@ impl Db {
             health: health_dto,
             tick_cache: Mutex::new(HashMap::new()),
         })
+    }
+
+    /// Persists the latest interval's entity rates so list queries can sort by
+    /// them with plain SQL. The table mirrors the in-memory maps exactly:
+    /// stale rows are cleared, then the current interval is written.
+    fn store_entity_rates(&mut self) -> Result<(), ApiError> {
+        let tx = self.conn.transaction()?;
+        tx.execute("DELETE FROM entity_rates", [])?;
+        {
+            let mut statement = tx.prepare(
+                "INSERT INTO entity_rates (kind, key, inbound_bps, outbound_bps) \
+                 VALUES (?1, ?2, ?3, ?4)",
+            )?;
+            let mut insert = |kind: &str, key: &str, rate: &EntityRates| -> rusqlite::Result<()> {
+                statement.execute(params![
+                    kind,
+                    key,
+                    rate.inbound_bps as i64,
+                    rate.outbound_bps as i64,
+                ])?;
+                Ok(())
+            };
+            for (id, rate) in &self.rates_by_flow {
+                insert("flow", &id.to_string(), rate)?;
+            }
+            for (id, rate) in &self.rates_by_connection {
+                insert("connection", id, rate)?;
+            }
+            for (address, rate) in &self.rates_by_endpoint {
+                insert("endpoint", address, rate)?;
+            }
+            for (domain, rate) in &self.rates_by_domain {
+                insert("domain", domain, rate)?;
+            }
+            for (id, rate) in &self.rates_by_application {
+                insert("application", id, rate)?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
     }
 
     fn enforce_policy(&mut self, settings: &Settings, now: SystemTime) -> Result<(), ApiError> {
@@ -2517,7 +2567,8 @@ impl Db {
         let result = (|| -> Result<(), ApiError> {
             self.conn.execute_batch(
                 "DELETE FROM flows; DELETE FROM observations; DELETE FROM traffic_buckets; \
-                 DELETE FROM entity_buckets; DELETE FROM applications; DELETE FROM exports;",
+                 DELETE FROM entity_buckets; DELETE FROM entity_rates; \
+                 DELETE FROM applications; DELETE FROM exports;",
             )?;
             Ok(())
         })();
@@ -3423,14 +3474,15 @@ fn split_sort<'a>(sort: Option<&'a str>, default: &'static str) -> (&'a str, boo
 fn flow_order(sort: Option<&str>) -> Result<String, ApiError> {
     let (field, descending) = split_sort(sort, "-last_seen");
     let column = match field {
-        "last_seen" => "last_seen_ms",
-        "first_seen" => "first_seen_ms",
-        "bytes" => "bytes",
-        "packets" => "packets",
-        "direction" => "direction",
-        "remote" => "ip_sort_key(remote_addr)",
-        "application" => "app_id",
-        "domain" => "domain_sort_key(json_extract(domains_json, '$[0].domain'))",
+        "last_seen" => "last_seen_ms".to_owned(),
+        "first_seen" => "first_seen_ms".to_owned(),
+        "bytes" => "bytes".to_owned(),
+        "packets" => "packets".to_owned(),
+        "direction" => "direction".to_owned(),
+        "remote" => "ip_sort_key(remote_addr)".to_owned(),
+        "application" => "app_id".to_owned(),
+        "domain" => "domain_sort_key(json_extract(domains_json, '$[0].domain'))".to_owned(),
+        "rate" | "in_rate" | "out_rate" => rate_order("flow", "CAST(flows.id AS TEXT)", field),
         _ => return Err(unsupported_sort(field)),
     };
     let direction = if descending { "DESC" } else { "ASC" };
@@ -3440,13 +3492,14 @@ fn flow_order(sort: Option<&str>) -> Result<String, ApiError> {
 fn application_order(sort: Option<&str>) -> Result<String, ApiError> {
     let (field, descending) = split_sort(sort, "-bytes");
     let column = match field {
-        "bytes" => "total_bytes",
-        "packets" => "total_packets",
-        "in_bytes" => "in_bytes",
-        "out_bytes" => "out_bytes",
-        "flows" => "flow_count",
-        "last_seen" => "last_seen_ms",
-        "name" => "app_name COLLATE NOCASE",
+        "bytes" => "total_bytes".to_owned(),
+        "packets" => "total_packets".to_owned(),
+        "in_bytes" => "in_bytes".to_owned(),
+        "out_bytes" => "out_bytes".to_owned(),
+        "flows" => "flow_count".to_owned(),
+        "last_seen" => "last_seen_ms".to_owned(),
+        "name" => "app_name COLLATE NOCASE".to_owned(),
+        "rate" | "in_rate" | "out_rate" => rate_order("application", "flows.app_id", field),
         _ => return Err(unsupported_sort(field)),
     };
     let direction = if descending { "DESC" } else { "ASC" };
@@ -3456,15 +3509,16 @@ fn application_order(sort: Option<&str>) -> Result<String, ApiError> {
 fn endpoint_order(sort: Option<&str>) -> Result<String, ApiError> {
     let (field, descending) = split_sort(sort, "-bytes");
     let column = match field {
-        "bytes" => "total_bytes",
-        "packets" => "total_packets",
-        "in_bytes" => "in_bytes",
-        "out_bytes" => "out_bytes",
-        "last_seen" => "last_seen_ms",
-        "address" => "ip_sort_key(remote_addr)",
-        "country" => "country",
-        "organization" => "organization",
-        "asn" => "asn",
+        "bytes" => "total_bytes".to_owned(),
+        "packets" => "total_packets".to_owned(),
+        "in_bytes" => "in_bytes".to_owned(),
+        "out_bytes" => "out_bytes".to_owned(),
+        "last_seen" => "last_seen_ms".to_owned(),
+        "address" => "ip_sort_key(remote_addr)".to_owned(),
+        "country" => "country".to_owned(),
+        "organization" => "organization".to_owned(),
+        "asn" => "asn".to_owned(),
+        "rate" | "in_rate" | "out_rate" => rate_order("endpoint", "remote_addr", field),
         _ => return Err(unsupported_sort(field)),
     };
     let direction = if descending { "DESC" } else { "ASC" };
@@ -3474,13 +3528,14 @@ fn endpoint_order(sort: Option<&str>) -> Result<String, ApiError> {
 fn domain_order(sort: Option<&str>) -> Result<String, ApiError> {
     let (field, descending) = split_sort(sort, "-bytes");
     let column = match field {
-        "bytes" => "total_bytes",
-        "packets" => "total_packets",
-        "in_bytes" => "in_bytes",
-        "out_bytes" => "out_bytes",
-        "last_seen" => "last_seen_ms",
-        "domain" => "domain_sort_key(je.value->>'domain')",
-        "evidence" => "evidences",
+        "bytes" => "total_bytes".to_owned(),
+        "packets" => "total_packets".to_owned(),
+        "in_bytes" => "in_bytes".to_owned(),
+        "out_bytes" => "out_bytes".to_owned(),
+        "last_seen" => "last_seen_ms".to_owned(),
+        "domain" => "domain_sort_key(je.value->>'domain')".to_owned(),
+        "evidence" => "evidences".to_owned(),
+        "rate" | "in_rate" | "out_rate" => rate_order("domain", "je.value->>'domain'", field),
         _ => return Err(unsupported_sort(field)),
     };
     let direction = if descending { "DESC" } else { "ASC" };
@@ -3490,16 +3545,21 @@ fn domain_order(sort: Option<&str>) -> Result<String, ApiError> {
 fn connection_order(sort: Option<&str>) -> Result<String, ApiError> {
     let (field, descending) = split_sort(sort, "-last_seen");
     let column = match field {
-        "last_seen" => "last_seen_ms",
-        "first_seen" => "first_seen_ms",
-        "duration_ms" => "duration_ms",
-        "bytes" => "total_bytes",
-        "packets" => "total_packets",
-        "in_bytes" => "in_bytes",
-        "out_bytes" => "out_bytes",
-        "service" => "service",
-        "remote" => "ip_sort_key(MAX(remote_addr))",
-        "domain" => "domain_sort_key(MIN(json_extract(domains_json, '$[0].domain')))",
+        "last_seen" => "last_seen_ms".to_owned(),
+        "first_seen" => "first_seen_ms".to_owned(),
+        "duration_ms" => "duration_ms".to_owned(),
+        "bytes" => "total_bytes".to_owned(),
+        "packets" => "total_packets".to_owned(),
+        "in_bytes" => "in_bytes".to_owned(),
+        "out_bytes" => "out_bytes".to_owned(),
+        "service" => "service".to_owned(),
+        "remote" => "ip_sort_key(MAX(remote_addr))".to_owned(),
+        "domain" => "domain_sort_key(MIN(json_extract(domains_json, '$[0].domain')))".to_owned(),
+        "rate" | "in_rate" | "out_rate" => rate_order(
+            "connection",
+            "connection_key(protocol, ifindex, pair_lo, pair_hi)",
+            field,
+        ),
         _ => return Err(unsupported_sort(field)),
     };
     let direction = if descending { "DESC" } else { "ASC" };
@@ -3544,6 +3604,22 @@ fn unsupported_sort(field: &str) -> ApiError {
     ApiError::bad_request(format!("unsupported sort field: {field:?}"))
 }
 
+/// Rate ordering backed by the latest ingest's `entity_rates` rows.
+///
+/// `channel` is `rate` (both directions), `in_rate` or `out_rate`. Entities
+/// with no rate in the current interval coalesce to zero.
+fn rate_order(kind: &str, key: &str, channel: &str) -> String {
+    let column = match channel {
+        "in_rate" => "inbound_bps",
+        "out_rate" => "outbound_bps",
+        _ => "inbound_bps + outbound_bps",
+    };
+    format!(
+        "COALESCE((SELECT {column} FROM entity_rates r \
+         WHERE r.kind = '{kind}' AND r.key = {key}), 0)"
+    )
+}
+
 fn where_sql(clauses: &[String]) -> String {
     if clauses.is_empty() {
         String::new()
@@ -3562,6 +3638,16 @@ fn register_functions(conn: &Connection) -> Result<(), ApiError> {
     conn.create_scalar_function("domain_sort_key", 1, flags, |context| {
         let text: Option<String> = context.get(0)?;
         Ok(text.as_deref().map(domain_sort_key))
+    })?;
+    conn.create_scalar_function("connection_key", 4, flags, |context| {
+        let protocol: String = context.get(0)?;
+        let ifindex: i64 = context.get(1)?;
+        let pair_lo: String = context.get(2)?;
+        let pair_hi: String = context.get(3)?;
+        let Some(protocol) = enum_from_value::<Protocol>(&protocol) else {
+            return Ok(None::<String>);
+        };
+        Ok(Some(connection_id(protocol, ifindex, &pair_lo, &pair_hi)))
     })?;
     Ok(())
 }

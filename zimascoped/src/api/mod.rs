@@ -1915,6 +1915,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn entities_sort_by_latest_interval_rate() {
+        let state = state();
+        let mut incoming = batch(
+            1,
+            vec![
+                outbound(("93.184.216.34", 443), 40, 4_000, Duration::ZERO),
+                outbound(("198.51.100.7", 80), 40, 400_000, Duration::ZERO),
+            ],
+        );
+        incoming.domains = vec![
+            observation(
+                "slow.example",
+                "93.184.216.34",
+                DomainEvidence::TlsSni,
+                AssociationConfidence::Direct,
+            ),
+            observation(
+                "fast.example",
+                "198.51.100.7",
+                DomainEvidence::TlsSni,
+                AssociationConfidence::Direct,
+            ),
+        ];
+        state.ingest_batch(incoming);
+
+        // 400_000 B/s = 3_200_000 bps, 4_000 B/s = 32_000 bps.
+        let body = body_json(call(&state, get("/v1/endpoints?sort=-rate")).await).await;
+        assert_eq!(body["items"][0]["address"], "198.51.100.7");
+        assert_eq!(body["items"][0]["outbound_bps"], 3_200_000);
+        assert_eq!(body["items"][1]["address"], "93.184.216.34");
+
+        let body = body_json(call(&state, get("/v1/endpoints?sort=-out_rate")).await).await;
+        assert_eq!(body["items"][0]["address"], "198.51.100.7");
+        let body = body_json(call(&state, get("/v1/endpoints?sort=out_rate")).await).await;
+        assert_eq!(body["items"][0]["address"], "93.184.216.34");
+
+        let body = body_json(call(&state, get("/v1/connections?sort=-rate")).await).await;
+        assert_eq!(body["items"][0]["remote"]["address"], "198.51.100.7");
+
+        let body = body_json(call(&state, get("/v1/flows?sort=-rate")).await).await;
+        assert_eq!(body["items"][0]["remote"]["address"], "198.51.100.7");
+
+        let body = body_json(call(&state, get("/v1/domains?sort=-rate")).await).await;
+        assert_eq!(body["items"][0]["domain"], "fast.example");
+
+        // Rates reset with the interval, so ordering falls back to zero.
+        state.ingest_batch(batch(2, Vec::new()));
+        let body = body_json(call(&state, get("/v1/endpoints?sort=-rate")).await).await;
+        assert_eq!(body["items"][0]["outbound_bps"], 0);
+    }
+
+    #[tokio::test]
     async fn tick_carries_touched_application_summaries() {
         let state = state();
         let response = call(&state, get("/v1/stream")).await;
