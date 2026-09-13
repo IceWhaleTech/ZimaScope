@@ -724,11 +724,10 @@ impl Db {
 
             for address in &changed_addresses {
                 let domains_json = associate_address(&tx, *address, now_system)?;
-                tx.execute(
-                    "UPDATE flows SET domains_json = ?1 WHERE remote_addr = ?2",
-                    params![domains_json, address.to_string()],
-                )?;
-                let mut statement = tx.prepare("SELECT id FROM flows WHERE remote_addr = ?1")?;
+                tx.prepare_cached("UPDATE flows SET domains_json = ?1 WHERE remote_addr = ?2")?
+                    .execute(params![domains_json, address.to_string()])?;
+                let mut statement =
+                    tx.prepare_cached("SELECT id FROM flows WHERE remote_addr = ?1")?;
                 let ids = statement
                     .query_map([address.to_string()], |row| row.get::<_, i64>(0))?
                     .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -741,10 +740,19 @@ impl Db {
                 interfaces: &self.interfaces,
                 proxy,
             };
+            let mut domains_cache: HashMap<IpAddr, String> = HashMap::new();
             for update in flows {
                 let id = flow_id(&update.key);
                 flow_deltas.insert(id, (update.key.direction, update.delta));
-                upsert_flow(&tx, id, &update, now_instant, now_system, &mut writer)?;
+                upsert_flow(
+                    &tx,
+                    id,
+                    &update,
+                    now_instant,
+                    now_system,
+                    &mut writer,
+                    &mut domains_cache,
+                )?;
                 touched.push(id);
 
                 if update.delta.bytes > 0 {
@@ -1078,7 +1086,8 @@ impl Db {
         let sql = format!("SELECT {FLOW_COLUMNS} FROM flows WHERE id = ?1");
         let dto = self
             .conn
-            .query_row(&sql, [id as i64], flow_dto_from_row)
+            .prepare_cached(&sql)?
+            .query_row([id as i64], flow_dto_from_row)
             .optional()?;
         Ok(dto.map(|mut dto| {
             self.apply_flow_rate(&mut dto);
@@ -3131,22 +3140,22 @@ fn store_observation(
     if domain.is_empty() {
         return Ok(false);
     }
-    tx.execute(
+    tx.prepare_cached(
         "INSERT INTO observations (domain, address, evidence, confidence, last_observed_ms, \
          expires_at_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
          ON CONFLICT(domain, address, evidence) DO UPDATE SET \
          last_observed_ms = MAX(observations.last_observed_ms, excluded.last_observed_ms), \
          expires_at_ms = MAX(observations.expires_at_ms, excluded.expires_at_ms), \
          confidence = excluded.confidence",
-        params![
-            domain,
-            observation.address.to_string(),
-            enum_value(observation.evidence),
-            enum_value(observation.confidence),
-            unix_millis(observed_at),
-            unix_millis(expires_at),
-        ],
-    )?;
+    )?
+    .execute(params![
+        domain,
+        observation.address.to_string(),
+        enum_value(observation.evidence),
+        enum_value(observation.confidence),
+        unix_millis(observed_at),
+        unix_millis(expires_at),
+    ])?;
     Ok(true)
 }
 
@@ -3155,7 +3164,7 @@ fn associate_address(
     address: IpAddr,
     now: SystemTime,
 ) -> Result<String, ApiError> {
-    let mut statement = tx.prepare(
+    let mut statement = tx.prepare_cached(
         "SELECT domain, evidence, confidence, last_observed_ms FROM observations \
          WHERE address = ?1 AND expires_at_ms > ?2",
     )?;
@@ -3219,10 +3228,20 @@ fn upsert_flow(
     now_instant: Instant,
     now_system: SystemTime,
     writer: &mut FlowWriter<'_>,
+    domains_cache: &mut HashMap<IpAddr, String>,
 ) -> Result<(), ApiError> {
     let remote = remote_endpoint(&update.key);
     let profile = resolved_profile(update, remote, writer.enricher, writer.proxy);
-    let domains_json = associate_address(tx, remote.address, now_system)?;
+    // Domain evidence only changes when an observation for the address
+    // changes; deduplicate the lookup across the interval's flows.
+    let domains_json = match domains_cache.get(&remote.address) {
+        Some(cached) => cached.clone(),
+        None => {
+            let computed = associate_address(tx, remote.address, now_system)?;
+            domains_cache.insert(remote.address, computed.clone());
+            computed
+        }
+    };
     let first_seen = instant_to_system(update.first_seen, now_instant, now_system);
     let last_seen = instant_to_system(update.last_seen, now_instant, now_system);
     let end_reason = match update.state {
@@ -3235,7 +3254,7 @@ fn upsert_flow(
         upsert_application(tx, application, first_seen, last_seen)?;
     }
 
-    tx.execute(
+    tx.prepare_cached(
         "INSERT INTO flows (id, direction, protocol, src_addr, src_port, dst_addr, dst_port, \
          ifindex, interface, packets, bytes, first_seen_ms, last_seen_ms, state, end_reason, \
          remote_addr, remote_port, remote_scope, remote_country, remote_region, remote_city, \
@@ -3275,39 +3294,39 @@ fn upsert_flow(
              AND excluded.remote_db_version IS NULL \
              THEN flows.remote_enriched_at_ms \
              ELSE excluded.remote_enriched_at_ms END",
-        params![
-            id as i64,
-            enum_value(update.key.direction),
-            enum_value(update.key.protocol),
-            update.key.source.address.to_string(),
-            update.key.source.port.map(i64::from),
-            update.key.destination.address.to_string(),
-            update.key.destination.port.map(i64::from),
-            update.key.interface_index.get(),
-            interface.map(Box::as_ref),
-            update.total.packets as i64,
-            update.total.bytes as i64,
-            unix_millis(first_seen),
-            unix_millis(last_seen),
-            flow_state_name(update.state),
-            end_reason,
-            remote.address.to_string(),
-            remote.port.map(i64::from),
-            enum_value(profile.scope),
-            profile.country.as_ref().map(Box::as_ref),
-            profile.region.as_ref().map(Box::as_ref),
-            profile.city_approximate.as_ref().map(Box::as_ref),
-            profile.asn.map(i64::from),
-            profile.organization.as_ref().map(Box::as_ref),
-            profile.database_version.as_ref().map(Box::as_ref),
-            unix_millis(profile.enriched_at),
-            domains_json,
-            update.service.as_deref(),
-            application
-                .as_ref()
-                .map(|application| application.id.as_str()),
-        ],
-    )?;
+    )?
+    .execute(params![
+        id as i64,
+        enum_value(update.key.direction),
+        enum_value(update.key.protocol),
+        update.key.source.address.to_string(),
+        update.key.source.port.map(i64::from),
+        update.key.destination.address.to_string(),
+        update.key.destination.port.map(i64::from),
+        update.key.interface_index.get(),
+        interface.map(Box::as_ref),
+        update.total.packets as i64,
+        update.total.bytes as i64,
+        unix_millis(first_seen),
+        unix_millis(last_seen),
+        flow_state_name(update.state),
+        end_reason,
+        remote.address.to_string(),
+        remote.port.map(i64::from),
+        enum_value(profile.scope),
+        profile.country.as_ref().map(Box::as_ref),
+        profile.region.as_ref().map(Box::as_ref),
+        profile.city_approximate.as_ref().map(Box::as_ref),
+        profile.asn.map(i64::from),
+        profile.organization.as_ref().map(Box::as_ref),
+        profile.database_version.as_ref().map(Box::as_ref),
+        unix_millis(profile.enriched_at),
+        domains_json,
+        update.service.as_deref(),
+        application
+            .as_ref()
+            .map(|application| application.id.as_str()),
+    ])?;
     Ok(())
 }
 
@@ -3321,7 +3340,7 @@ fn upsert_application(
     first_seen: SystemTime,
     last_seen: SystemTime,
 ) -> Result<(), ApiError> {
-    tx.execute(
+    tx.prepare_cached(
         "INSERT INTO applications (id, kind, name, exe, comm, uid, container_id, first_seen_ms, \
          last_seen_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9) \
          ON CONFLICT(id) DO UPDATE SET \
@@ -3332,18 +3351,18 @@ fn upsert_application(
          container_id = COALESCE(excluded.container_id, applications.container_id), \
          first_seen_ms = MIN(applications.first_seen_ms, excluded.first_seen_ms), \
          last_seen_ms = MAX(applications.last_seen_ms, excluded.last_seen_ms)",
-        params![
-            application.id.as_str(),
-            application.kind,
-            application.name.as_str(),
-            application.exe.as_deref(),
-            application.comm.as_str(),
-            application.uid as i64,
-            application.container_id.as_deref(),
-            unix_millis(first_seen),
-            unix_millis(last_seen),
-        ],
-    )?;
+    )?
+    .execute(params![
+        application.id.as_str(),
+        application.kind,
+        application.name.as_str(),
+        application.exe.as_deref(),
+        application.comm.as_str(),
+        application.uid as i64,
+        application.container_id.as_deref(),
+        unix_millis(first_seen),
+        unix_millis(last_seen),
+    ])?;
     Ok(())
 }
 
@@ -3388,7 +3407,7 @@ fn add_entity_bucket(
         FlowDirection::Inbound => (delta.packets as i64, delta.bytes as i64, 0, 0),
         FlowDirection::Outbound => (0, 0, delta.packets as i64, delta.bytes as i64),
     };
-    tx.execute(
+    tx.prepare_cached(
         "INSERT INTO entity_buckets (kind, key, resolution, start_ms, in_packets, in_bytes, \
          out_packets, out_bytes) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) \
          ON CONFLICT(kind, key, resolution, start_ms) DO UPDATE SET \
@@ -3396,17 +3415,17 @@ fn add_entity_bucket(
          in_bytes = entity_buckets.in_bytes + excluded.in_bytes, \
          out_packets = entity_buckets.out_packets + excluded.out_packets, \
          out_bytes = entity_buckets.out_bytes + excluded.out_bytes",
-        params![
-            kind,
-            key,
-            resolution,
-            unix_millis(start),
-            in_packets,
-            in_bytes,
-            out_packets,
-            out_bytes,
-        ],
-    )?;
+    )?
+    .execute(params![
+        kind,
+        key,
+        resolution,
+        unix_millis(start),
+        in_packets,
+        in_bytes,
+        out_packets,
+        out_bytes,
+    ])?;
     Ok(())
 }
 

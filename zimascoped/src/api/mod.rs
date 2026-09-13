@@ -47,7 +47,7 @@ use tokio::sync::broadcast;
 use tokio_stream::{Stream, StreamExt, wrappers::BroadcastStream};
 use tower_http::{
     compression::{
-        CompressionLayer,
+        CompressionLayer, CompressionLevel,
         predicate::{NotForContentType, Predicate, SizeAbove},
     },
     services::{ServeDir, ServeFile},
@@ -448,11 +448,17 @@ fn asset_content_type(name: &str) -> &'static str {
 /// The default predicate deliberately skips `text/event-stream`; the tick
 /// payload is the largest thing this API serves, so it opts back in. gRPC and
 /// images stay uncompressed, and tiny responses stay below the size floor.
+///
+/// `Fastest` trades a little ratio (the SSE stream still compresses ~10x) for
+/// noticeably less CPU, which a 1s tick cadence makes worth it.
 fn compression_layer() -> CompressionLayer<impl Predicate> {
     let predicate = SizeAbove::default()
         .and(NotForContentType::GRPC)
         .and(NotForContentType::IMAGES);
-    CompressionLayer::new().gzip(true).compress_when(predicate)
+    CompressionLayer::new()
+        .gzip(true)
+        .quality(CompressionLevel::Fastest)
+        .compress_when(predicate)
 }
 
 /// All API routes, in one place so the dev and production routers stay in
