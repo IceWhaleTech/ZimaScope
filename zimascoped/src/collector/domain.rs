@@ -71,6 +71,7 @@ impl DomainDecoder {
 
         let cursor = MemoryCursor::new(&sample.payload[..length]);
         let peer = IpAddr::V4(zimascope_common::model::ipv4_from_abi(sample.address));
+        let ifindex = sample.ifindex;
 
         clock.anchor_if_needed(sample.observed_mono_ns, now);
         let observed_at = clock.to_instant(sample.observed_mono_ns);
@@ -101,6 +102,7 @@ impl DomainDecoder {
                         self.push(
                             domain,
                             address,
+                            ifindex,
                             DomainEvidence::Dns,
                             observed_at,
                             expires_at,
@@ -117,6 +119,7 @@ impl DomainDecoder {
                         self.push(
                             domain,
                             peer,
+                            ifindex,
                             DomainEvidence::TlsSni,
                             observed_at,
                             observed_at + DIRECT_EVIDENCE_TTL,
@@ -133,6 +136,7 @@ impl DomainDecoder {
                         self.push(
                             domain,
                             peer,
+                            ifindex,
                             DomainEvidence::HttpHost,
                             observed_at,
                             observed_at + DIRECT_EVIDENCE_TTL,
@@ -150,17 +154,21 @@ impl DomainDecoder {
         &mut self,
         domain: Box<str>,
         address: IpAddr,
+        ifindex: u32,
         evidence: DomainEvidence,
         observed_at: Instant,
         expires_at: Instant,
         now: Instant,
         observations: &mut Vec<DomainObservation>,
     ) {
+        // The interface is the client context: the same DNS answer observed on
+        // different Device Boundary interfaces is evidence for different Flows.
+        let client_context = u64::from(ifindex);
         let key = DomainDedupeKey {
             domain: domain.clone(),
             address,
             evidence,
-            client_context: 0,
+            client_context,
         };
         if let Some(existing_expiry) = self.dedupe.get(&key) {
             if *existing_expiry > now {
@@ -174,7 +182,7 @@ impl DomainDecoder {
             address,
             evidence,
             confidence: confidence_for(evidence),
-            client_context: 0,
+            client_context,
             observed_at,
             expires_at,
         });
@@ -350,6 +358,29 @@ mod tests {
         invalid.transport = 1;
         decoder.decode(&invalid, &mut clock, base, &mut observations);
         assert!(observations.is_empty());
+    }
+
+    #[test]
+    fn observations_carry_the_interface_context() {
+        let mut decoder = DomainDecoder::new();
+        let mut clock = MonoClock::default();
+        let base = Instant::now();
+        let mut observations = Vec::new();
+
+        let mut first = abi_dns_sample("example.com", [203, 0, 113, 9], 60);
+        first.ifindex = 7;
+        decoder.decode(&first, &mut clock, base, &mut observations);
+        let mut second = first;
+        second.ifindex = 8;
+        decoder.decode(&second, &mut clock, base, &mut observations);
+
+        assert_eq!(
+            observations.len(),
+            2,
+            "the same answer seen on two interfaces is two observations"
+        );
+        assert_eq!(observations[0].client_context, 7);
+        assert_eq!(observations[1].client_context, 8);
     }
 
     #[test]

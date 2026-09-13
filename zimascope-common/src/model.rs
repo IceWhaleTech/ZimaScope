@@ -145,6 +145,14 @@ pub struct DomainObservation {
     pub expires_at: Instant,
 }
 
+impl DomainObservation {
+    /// Kernel ifindex of the Device Boundary interface that produced this
+    /// observation; `0` means unknown (legacy evidence).
+    pub fn ifindex(&self) -> u32 {
+        self.client_context as u32
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]

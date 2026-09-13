@@ -1543,7 +1543,7 @@ mod tests {
             address: address.parse().expect("observation address"),
             evidence,
             confidence,
-            client_context: 1,
+            client_context: 7,
             observed_at: now,
             expires_at: now + Duration::from_secs(600),
         }
@@ -2244,6 +2244,43 @@ mod tests {
 
         let body = body_json(call(&state, get("/v1/flows?interface=missing0")).await).await;
         assert_eq!(body["total"], 0);
+    }
+
+    #[tokio::test]
+    async fn domain_evidence_stays_on_the_observing_interface() {
+        let state = state();
+        let eth0 = outbound(("93.184.216.34", 443), 40, 4_000, Duration::ZERO);
+        let mut docker0 = outbound(("93.184.216.34", 443), 10, 1_000, Duration::ZERO);
+        docker0.key.interface_index = NonZeroU32::new(8).expect("non-zero ifindex");
+        let mut incoming = batch(1, vec![eth0, docker0]);
+        incoming.health.attached_interfaces.push(InterfaceHealth {
+            ifindex: NonZeroU32::new(8).expect("non-zero ifindex"),
+            name: "docker0".into(),
+            ingress_attached: true,
+            egress_attached: true,
+            last_error: None,
+        });
+        let mut dns = observation(
+            "cdn.example",
+            "93.184.216.34",
+            DomainEvidence::Dns,
+            AssociationConfidence::Inferred,
+        );
+        dns.client_context = 8;
+        incoming.domains = vec![dns];
+        state.ingest_batch(incoming);
+
+        let body = body_json(call(&state, get("/v1/flows?interface=docker0")).await).await;
+        assert_eq!(body["items"][0]["domains"][0]["domain"], "cdn.example");
+
+        let body = body_json(call(&state, get("/v1/flows?interface=eth0")).await).await;
+        assert!(
+            body["items"][0]["domains"]
+                .as_array()
+                .expect("domains is an array")
+                .is_empty(),
+            "an observation made on docker0 must not attach to eth0 flows"
+        );
     }
 
     #[tokio::test]

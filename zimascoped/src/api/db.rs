@@ -83,7 +83,7 @@ const MINUTE_BUCKET_RETENTION_MS: i64 = 2 * 60 * 60 * 1000;
 const HOUR_BUCKET_RETENTION_MS: i64 = 8 * 24 * 60 * 60 * 1000;
 const MS_PER_DAY: i64 = 24 * 60 * 60 * 1000;
 
-const SCHEMA_VERSION: i64 = 8;
+const SCHEMA_VERSION: i64 = 9;
 
 const SCHEMA_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS flows (
@@ -139,9 +139,10 @@ CREATE TABLE IF NOT EXISTS observations (
     address TEXT NOT NULL,
     evidence TEXT NOT NULL,
     confidence TEXT NOT NULL,
+    ifindex INTEGER NOT NULL DEFAULT 0,
     last_observed_ms INTEGER NOT NULL,
     expires_at_ms INTEGER NOT NULL,
-    PRIMARY KEY (domain, address, evidence)
+    PRIMARY KEY (domain, address, evidence, ifindex)
 );
 CREATE INDEX IF NOT EXISTS idx_observations_address ON observations(address);
 CREATE INDEX IF NOT EXISTS idx_observations_expires ON observations(expires_at_ms);
@@ -572,6 +573,28 @@ impl Db {
             if version > 0 && version < 7 {
                 conn.execute_batch("DROP TABLE IF EXISTS traffic_rules")?;
             }
+            // Schema v9 scopes Domain Evidence to the observing interface.
+            // Rows written before this database knows their interface stay
+            // wildcard (`ifindex = 0`).
+            if version > 0 && version < 9 && table_exists(&conn, "observations")? {
+                conn.execute_batch(
+                    "ALTER TABLE observations RENAME TO observations_v8; \
+                     CREATE TABLE observations ( \
+                         domain TEXT NOT NULL, address TEXT NOT NULL, \
+                         evidence TEXT NOT NULL, confidence TEXT NOT NULL, \
+                         ifindex INTEGER NOT NULL DEFAULT 0, \
+                         last_observed_ms INTEGER NOT NULL, \
+                         expires_at_ms INTEGER NOT NULL, \
+                         PRIMARY KEY (domain, address, evidence, ifindex) \
+                     ); \
+                     INSERT INTO observations \
+                         (domain, address, evidence, confidence, ifindex, \
+                          last_observed_ms, expires_at_ms) \
+                     SELECT domain, address, evidence, confidence, 0, \
+                            last_observed_ms, expires_at_ms FROM observations_v8; \
+                     DROP TABLE observations_v8;",
+                )?;
+            }
             conn.execute_batch(SCHEMA_SQL)?;
             // Upgraded databases keep their rows: new columns are added in
             // place instead of recreating tables.
@@ -700,14 +723,15 @@ impl Db {
 
         let mut touched: Vec<u64> = Vec::new();
         let mut domain_events: Vec<DomainObservationDto> = Vec::new();
-        let mut changed_addresses: HashSet<IpAddr> = HashSet::new();
+        let mut changed_addresses: HashSet<(IpAddr, i64)> = HashSet::new();
         let mut flow_deltas: HashMap<u64, (FlowDirection, TrafficCounters)> = HashMap::new();
 
         {
             let tx = self.conn.transaction()?;
             for observation in &domains {
                 if store_observation(&tx, observation, now_instant, now_system)? {
-                    changed_addresses.insert(observation.address);
+                    changed_addresses
+                        .insert((observation.address, i64::from(observation.ifindex())));
                     domain_events.push(DomainObservationDto {
                         domain: normalize_domain(&observation.domain),
                         address: observation.address.to_string(),
@@ -722,14 +746,19 @@ impl Db {
                 }
             }
 
-            for address in &changed_addresses {
-                let domains_json = associate_address(&tx, *address, now_system)?;
-                tx.prepare_cached("UPDATE flows SET domains_json = ?1 WHERE remote_addr = ?2")?
-                    .execute(params![domains_json, address.to_string()])?;
-                let mut statement =
-                    tx.prepare_cached("SELECT id FROM flows WHERE remote_addr = ?1")?;
+            for (address, ifindex) in &changed_addresses {
+                let domains_json = associate_address(&tx, *address, *ifindex, now_system)?;
+                tx.prepare_cached(
+                    "UPDATE flows SET domains_json = ?1 WHERE remote_addr = ?2 AND ifindex = ?3",
+                )?
+                .execute(params![domains_json, address.to_string(), ifindex])?;
+                let mut statement = tx.prepare_cached(
+                    "SELECT id FROM flows WHERE remote_addr = ?1 AND ifindex = ?2",
+                )?;
                 let ids = statement
-                    .query_map([address.to_string()], |row| row.get::<_, i64>(0))?
+                    .query_map(params![address.to_string(), ifindex], |row| {
+                        row.get::<_, i64>(0)
+                    })?
                     .collect::<rusqlite::Result<Vec<_>>>()?;
                 touched.extend(ids.into_iter().map(|id| id as u64));
             }
@@ -740,7 +769,7 @@ impl Db {
                 interfaces: &self.interfaces,
                 proxy,
             };
-            let mut domains_cache: HashMap<IpAddr, String> = HashMap::new();
+            let mut domains_cache: HashMap<(IpAddr, i64), String> = HashMap::new();
             for update in flows {
                 let id = flow_id(&update.key);
                 flow_deltas.insert(id, (update.key.direction, update.delta));
@@ -877,8 +906,10 @@ impl Db {
 
         self.store_entity_rates()?;
 
-        let mut touched_addresses: HashSet<String> =
-            changed_addresses.iter().map(ToString::to_string).collect();
+        let mut touched_addresses: HashSet<String> = changed_addresses
+            .iter()
+            .map(|(address, _)| address.to_string())
+            .collect();
         let mut touched_domains: HashSet<String> = domain_events
             .iter()
             .map(|event| event.domain.clone())
@@ -3152,9 +3183,9 @@ fn store_observation(
         return Ok(false);
     }
     tx.prepare_cached(
-        "INSERT INTO observations (domain, address, evidence, confidence, last_observed_ms, \
-         expires_at_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
-         ON CONFLICT(domain, address, evidence) DO UPDATE SET \
+        "INSERT INTO observations (domain, address, evidence, confidence, ifindex, \
+         last_observed_ms, expires_at_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) \
+         ON CONFLICT(domain, address, evidence, ifindex) DO UPDATE SET \
          last_observed_ms = MAX(observations.last_observed_ms, excluded.last_observed_ms), \
          expires_at_ms = MAX(observations.expires_at_ms, excluded.expires_at_ms), \
          confidence = excluded.confidence",
@@ -3164,6 +3195,7 @@ fn store_observation(
         observation.address.to_string(),
         enum_value(observation.evidence),
         enum_value(observation.confidence),
+        i64::from(observation.ifindex()),
         unix_millis(observed_at),
         unix_millis(expires_at),
     ])?;
@@ -3173,21 +3205,27 @@ fn store_observation(
 fn associate_address(
     tx: &rusqlite::Transaction<'_>,
     address: IpAddr,
+    ifindex: i64,
     now: SystemTime,
 ) -> Result<String, ApiError> {
+    // Rows with `ifindex = 0` were written before per-interface attribution
+    // existed and stay valid for every interface (wildcard).
     let mut statement = tx.prepare_cached(
         "SELECT domain, evidence, confidence, last_observed_ms FROM observations \
-         WHERE address = ?1 AND expires_at_ms > ?2",
+         WHERE address = ?1 AND (ifindex = ?2 OR ifindex = 0) AND expires_at_ms > ?3",
     )?;
     let mut candidates = statement
-        .query_map(params![address.to_string(), unix_millis(now)], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, i64>(3)?,
-            ))
-        })?
+        .query_map(
+            params![address.to_string(), ifindex, unix_millis(now)],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                ))
+            },
+        )?
         .collect::<rusqlite::Result<Vec<_>>>()?
         .into_iter()
         .filter_map(|(domain, evidence, confidence, last_observed)| {
@@ -3239,17 +3277,18 @@ fn upsert_flow(
     now_instant: Instant,
     now_system: SystemTime,
     writer: &mut FlowWriter<'_>,
-    domains_cache: &mut HashMap<IpAddr, String>,
+    domains_cache: &mut HashMap<(IpAddr, i64), String>,
 ) -> Result<(), ApiError> {
     let remote = remote_endpoint(&update.key);
+    let ifindex = i64::from(update.key.interface_index.get());
     let profile = resolved_profile(update, remote, writer.enricher, writer.proxy);
-    // Domain evidence only changes when an observation for the address
-    // changes; deduplicate the lookup across the interval's flows.
-    let domains_json = match domains_cache.get(&remote.address) {
+    // Domain evidence only changes when an observation for the address and
+    // interface changes; deduplicate the lookup across the interval's flows.
+    let domains_json = match domains_cache.get(&(remote.address, ifindex)) {
         Some(cached) => cached.clone(),
         None => {
-            let computed = associate_address(tx, remote.address, now_system)?;
-            domains_cache.insert(remote.address, computed.clone());
+            let computed = associate_address(tx, remote.address, ifindex, now_system)?;
+            domains_cache.insert((remote.address, ifindex), computed.clone());
             computed
         }
     };
@@ -3926,6 +3965,15 @@ impl ApplicationComms for Db {
     }
 }
 
+fn table_exists(conn: &rusqlite::Connection, table: &str) -> rusqlite::Result<bool> {
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+        [table],
+        |row| row.get(0),
+    )?;
+    Ok(count > 0)
+}
+
 fn add_column_if_missing(
     conn: &rusqlite::Connection,
     table: &str,
@@ -4261,6 +4309,54 @@ mod tests {
 
         let record = db.insert_traffic_rule(&endpoint_draft()).expect("insert");
         assert_eq!(record.rule.id, 1);
+
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("db-wal"));
+        let _ = std::fs::remove_file(path.with_extension("db-shm"));
+    }
+
+    #[test]
+    fn migrates_a_v8_database_and_keeps_observations_as_wildcards() {
+        let unique = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "zs-observations-{}-{unique}.db",
+            std::process::id()
+        ));
+        {
+            let conn = Connection::open(&path).expect("open old database");
+            conn.execute_batch(
+                "CREATE TABLE observations ( \
+                     domain TEXT NOT NULL, address TEXT NOT NULL, evidence TEXT NOT NULL, \
+                     confidence TEXT NOT NULL, last_observed_ms INTEGER NOT NULL, \
+                     expires_at_ms INTEGER NOT NULL, \
+                     PRIMARY KEY (domain, address, evidence)); \
+                 INSERT INTO observations VALUES \
+                     ('example.com', '93.184.216.34', 'dns', 'inferred', 1, 4102444800000); \
+                 PRAGMA user_version = 8;",
+            )
+            .expect("seed old schema");
+        }
+
+        let db = Db::open(&ApiConfig {
+            database: Some(path.clone()),
+            ..ApiConfig::default()
+        })
+        .expect("open upgraded database");
+
+        let (ifindex, domain): (i64, String) = db
+            .conn
+            .query_row(
+                "SELECT ifindex, domain FROM observations WHERE address = '93.184.216.34'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("legacy row survives");
+        assert_eq!(ifindex, 0, "legacy evidence stays wildcard");
+        assert_eq!(domain, "example.com");
 
         drop(db);
         let _ = std::fs::remove_file(&path);
