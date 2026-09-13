@@ -13,6 +13,7 @@ import { useQueryClient } from "@tanstack/react-query";
 import { motion, useReducedMotion } from "motion/react";
 import { ArrowDown, ArrowUp, ChevronDown, ChevronRight, Info, TriangleAlert } from "lucide-react";
 import { Skeleton } from "@/components/ui/skeleton";
+import { NetworkFilterControl } from "@/components/filter-controls";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { TimelineChart, rateSeries, Sparkline } from "@/components/charts";
 import { FlowRow, FLOW_COLUMNS } from "@/components/flow-table";
@@ -21,7 +22,7 @@ import { Segmented } from "@/components/segmented";
 import { SpringNumber } from "@/components/spring-number";
 import { useDetails } from "@/hooks/use-details";
 import { queryKeys, useFlows, useOverview, useStatus } from "@/hooks/use-data";
-import { useHideLan } from "@/hooks/use-hide-lan";
+import { useNetworkFilter } from "@/hooks/use-network-filter";
 import { useSetTopbar } from "@/hooks/use-topbar";
 import { useTick } from "@/hooks/use-tick";
 import { data } from "@/store";
@@ -44,15 +45,10 @@ const RANGES = [
   { value: "7d", label: "7d" },
 ];
 
-const LAN_OPTIONS = [
-  { value: "all", label: "All traffic" },
-  { value: "internet", label: "Internet only" },
-];
-
 export function OverviewView() {
   const [range, setRange] = useState<TimeRange>("15m");
-  const [hideLan, setHideLan] = useHideLan();
-  const excludeScope = excludeScopeParam(hideLan);
+  const [network, setNetwork] = useNetworkFilter();
+  const excludeScope = excludeScopeParam(network);
   const overviewQuery = useOverview(range, excludeScope);
   const overview = overviewQuery.data;
   const flowsQuery = useFlows({ sort: "-last_seen", limit: 200, exclude_scope: excludeScope });
@@ -76,12 +72,12 @@ export function OverviewView() {
   const explorerDefaults = useMemo<FlowQuery>(
     () => ({
       range: "15m",
-      exclude_scope: excludeScopeParam(hideLan),
+      exclude_scope: excludeScopeParam(network),
       sort: "-last_seen",
       limit: 50,
       hide_noise: true,
     }),
-    [hideLan],
+    [network],
   );
 
   const openFlows = useCallback(async () => {
@@ -253,12 +249,7 @@ export function OverviewView() {
           description="Bytes observed per interval at the device boundary"
           action={
             <span className="flex flex-wrap items-center gap-2">
-              <Segmented
-                ariaLabel="Local traffic"
-                options={LAN_OPTIONS}
-                value={hideLan ? "internet" : "all"}
-                onChange={(value) => setHideLan(value === "internet")}
-              />
+              <NetworkFilterControl value={network} onChange={setNetwork} />
               <Segmented ariaLabel="Time range" options={RANGES} value={range} onChange={(value) => setRange(value as TimeRange)} />
             </span>
           }

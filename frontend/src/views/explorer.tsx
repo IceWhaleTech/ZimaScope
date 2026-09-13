@@ -10,7 +10,7 @@
 
 import { startTransition, useEffect, useMemo, useRef, useState } from "react";
 import { useSearchParams } from "react-router";
-import { ArrowDown, ArrowUp, ArrowUpDown, Download, Info, Loader2, Lock, Search, X } from "lucide-react";
+import { ArrowDown, ArrowUp, ArrowUpDown, Download, Info, Loader2, Lock, Search, SlidersHorizontal, X } from "lucide-react";
 import { AnimatePresence, motion, useReducedMotion } from "motion/react";
 import { toast } from "sonner";
 import { useQueryClient } from "@tanstack/react-query";
@@ -22,6 +22,7 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { Input } from "@/components/ui/input";
+import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import {
   Select,
   SelectContent,
@@ -40,6 +41,11 @@ import { DomainRow, DOMAIN_COLUMNS } from "@/components/domain-table";
 import { EmptyState } from "@/components/empty-state";
 import { EndpointRow, ENDPOINT_COLUMNS } from "@/components/endpoint-table";
 import { ApplicationRow, APPLICATION_COLUMNS } from "@/components/application-table";
+import {
+  NetworkFilterControl,
+  TimeFilter,
+  type TimeWindow,
+} from "@/components/filter-controls";
 import { RowContextMenu } from "@/components/row-context-menu";
 import { Segmented } from "@/components/segmented";
 import { TableSkeleton } from "@/components/skeletons";
@@ -50,12 +56,13 @@ import {
   useCreateExport,
   useDomainsInfinite,
   useEndpointsInfinite,
+  useStatus,
 } from "@/hooks/use-data";
 import { useDetails } from "@/hooks/use-details";
-import { useHideLan } from "@/hooks/use-hide-lan";
+import { useNetworkFilter } from "@/hooks/use-network-filter";
 import { useSetTopbar } from "@/hooks/use-topbar";
 import { setStreamQuery, subscribeTicks } from "@/store";
-import { excludeScopeParam } from "@/lib/filters";
+import { excludeScopeParam, scopeParam as networkScopeParam } from "@/lib/filters";
 import { downloadExport } from "@/lib/download";
 import { formatBytes, formatNumber, rangeLabel } from "@/lib/format";
 import { cn } from "@/lib/utils";
@@ -141,12 +148,6 @@ const SCOPE_META: Record<
   },
 };
 
-const RANGE_OPTIONS = [
-  { value: "15m", label: "15m" },
-  { value: "1h", label: "1h" },
-  { value: "24h", label: "24h" },
-  { value: "7d", label: "7d" },
-];
 const STATE_OPTIONS = [
   { value: "", label: "All" },
   { value: "active", label: "Active" },
@@ -154,31 +155,27 @@ const STATE_OPTIONS = [
 ];
 const VISIBILITY_OPTIONS = [
   { value: "", label: "All" },
-  { value: "visible", label: "Named" },
-  { value: "hidden", label: "Hidden" },
+  { value: "visible", label: "With domain" },
+  { value: "hidden", label: "Without domain" },
 ];
-const LAN_OPTIONS = [
-  { value: "all", label: "All traffic" },
-  { value: "internet", label: "Internet only" },
-];
-const PROTOCOL_OPTIONS = [
-  { value: "", label: "TCP + UDP" },
+const TRANSPORT_OPTIONS = [
+  { value: "", label: "All" },
   { value: "tcp", label: "TCP" },
   { value: "udp", label: "UDP" },
 ];
 const EVIDENCE_OPTIONS = [
-  { value: "", label: "Any evidence" },
+  { value: "any", label: "Any evidence" },
   { value: "dns", label: "DNS" },
   { value: "tls_sni", label: "TLS SNI" },
   { value: "http_host", label: "HTTP Host" },
 ];
 const CONFIDENCE_OPTIONS = [
-  { value: "", label: "Direct + inferred" },
+  { value: "any", label: "Direct + inferred" },
   { value: "direct", label: "Direct" },
   { value: "inferred", label: "Inferred" },
 ];
 const SCOPE_OPTIONS = [
-  { value: "", label: "Any scope" },
+  { value: "any", label: "Any scope" },
   { value: "public", label: "Public" },
   { value: "private", label: "Private" },
   { value: "shared", label: "Carrier NAT" },
@@ -309,9 +306,12 @@ export function ExplorerView() {
   const [search, setSearch] = useState(searchParams.get("q") ?? "");
   const [appliedQ, setAppliedQ] = useState(searchParams.get("q") ?? "");
   const [range, setRange] = useState<TimeRange>("15m");
+  const [customTime, setCustomTime] = useState<TimeWindow | null>(null);
+  const [network, setNetwork] = useNetworkFilter();
+  const [protocol, setProtocol] = useState("");
+  const [service, setService] = useState("");
   const [state, setState] = useState("");
   const [visibility, setVisibility] = useState("");
-  const [protocol, setProtocol] = useState("");
   const [port, setPort] = useState("");
   const [evidence, setEvidence] = useState("");
   const [confidence, setConfidence] = useState("");
@@ -324,7 +324,10 @@ export function ExplorerView() {
   const { open } = useDetails();
   const queryClient = useQueryClient();
   const createExport = useCreateExport();
-  const [hideLan, setHideLan] = useHideLan();
+  const statusQuery = useStatus();
+  const serviceOptions = statusQuery.data?.fingerprints.services ?? [];
+  const advancedActive =
+    Boolean(state || visibility || port || evidence || confidence || scopeFilter) || !hideNoise;
   const reduceMotion = useReducedMotion();
 
   // Two-phase in-place morph: the tbody element itself never unmounts — the
@@ -366,17 +369,23 @@ export function ExplorerView() {
 
   // Shared base filters for the Flows lens: connections use them for the
   // merged view and exports reuse them unchanged.
+  const timeFilter = customTime
+    ? { start: customTime.start, end: customTime.end }
+    : { range };
+  const scopeFilterParam = scopeFilter || networkScopeParam(network);
+  const excludeScopeFilter = scopeFilter ? undefined : excludeScopeParam(network);
   const flowsFilter = useMemo<FlowQuery>(
     () => ({
       q: appliedQ || undefined,
-      range,
+      ...timeFilter,
       state: state || undefined,
       protocol: protocol || undefined,
+      service: service || undefined,
       port: port ? Number(port) : undefined,
       evidence: (evidence || undefined) as Evidence | undefined,
       confidence: confidence || undefined,
-      scope: scopeFilter || undefined,
-      exclude_scope: excludeScopeParam(hideLan),
+      scope: scopeFilterParam,
+      exclude_scope: excludeScopeFilter,
       has_domain: visibility === "visible" ? true : visibility === "hidden" ? false : undefined,
       ip: pinned.ip || undefined,
       domain: pinned.domain || undefined,
@@ -386,7 +395,7 @@ export function ExplorerView() {
       sort: scope === "flows" ? sort : "-last_seen",
       limit: LIMIT,
     }),
-    [appliedQ, range, state, visibility, protocol, port, evidence, confidence, scopeFilter, hideLan, sort, scope, pinned.ip, pinned.domain, pinned.application, pinned.country, pinned.asn],
+    [appliedQ, range, customTime, state, visibility, protocol, service, port, evidence, confidence, scopeFilterParam, excludeScopeFilter, sort, scope, pinned.ip, pinned.domain, pinned.application, pinned.country, pinned.asn],
   );
   const connectionsFilter = useMemo<FlowQuery>(
     () => ({ ...flowsFilter, hide_noise: hideNoise }),
@@ -395,17 +404,27 @@ export function ExplorerView() {
   const connectionsQuery = useConnectionsInfinite(connectionsFilter);
   const endpointsQuery = useEndpointsInfinite({
     q: appliedQ || undefined,
+    ...timeFilter,
+    protocol: protocol || undefined,
+    service: service || undefined,
+    scope: networkScopeParam(network),
+    exclude_scope: excludeScopeParam(network),
     sort: scope === "endpoints" ? sort : "-bytes",
     limit: LIMIT,
   });
   const domainsQuery = useDomainsInfinite({
     q: appliedQ || undefined,
+    ...timeFilter,
+    scope: networkScopeParam(network),
+    exclude_scope: excludeScopeParam(network),
     sort: scope === "domains" ? sort : "-bytes",
     limit: LIMIT,
   });
   const applicationsQuery = useApplicationsInfinite({
     q: appliedQ || undefined,
-    range,
+    ...timeFilter,
+    scope: networkScopeParam(network),
+    exclude_scope: excludeScopeParam(network),
     sort: scope === "applications" ? sort : "-bytes",
     limit: LIMIT,
   });
@@ -517,13 +536,14 @@ export function ExplorerView() {
       state: state || undefined,
       protocol: protocol || undefined,
       port: port ? Number(port) : undefined,
-      exclude_scope: excludeScopeParam(hideLan),
+      scope: networkScopeParam(network),
+      exclude_scope: excludeScopeParam(network),
       has_domain: visibility === "visible" ? true : visibility === "hidden" ? false : undefined,
       ip: pinned.ip || undefined,
       domain: pinned.domain || undefined,
       application_id: pinned.application || undefined,
     });
-  }, [appliedQ, state, visibility, protocol, port, hideLan, pinned.ip, pinned.domain, pinned.application]);
+  }, [appliedQ, state, visibility, protocol, port, network, pinned.ip, pinned.domain, pinned.application]);
 
   // Clear the stream filters only when leaving the view, not between filter
   // updates (a per-update reset caused an extra reconnect on every change).
@@ -906,80 +926,141 @@ export function ExplorerView() {
             </motion.div>
           </AnimatePresence>
         </div>
-        <AnimatePresence initial={false}>
-          {scope === "flows" && (
-            <motion.div
-              key="flow-filters"
-              className="overflow-hidden"
-              initial={reduceMotion ? { opacity: 0 } : { opacity: 0, height: 0 }}
-              animate={reduceMotion ? { opacity: 1 } : { opacity: 1, height: "auto" }}
-              exit={reduceMotion ? { opacity: 0 } : { opacity: 0, height: 0 }}
-              transition={{ duration: 0.24, ease: EASE }}
-            >
-              <div className="flex flex-wrap items-center gap-2">
-                <Segmented ariaLabel="Time range" options={RANGE_OPTIONS} value={range} onChange={(value) => { setRange(value as TimeRange); }} />
-                <Segmented ariaLabel="Flow state" options={STATE_OPTIONS} value={state} onChange={(value) => { setState(value); }} />
-                <Segmented ariaLabel="Domain visibility" options={VISIBILITY_OPTIONS} value={visibility} onChange={(value) => { setVisibility(value); }} />
-                <Segmented ariaLabel="Local traffic" options={LAN_OPTIONS} value={hideLan ? "internet" : "all"} onChange={(value) => { setHideLan(value === "internet"); }} />
-                <Segmented ariaLabel="Noise" options={NOISE_OPTIONS} value={hideNoise ? "hide" : "all"} onChange={(value) => setHideNoise(value === "hide")} />
-                <div className="flex-1" />
-                <label className="flex items-center gap-1.5 text-2xs text-muted-foreground">
-                  Port
-                  <Input
-                    inputMode="numeric"
-                    value={port}
-                    placeholder="any"
-                    aria-label="Port"
-                    onChange={(event) => {
-                      setPort(event.target.value.replace(/[^0-9]/g, ""));
-                    }}
-                    className="h-8 w-16 text-xs"
-                  />
-                </label>
-                <Select value={protocol} onValueChange={(value) => { setProtocol(value); }}>
-                  <SelectTrigger aria-label="Protocol" size="sm" className="w-28">
-                    <SelectValue />
-                  </SelectTrigger>
-                  <SelectContent>
-                    {PROTOCOL_OPTIONS.map((option) => (
-                      <SelectItem key={option.value} value={option.value}>{option.label}</SelectItem>
-                    ))}
-                  </SelectContent>
-                </Select>
-                <Select value={evidence} onValueChange={(value) => { setEvidence(value); }}>
-                  <SelectTrigger aria-label="Domain evidence" size="sm" className="w-32">
-                    <SelectValue />
-                  </SelectTrigger>
-                  <SelectContent>
-                    {EVIDENCE_OPTIONS.map((option) => (
-                      <SelectItem key={option.value} value={option.value}>{option.label}</SelectItem>
-                    ))}
-                  </SelectContent>
-                </Select>
-                <Select value={confidence} onValueChange={(value) => { setConfidence(value); }}>
-                  <SelectTrigger aria-label="Association confidence" size="sm" className="w-36">
-                    <SelectValue />
-                  </SelectTrigger>
-                  <SelectContent>
-                    {CONFIDENCE_OPTIONS.map((option) => (
-                      <SelectItem key={option.value} value={option.value}>{option.label}</SelectItem>
-                    ))}
-                  </SelectContent>
-                </Select>
-                <Select value={scopeFilter} onValueChange={(value) => { setScopeFilter(value); }}>
-                  <SelectTrigger aria-label="Address scope" size="sm" className="w-32">
-                    <SelectValue />
-                  </SelectTrigger>
-                  <SelectContent>
-                    {SCOPE_OPTIONS.map((option) => (
-                      <SelectItem key={option.value} value={option.value}>{option.label}</SelectItem>
-                    ))}
-                  </SelectContent>
-                </Select>
-              </div>
-            </motion.div>
+        <div className="flex flex-wrap items-center gap-2">
+          <TimeFilter
+            range={range}
+            custom={customTime}
+            onRange={setRange}
+            onCustom={setCustomTime}
+          />
+          <NetworkFilterControl value={network} onChange={setNetwork} />
+          {(scope === "flows" || scope === "endpoints") && (
+            <Segmented
+              ariaLabel="Transport protocol"
+              options={TRANSPORT_OPTIONS}
+              value={protocol}
+              onChange={setProtocol}
+            />
           )}
-        </AnimatePresence>
+          {(scope === "flows" || scope === "endpoints") && (
+            <Select value={service || "any"} onValueChange={(value) => setService(value === "any" ? "" : value)}>
+              <SelectTrigger aria-label="Service" size="sm" className="w-36">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="any">Any service</SelectItem>
+                {serviceOptions.map((name) => (
+                  <SelectItem key={name} value={name}>
+                    {name}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          )}
+          <div className="flex-1" />
+          {scope === "flows" && (
+            <Popover>
+              <PopoverTrigger asChild>
+                <Button variant="outline" size="sm">
+                  <SlidersHorizontal className="size-3.5" />
+                  More filters
+                  {advancedActive && <i className="size-1.5 rounded-full bg-primary" />}
+                </Button>
+              </PopoverTrigger>
+              <PopoverContent align="end" className="w-80">
+                <div className="grid gap-3">
+                  <div className="grid gap-1">
+                    <span className="text-2xs font-medium text-muted-foreground">Flow state</span>
+                    <Segmented
+                      ariaLabel="Flow state"
+                      options={STATE_OPTIONS}
+                      value={state}
+                      onChange={setState}
+                    />
+                  </div>
+                  <div className="grid gap-1">
+                    <span className="text-2xs font-medium text-muted-foreground">Associated domain</span>
+                    <Segmented
+                      ariaLabel="Domain visibility"
+                      options={VISIBILITY_OPTIONS}
+                      value={visibility}
+                      onChange={setVisibility}
+                    />
+                  </div>
+                  <div className="grid gap-1">
+                    <span className="text-2xs font-medium text-muted-foreground">
+                      DNS and sub-second chatter
+                    </span>
+                    <Segmented
+                      ariaLabel="Noise"
+                      options={NOISE_OPTIONS}
+                      value={hideNoise ? "hide" : "all"}
+                      onChange={(value) => setHideNoise(value === "hide")}
+                    />
+                  </div>
+                  <label className="grid gap-1">
+                    <span className="text-2xs font-medium text-muted-foreground">Port</span>
+                    <Input
+                      inputMode="numeric"
+                      value={port}
+                      placeholder="any"
+                      aria-label="Port"
+                      onChange={(event) => {
+                        setPort(event.target.value.replace(/[^0-9]/g, ""));
+                      }}
+                      className="h-8 w-24 text-xs"
+                    />
+                  </label>
+                  <label className="grid gap-1">
+                    <span className="text-2xs font-medium text-muted-foreground">Domain evidence</span>
+                    <Select value={evidence || "any"} onValueChange={(value) => setEvidence(value === "any" ? "" : value)}>
+                      <SelectTrigger aria-label="Domain evidence" size="sm">
+                        <SelectValue />
+                      </SelectTrigger>
+                      <SelectContent>
+                        {EVIDENCE_OPTIONS.map((option) => (
+                          <SelectItem key={option.value} value={option.value}>
+                            {option.label}
+                          </SelectItem>
+                        ))}
+                      </SelectContent>
+                    </Select>
+                  </label>
+                  <label className="grid gap-1">
+                    <span className="text-2xs font-medium text-muted-foreground">Association</span>
+                    <Select value={confidence || "any"} onValueChange={(value) => setConfidence(value === "any" ? "" : value)}>
+                      <SelectTrigger aria-label="Association confidence" size="sm">
+                        <SelectValue />
+                      </SelectTrigger>
+                      <SelectContent>
+                        {CONFIDENCE_OPTIONS.map((option) => (
+                          <SelectItem key={option.value} value={option.value}>
+                            {option.label}
+                          </SelectItem>
+                        ))}
+                      </SelectContent>
+                    </Select>
+                  </label>
+                  <label className="grid gap-1">
+                    <span className="text-2xs font-medium text-muted-foreground">Address scope</span>
+                    <Select value={scopeFilter || "any"} onValueChange={(value) => setScopeFilter(value === "any" ? "" : value)}>
+                      <SelectTrigger aria-label="Address scope" size="sm">
+                        <SelectValue />
+                      </SelectTrigger>
+                      <SelectContent>
+                        {SCOPE_OPTIONS.map((option) => (
+                          <SelectItem key={option.value} value={option.value}>
+                            {option.label}
+                          </SelectItem>
+                        ))}
+                      </SelectContent>
+                    </Select>
+                  </label>
+                </div>
+              </PopoverContent>
+            </Popover>
+          )}
+        </div>
         {scope === "flows" && pinnedChips.length > 0 && (
           <div className="flex flex-wrap items-center gap-1.5">
             {pinnedChips.map(([key, value]) => (

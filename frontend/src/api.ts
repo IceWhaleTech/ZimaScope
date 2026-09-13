@@ -79,8 +79,13 @@ function json(method: string, body: unknown): RequestInit {
 export interface FlowQuery {
   q?: string;
   range?: TimeRange;
+  /** Absolute window (Unix epoch ms); only with `end`, and never with `range`. */
+  start?: number;
+  end?: number;
   direction?: string;
   protocol?: string;
+  /** Fingerprint service name (`SSH`, `TLS`, `HTTP`, …). */
+  service?: string;
   ip?: string;
   src_ip?: string;
   dst_ip?: string;
@@ -91,6 +96,7 @@ export interface FlowQuery {
   country?: string;
   asn?: number;
   organization?: string;
+  /** Comma-separated scopes to show, matched against the remote address. */
   scope?: string;
   /** Comma-separated scopes to hide, matched against the remote address. */
   exclude_scope?: string;
@@ -251,6 +257,7 @@ export interface StreamQuery {
   port?: number;
   domain?: string;
   application_id?: string;
+  scope?: string;
   exclude_scope?: string;
   state?: string;
   has_domain?: boolean;

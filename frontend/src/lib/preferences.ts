@@ -1,9 +1,16 @@
 /** Small persisted UI preferences. */
 
+import type { NetworkFilter } from "../types";
+
 const THEME_KEY = "zimascope.theme";
-const HIDE_LAN_KEY = "zimascope.hide-lan";
+const NETWORK_KEY = "zimascope.network-filter";
+const LEGACY_HIDE_LAN_KEY = "zimascope.hide-lan";
 
 export type ThemePreference = "system" | "light" | "dark";
+
+function isNetworkFilter(value: string | null): value is NetworkFilter {
+  return value === "all" || value === "internet" || value === "lan";
+}
 
 export const preferences = {
   theme(): ThemePreference {
@@ -14,11 +21,14 @@ export const preferences = {
     if (theme === "system") localStorage.removeItem(THEME_KEY);
     else localStorage.setItem(THEME_KEY, theme);
   },
-  hideLan(): boolean {
-    return localStorage.getItem(HIDE_LAN_KEY) === "true";
+  networkFilter(): NetworkFilter {
+    const value = localStorage.getItem(NETWORK_KEY);
+    if (isNetworkFilter(value)) return value;
+    // Legacy `hide-lan=true` meant "internet only".
+    return localStorage.getItem(LEGACY_HIDE_LAN_KEY) === "true" ? "internet" : "all";
   },
-  setHideLan(value: boolean): void {
-    if (value) localStorage.setItem(HIDE_LAN_KEY, "true");
-    else localStorage.removeItem(HIDE_LAN_KEY);
+  setNetworkFilter(value: NetworkFilter): void {
+    if (value === "all") localStorage.removeItem(NETWORK_KEY);
+    else localStorage.setItem(NETWORK_KEY, value);
   },
 };

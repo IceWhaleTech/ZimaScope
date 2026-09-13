@@ -1,11 +1,16 @@
-import type { Scope } from "@/types";
+import type { NetworkFilter, Scope } from "@/types";
 
-/** Scopes treated as local network by the "Internet only" filter. */
+/** Scopes treated as the local network by the shared network filter. */
 export const LAN_SCOPES: Scope[] = ["private", "link_local", "unique_local", "loopback"];
 
-/** `exclude_scope` query value for the current filter state. */
-export function excludeScopeParam(hideLan: boolean): string | undefined {
-  return hideLan ? LAN_SCOPES.join(",") : undefined;
+/** `scope` query value for the current network filter (LAN only). */
+export function scopeParam(filter: NetworkFilter): string | undefined {
+  return filter === "lan" ? LAN_SCOPES.join(",") : undefined;
+}
+
+/** `exclude_scope` query value for the current network filter (internet only). */
+export function excludeScopeParam(filter: NetworkFilter): string | undefined {
+  return filter === "internet" ? LAN_SCOPES.join(",") : undefined;
 }
 
 /** Parses an `exclude_scope` value back into a scope set. */

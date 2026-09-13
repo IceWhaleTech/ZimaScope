@@ -21,6 +21,8 @@ export type Scope =
 export type CollectorState = "running" | "degraded" | "stopped";
 export type TimeRange = "15m" | "1h" | "24h" | "7d";
 export type ExportFormat = "json" | "csv";
+/** Shared network filter: everything, internet only, or LAN only. */
+export type NetworkFilter = "all" | "internet" | "lan";
 
 /** Offset-paginated collection envelope. */
 export interface Page<T> {
@@ -402,6 +404,8 @@ export interface SettingsSummary {
 export interface FingerprintStatus {
   rules: number;
   custom: boolean;
+  /** Service names the active library can classify, sorted. */
+  services: string[];
 }
 
 export interface ProxyStatus {
@@ -431,8 +435,7 @@ export interface ServiceStatus {
 }
 
 export type RuleAction = "limit" | "block";
-export type RuleDirection = "inbound" | "outbound" | "both";
-/** Derived enforcement state of one rule. */
+export type RuleDirection = "inbound" | "outbound" | "both";/** Derived enforcement state of one rule. */
 export type RuleState = "active" | "unresolved" | "bypassed" | "unavailable";
 
 export interface EnforcementStatus {
