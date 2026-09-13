@@ -230,7 +230,7 @@ pub struct ApplicationSummaryDto {
     pub container_id: Option<String>,
     pub packets: u64,
     pub bytes: u64,
-    /// Average rate over the most recent collection interval.
+    /// Trailing average over the last few collection intervals (~5 s).
     pub inbound_bps: u64,
     pub outbound_bps: u64,
     /// Directional split relative to the Device Boundary.
@@ -297,7 +297,7 @@ pub struct FlowDto {
     pub interface: Option<String>,
     pub packets: u64,
     pub bytes: u64,
-    /// Average rate over the most recent collection interval. A directional
+    /// Trailing average over the last few collection intervals (~5 s). A directional
     /// Flow only carries the side matching its `direction`.
     pub inbound_bps: u64,
     pub outbound_bps: u64,
@@ -335,7 +335,7 @@ pub struct ConnectionDto {
     pub interface: Option<String>,
     pub packets: u64,
     pub bytes: u64,
-    /// Average rate over the most recent collection interval.
+    /// Trailing average over the last few collection intervals (~5 s).
     pub inbound_bps: u64,
     pub outbound_bps: u64,
     /// Directional counters relative to the Device Boundary.
@@ -369,7 +369,7 @@ pub struct EndpointSummaryDto {
     pub organization: Option<String>,
     pub packets: u64,
     pub bytes: u64,
-    /// Average rate over the most recent collection interval.
+    /// Trailing average over the last few collection intervals (~5 s).
     pub inbound_bps: u64,
     pub outbound_bps: u64,
     /// Directional split relative to the Device Boundary.
@@ -414,7 +414,7 @@ pub struct DomainSummaryDto {
     pub domain: String,
     pub packets: u64,
     pub bytes: u64,
-    /// Average rate over the most recent collection interval.
+    /// Trailing average over the last few collection intervals (~5 s).
     pub inbound_bps: u64,
     pub outbound_bps: u64,
     /// Directional split relative to the Device Boundary.

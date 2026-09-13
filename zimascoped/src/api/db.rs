@@ -267,19 +267,90 @@ impl Default for ApiConfig {
     }
 }
 
-/// Average rates of one entity over the most recent collection interval.
-#[derive(Clone, Copy, Debug, Default)]
+/// Number of trailing collection intervals a reported rate averages over.
+pub(crate) const RATE_WINDOW_TICKS: usize = 5;
+
+/// Trailing byte window for one direction: `(bytes, interval seconds)` samples.
+///
+/// Every collection interval starts a new sample, zero bytes when the entity
+/// was idle, so a burst decays over the window instead of dropping straight to
+/// zero after one quiet second.
+#[derive(Clone, Debug, Default)]
+struct RateWindow {
+    samples: VecDeque<(u64, f64)>,
+    bytes: u64,
+    seconds: f64,
+}
+
+impl RateWindow {
+    fn push(&mut self, bytes: u64, interval_seconds: f64) {
+        self.samples.push_back((bytes, interval_seconds));
+        self.bytes = self.bytes.saturating_add(bytes);
+        self.seconds += interval_seconds;
+        while self.samples.len() > RATE_WINDOW_TICKS {
+            let (old_bytes, old_seconds) = self.samples.pop_front().expect("window sample");
+            self.bytes = self.bytes.saturating_sub(old_bytes);
+            self.seconds -= old_seconds;
+        }
+    }
+
+    /// Adds bytes to the newest sample; [`EntityRates::roll`] must have started it.
+    fn add_bytes(&mut self, bytes: u64) {
+        if let Some(sample) = self.samples.back_mut() {
+            sample.0 = sample.0.saturating_add(bytes);
+        }
+        self.bytes = self.bytes.saturating_add(bytes);
+    }
+
+    fn bps(&self) -> u64 {
+        if self.seconds > 0.0 {
+            (self.bytes as f64 * 8.0 / self.seconds) as u64
+        } else {
+            0
+        }
+    }
+}
+
+/// Trailing rates of one entity over the last [`RATE_WINDOW_TICKS`] intervals.
+#[derive(Clone, Debug, Default)]
 struct EntityRates {
-    inbound_bps: u64,
-    outbound_bps: u64,
+    inbound: RateWindow,
+    outbound: RateWindow,
 }
 
 impl EntityRates {
-    fn add(&mut self, direction: FlowDirection, bps: u64) {
+    /// An entity first seen this interval, with its newest sample started.
+    fn started(interval_seconds: f64) -> Self {
+        let mut rates = Self::default();
+        rates.roll(interval_seconds);
+        rates
+    }
+
+    /// Starts the next interval sample for both directions.
+    fn roll(&mut self, interval_seconds: f64) {
+        self.inbound.push(0, interval_seconds);
+        self.outbound.push(0, interval_seconds);
+    }
+
+    /// Adds one interval's bytes to the newest sample.
+    fn add(&mut self, direction: FlowDirection, bytes: u64) {
         match direction {
-            FlowDirection::Inbound => self.inbound_bps = self.inbound_bps.saturating_add(bps),
-            FlowDirection::Outbound => self.outbound_bps = self.outbound_bps.saturating_add(bps),
+            FlowDirection::Inbound => self.inbound.add_bytes(bytes),
+            FlowDirection::Outbound => self.outbound.add_bytes(bytes),
         }
+    }
+
+    fn inbound_bps(&self) -> u64 {
+        self.inbound.bps()
+    }
+
+    fn outbound_bps(&self) -> u64 {
+        self.outbound.bps()
+    }
+
+    /// Whether the window still carries traffic; idle entities are evicted.
+    fn is_active(&self) -> bool {
+        self.inbound.bytes > 0 || self.outbound.bytes > 0
     }
 }
 
@@ -446,9 +517,9 @@ pub(crate) struct Db {
     last_interval: Duration,
     batch_sequence: u64,
     rates: EntityRates,
-    /// Rates of the most recent collection interval, keyed per entity. They
-    /// are live read-model state, not persisted history: a row without traffic
-    /// in the interval reads zero.
+    /// Trailing rate windows keyed per entity. They are live read-model
+    /// state, not persisted history: an entity idle for a whole window reads
+    /// zero and is evicted.
     rates_by_flow: HashMap<u64, EntityRates>,
     rates_by_connection: HashMap<String, EntityRates>,
     rates_by_endpoint: HashMap<String, EntityRates>,
@@ -569,8 +640,8 @@ impl Db {
                     interval,
                     inbound: TrafficCounters::default(),
                     outbound: TrafficCounters::default(),
-                    inbound_bps: self.rates.inbound_bps,
-                    outbound_bps: self.rates.outbound_bps,
+                    inbound_bps: self.rates.inbound_bps(),
+                    outbound_bps: self.rates.outbound_bps(),
                     flows: Vec::new(),
                     endpoints: Vec::new(),
                     domain_summaries: Vec::new(),
@@ -622,15 +693,10 @@ impl Db {
         }
         let seconds = interval.as_secs_f64();
         let seconds = if seconds > 0.0 { seconds } else { 1.0 };
-        self.rates = EntityRates {
-            inbound_bps: (inbound.bytes as f64 * 8.0 / seconds) as u64,
-            outbound_bps: (outbound.bytes as f64 * 8.0 / seconds) as u64,
-        };
-        self.rates_by_flow.clear();
-        self.rates_by_connection.clear();
-        self.rates_by_endpoint.clear();
-        self.rates_by_domain.clear();
-        self.rates_by_application.clear();
+        self.roll_entity_rates(seconds);
+        self.rates.roll(seconds);
+        self.rates.add(FlowDirection::Inbound, inbound.bytes);
+        self.rates.add(FlowDirection::Outbound, outbound.bytes);
 
         let mut touched: Vec<u64> = Vec::new();
         let mut domain_events: Vec<DomainObservationDto> = Vec::new();
@@ -681,12 +747,11 @@ impl Db {
                 upsert_flow(&tx, id, &update, now_instant, now_system, &mut writer)?;
                 touched.push(id);
 
-                let bps = (update.delta.bytes as f64 * 8.0 / seconds) as u64;
-                if bps > 0 {
+                if update.delta.bytes > 0 {
                     self.rates_by_flow
                         .entry(id)
-                        .or_default()
-                        .add(update.key.direction, bps);
+                        .or_insert_with(|| EntityRates::started(seconds))
+                        .add(update.key.direction, update.delta.bytes);
                     let (pair_lo, pair_hi) = connection_pair(&update.key);
                     let connection = connection_id(
                         update.key.protocol,
@@ -696,8 +761,8 @@ impl Db {
                     );
                     self.rates_by_connection
                         .entry(connection)
-                        .or_default()
-                        .add(update.key.direction, bps);
+                        .or_insert_with(|| EntityRates::started(seconds))
+                        .add(update.key.direction, update.delta.bytes);
                 }
             }
 
@@ -733,25 +798,24 @@ impl Db {
             let Some((direction, delta)) = flow_deltas.get(id) else {
                 continue;
             };
-            let bps = (delta.bytes as f64 * 8.0 / seconds) as u64;
-            if bps == 0 {
+            if delta.bytes == 0 {
                 continue;
             }
             self.rates_by_endpoint
                 .entry(dto.remote.address.clone())
-                .or_default()
-                .add(*direction, bps);
+                .or_insert_with(|| EntityRates::started(seconds))
+                .add(*direction, delta.bytes);
             if let Some(application) = &dto.application {
                 self.rates_by_application
                     .entry(application.id.clone())
-                    .or_default()
-                    .add(*direction, bps);
+                    .or_insert_with(|| EntityRates::started(seconds))
+                    .add(*direction, delta.bytes);
             }
             for domain in &dto.domains {
                 self.rates_by_domain
                     .entry(domain.domain.clone())
-                    .or_default()
-                    .add(*direction, bps);
+                    .or_insert_with(|| EntityRates::started(seconds))
+                    .add(*direction, delta.bytes);
             }
         }
 
@@ -848,8 +912,8 @@ impl Db {
             interval,
             inbound,
             outbound,
-            inbound_bps: self.rates.inbound_bps,
-            outbound_bps: self.rates.outbound_bps,
+            inbound_bps: self.rates.inbound_bps(),
+            outbound_bps: self.rates.outbound_bps(),
             flows: updated.into_iter().map(|(_, dto)| dto).collect(),
             endpoints,
             domain_summaries,
@@ -859,6 +923,33 @@ impl Db {
             health: health_dto,
             tick_cache: Mutex::new(HashMap::new()),
         })
+    }
+
+    /// Advances every entity rate window by one interval and evicts entries
+    /// whose traffic has aged out of the window.
+    fn roll_entity_rates(&mut self, interval_seconds: f64) {
+        for rates in self.rates_by_flow.values_mut() {
+            rates.roll(interval_seconds);
+        }
+        self.rates_by_flow.retain(|_, rates| rates.is_active());
+        for rates in self.rates_by_connection.values_mut() {
+            rates.roll(interval_seconds);
+        }
+        self.rates_by_connection
+            .retain(|_, rates| rates.is_active());
+        for rates in self.rates_by_endpoint.values_mut() {
+            rates.roll(interval_seconds);
+        }
+        self.rates_by_endpoint.retain(|_, rates| rates.is_active());
+        for rates in self.rates_by_domain.values_mut() {
+            rates.roll(interval_seconds);
+        }
+        self.rates_by_domain.retain(|_, rates| rates.is_active());
+        for rates in self.rates_by_application.values_mut() {
+            rates.roll(interval_seconds);
+        }
+        self.rates_by_application
+            .retain(|_, rates| rates.is_active());
     }
 
     /// Persists the latest interval's entity rates so list queries can sort by
@@ -876,8 +967,8 @@ impl Db {
                 statement.execute(params![
                     kind,
                     key,
-                    rate.inbound_bps as i64,
-                    rate.outbound_bps as i64,
+                    rate.inbound_bps() as i64,
+                    rate.outbound_bps() as i64,
                 ])?;
                 Ok(())
             };
@@ -1000,30 +1091,30 @@ impl Db {
     fn apply_flow_rate(&self, dto: &mut FlowDto) {
         if let Ok(id) = u64::from_str_radix(&dto.id, 16) {
             if let Some(rate) = self.rates_by_flow.get(&id) {
-                dto.inbound_bps = rate.inbound_bps;
-                dto.outbound_bps = rate.outbound_bps;
+                dto.inbound_bps = rate.inbound_bps();
+                dto.outbound_bps = rate.outbound_bps();
             }
         }
     }
 
     fn apply_endpoint_rate(&self, dto: &mut EndpointSummaryDto) {
         if let Some(rate) = self.rates_by_endpoint.get(&dto.address) {
-            dto.inbound_bps = rate.inbound_bps;
-            dto.outbound_bps = rate.outbound_bps;
+            dto.inbound_bps = rate.inbound_bps();
+            dto.outbound_bps = rate.outbound_bps();
         }
     }
 
     fn apply_domain_rate(&self, dto: &mut DomainSummaryDto) {
         if let Some(rate) = self.rates_by_domain.get(&dto.domain) {
-            dto.inbound_bps = rate.inbound_bps;
-            dto.outbound_bps = rate.outbound_bps;
+            dto.inbound_bps = rate.inbound_bps();
+            dto.outbound_bps = rate.outbound_bps();
         }
     }
 
     fn apply_application_rate(&self, dto: &mut ApplicationSummaryDto) {
         if let Some(rate) = self.rates_by_application.get(&dto.id) {
-            dto.inbound_bps = rate.inbound_bps;
-            dto.outbound_bps = rate.outbound_bps;
+            dto.inbound_bps = rate.inbound_bps();
+            dto.outbound_bps = rate.outbound_bps();
         }
     }
 
@@ -1450,8 +1541,8 @@ impl Db {
                 connection.service = evidence_service(&connection.domains).map(ToOwned::to_owned);
             }
             if let Some(rate) = self.rates_by_connection.get(&connection.id) {
-                connection.inbound_bps = rate.inbound_bps;
-                connection.outbound_bps = rate.outbound_bps;
+                connection.inbound_bps = rate.inbound_bps();
+                connection.outbound_bps = rate.outbound_bps();
             }
             items.push(connection);
         }
@@ -2157,8 +2248,8 @@ impl Db {
             generated_at: unix_millis(now),
             rates: if self.rates_are_fresh(now) {
                 RateDto {
-                    inbound_bps: self.rates.inbound_bps,
-                    outbound_bps: self.rates.outbound_bps,
+                    inbound_bps: self.rates.inbound_bps(),
+                    outbound_bps: self.rates.outbound_bps(),
                 }
             } else {
                 RateDto::default()

@@ -78,7 +78,7 @@ export function RateValue({
         inbound ? "text-series-inbound" : "text-series-outbound",
         className,
       )}
-      title={`${inbound ? "Download (entering ZimaOS)" : "Upload (leaving ZimaOS)"}: ${formatRateText(bps ?? 0)} over the last interval`}
+      title={`${inbound ? "Download (entering ZimaOS)" : "Upload (leaving ZimaOS)"}: ${formatRateText(bps ?? 0)}, averaged over the last few seconds`}
     >
       <Icon className="size-3" strokeWidth={2.2} />
       {formatRateText(bps ?? 0)}

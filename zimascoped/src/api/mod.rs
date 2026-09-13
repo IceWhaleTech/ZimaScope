@@ -1905,8 +1905,14 @@ mod tests {
         assert_eq!(body["items"][0]["outbound_bps"], 32_000);
         assert_eq!(body["items"][0]["inbound_bps"], 0);
 
-        // Rates describe the latest interval only; idle intervals reset them.
+        // Rates trail over a window: one idle interval halves the average and
+        // the value reaches zero only after the window has fully rolled over.
         state.ingest_batch(batch(2, Vec::new()));
+        let body = body_json(call(&state, get("/v1/flows")).await).await;
+        assert_eq!(body["items"][0]["outbound_bps"], 16_000);
+        for sequence in 3..=(super::db::RATE_WINDOW_TICKS as u64 + 1) {
+            state.ingest_batch(batch(sequence, Vec::new()));
+        }
         let body = body_json(call(&state, get("/v1/flows")).await).await;
         assert_eq!(body["items"][0]["outbound_bps"], 0);
         let body = body_json(call(&state, get("/v1/endpoints")).await).await;
@@ -1965,8 +1971,11 @@ mod tests {
         let body = body_json(call(&state, get("/v1/domains?sort=-rate")).await).await;
         assert_eq!(body["items"][0]["domain"], "fast.example");
 
-        // Rates reset with the interval, so ordering falls back to zero.
-        state.ingest_batch(batch(2, Vec::new()));
+        // Rates trail over a window, so ordering survives a few idle intervals
+        // and only falls back to zero once the window has rolled over.
+        for sequence in 2..=(super::db::RATE_WINDOW_TICKS as u64 + 1) {
+            state.ingest_batch(batch(sequence, Vec::new()));
+        }
         let body = body_json(call(&state, get("/v1/endpoints?sort=-rate")).await).await;
         assert_eq!(body["items"][0]["outbound_bps"], 0);
     }

@@ -75,7 +75,7 @@ export interface Flow {
   interface: string | null;
   packets: number;
   bytes: number;
-  /** Average rate over the most recent collection interval. */
+  /** Trailing average over the last few collection intervals (~5 s). */
   inbound_bps: number;
   outbound_bps: number;
   first_seen: number;
@@ -106,7 +106,7 @@ export interface Connection {
   interface: string | null;
   packets: number;
   bytes: number;
-  /** Average rate over the most recent collection interval. */
+  /** Trailing average over the last few collection intervals (~5 s). */
   inbound_bps: number;
   outbound_bps: number;
   /** Directional counters relative to the Device Boundary. */
@@ -126,7 +126,7 @@ export interface EndpointSummary {
   organization: string | null;
   packets: number;
   bytes: number;
-  /** Average rate over the most recent collection interval. */
+  /** Trailing average over the last few collection intervals (~5 s). */
   inbound_bps: number;
   outbound_bps: number;
   traffic: DirectionTotals;
@@ -168,7 +168,7 @@ export interface ApplicationSummary {
   container_id: string | null;
   packets: number;
   bytes: number;
-  /** Average rate over the most recent collection interval. */
+  /** Trailing average over the last few collection intervals (~5 s). */
   inbound_bps: number;
   outbound_bps: number;
   traffic: DirectionTotals;
@@ -187,7 +187,7 @@ export interface ApplicationDetail {
   container_id: string | null;
   packets: number;
   bytes: number;
-  /** Average rate over the most recent collection interval. */
+  /** Trailing average over the last few collection intervals (~5 s). */
   inbound_bps: number;
   outbound_bps: number;
   traffic: DirectionTotals;
@@ -222,7 +222,7 @@ export interface DomainSummary {
   domain: string;
   packets: number;
   bytes: number;
-  /** Average rate over the most recent collection interval. */
+  /** Trailing average over the last few collection intervals (~5 s). */
   inbound_bps: number;
   outbound_bps: number;
   traffic: DirectionTotals;
