@@ -1291,7 +1291,8 @@ impl Db {
              MIN(first_seen_ms) AS first_seen_ms, MAX(last_seen_ms) AS last_seen_ms, \
              (MAX(last_seen_ms) - MIN(first_seen_ms)) AS duration_ms, \
              MAX(service) AS service, \
-             MIN(json_extract(domains_json, '$[0].domain')) AS first_domain \
+             MIN(json_extract(domains_json, '$[0].domain')) AS first_domain, \
+             json_group_array(domains_json) AS domains_all \
              FROM flows {where_clause} \
              GROUP BY protocol, ifindex, pair_lo, pair_hi {having_clause} \
              ORDER BY {order} LIMIT ?{} OFFSET ?{}",
@@ -1366,17 +1367,24 @@ impl Db {
                         duration_ms: row.get::<_, i64>(27)?.max(0) as u64,
                         domains: Vec::new(),
                     },
-                    ifindex,
-                    pair_lo,
-                    pair_hi,
+                    row.get::<_, String>(30)?,
                 ))
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
 
         let mut items = Vec::with_capacity(rows.len());
-        for (mut connection, ifindex, pair_lo, pair_hi) in rows {
-            connection.domains =
-                self.connection_domains(connection.protocol, ifindex, &pair_lo, &pair_hi)?;
+        for (mut connection, domains_json) in rows {
+            let groups: Vec<String> = serde_json::from_str(&domains_json).unwrap_or_default();
+            let mut domains: Vec<DomainRefDto> = Vec::new();
+            for group in &groups {
+                let associations: Vec<DomainRefDto> =
+                    serde_json::from_str(group).unwrap_or_default();
+                for association in &associations {
+                    push_domain(&mut domains, association);
+                }
+            }
+            domains.sort_by(|left, right| left.domain.cmp(&right.domain));
+            connection.domains = domains;
             if connection.service.is_none() {
                 // Historical rows predate fingerprinting: Domain Evidence from
                 // a parsed TLS/HTTP handshake still names the protocol.
@@ -1395,35 +1403,6 @@ impl Db {
             limit,
             offset,
         })
-    }
-
-    /// Merged Associated Domains of both directional members of a connection.
-    fn connection_domains(
-        &self,
-        protocol: Protocol,
-        ifindex: i64,
-        pair_lo: &str,
-        pair_hi: &str,
-    ) -> Result<Vec<DomainRefDto>, ApiError> {
-        let mut statement = self.conn.prepare(
-            "SELECT domains_json FROM flows WHERE protocol = ?1 AND ifindex = ?2 \
-             AND (((src_addr || ':' || COALESCE(src_port, -1)) = ?3 \
-                AND (dst_addr || ':' || COALESCE(dst_port, -1)) = ?4) \
-               OR ((src_addr || ':' || COALESCE(src_port, -1)) = ?4 \
-                AND (dst_addr || ':' || COALESCE(dst_port, -1)) = ?3))",
-        )?;
-        let mut domains: Vec<DomainRefDto> = Vec::new();
-        for row in statement.query_map(
-            params![enum_value(protocol), ifindex, pair_lo, pair_hi],
-            |row| row.get::<_, String>(0),
-        )? {
-            let parsed: Vec<DomainRefDto> = serde_json::from_str(&row?).unwrap_or_default();
-            for association in parsed {
-                push_domain(&mut domains, &association);
-            }
-        }
-        domains.sort_by(|left, right| left.domain.cmp(&right.domain));
-        Ok(domains)
     }
 
     fn flows_page(
