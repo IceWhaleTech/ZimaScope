@@ -34,3 +34,8 @@ lto = true
 codegen-units = 1
 panic = "abort"
 strip = true
+
+# bpf-linker (LLVM 22) rejects the -Os that `opt-level = "s"` would pass for
+# eBPF objects, so the kernel program keeps a normal optimization level.
+[profile.release.package.zimascope-ebpf]
+opt-level = 3

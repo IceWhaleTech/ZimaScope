@@ -31,8 +31,10 @@ fn main() {
 
     // The generated file is compiled from OUT_DIR, so the embedded path must
     // be absolute; a relative path would be resolved against OUT_DIR.
+    // Watch the object even when it is missing: a later eBPF build must
+    // trigger a rerun so its bytes get embedded.
+    println!("cargo:rerun-if-changed={}", object.display());
     let contents = if target_os == "linux" && object.is_file() {
-        println!("cargo:rerun-if-changed={}", object.display());
         format!(
             "pub static EBPF_OBJECT: &[u8] = aya::include_bytes_aligned!({:?});\n",
             object.to_string_lossy()
