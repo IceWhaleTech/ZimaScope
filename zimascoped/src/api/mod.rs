@@ -740,6 +740,8 @@ async fn get_endpoint(
 #[derive(serde::Deserialize)]
 struct TimelineQuery {
     range: Option<TimeRange>,
+    /// Device Boundary interface name; omitted means every interface.
+    interface: Option<String>,
 }
 
 async fn get_endpoint_timeline(
@@ -751,7 +753,7 @@ async fn get_endpoint_timeline(
     state
         .lock()
         .db
-        .endpoint_timeline(&ip, range, SystemTime::now())
+        .endpoint_timeline(&ip, range, query.interface.as_deref(), SystemTime::now())
         .map(Json)
 }
 
@@ -764,7 +766,12 @@ async fn get_domain_timeline(
     state
         .lock()
         .db
-        .domain_timeline(&domain, range, SystemTime::now())
+        .domain_timeline(
+            &domain,
+            range,
+            query.interface.as_deref(),
+            SystemTime::now(),
+        )
         .map(Json)
 }
 
@@ -805,7 +812,7 @@ async fn get_application_timeline(
     state
         .lock()
         .db
-        .application_timeline(&id, range, SystemTime::now())
+        .application_timeline(&id, range, query.interface.as_deref(), SystemTime::now())
         .map(Json)
 }
 
@@ -2281,6 +2288,50 @@ mod tests {
                 .is_empty(),
             "an observation made on docker0 must not attach to eth0 flows"
         );
+    }
+
+    #[tokio::test]
+    async fn timeline_and_entity_series_respect_the_interface_filter() {
+        let state = state();
+        let eth0 = outbound(("93.184.216.34", 443), 40, 4_000, Duration::ZERO);
+        let mut docker0 = outbound(("93.184.216.34", 443), 10, 1_000, Duration::ZERO);
+        docker0.key.interface_index = NonZeroU32::new(8).expect("non-zero ifindex");
+        let mut incoming = batch(1, vec![eth0, docker0]);
+        incoming.health.attached_interfaces.push(InterfaceHealth {
+            ifindex: NonZeroU32::new(8).expect("non-zero ifindex"),
+            name: "docker0".into(),
+            ingress_attached: true,
+            egress_attached: true,
+            last_error: None,
+        });
+        state.ingest_batch(incoming);
+
+        let body = body_json(call(&state, get("/v1/overview?range=15m")).await).await;
+        assert_eq!(timeline_bytes(&body["timeline"], "outbound"), 5_000);
+
+        let body =
+            body_json(call(&state, get("/v1/overview?range=15m&interface=eth0")).await).await;
+        assert_eq!(timeline_bytes(&body["timeline"], "outbound"), 4_000);
+
+        let body = body_json(
+            call(
+                &state,
+                get("/v1/endpoints/93.184.216.34/timeline?range=15m&interface=docker0"),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(timeline_bytes(&body, "outbound"), 1_000);
+
+        let body = body_json(
+            call(
+                &state,
+                get("/v1/endpoints/93.184.216.34/timeline?range=15m"),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(timeline_bytes(&body, "outbound"), 5_000);
     }
 
     #[tokio::test]

@@ -83,7 +83,7 @@ const MINUTE_BUCKET_RETENTION_MS: i64 = 2 * 60 * 60 * 1000;
 const HOUR_BUCKET_RETENTION_MS: i64 = 8 * 24 * 60 * 60 * 1000;
 const MS_PER_DAY: i64 = 24 * 60 * 60 * 1000;
 
-const SCHEMA_VERSION: i64 = 9;
+const SCHEMA_VERSION: i64 = 10;
 
 const SCHEMA_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS flows (
@@ -150,11 +150,13 @@ CREATE INDEX IF NOT EXISTS idx_observations_expires ON observations(expires_at_m
 CREATE TABLE IF NOT EXISTS traffic_buckets (
     resolution TEXT NOT NULL,
     start_ms INTEGER NOT NULL,
+    ifindex INTEGER NOT NULL DEFAULT 0,
+    interface TEXT NOT NULL DEFAULT '',
     in_packets INTEGER NOT NULL,
     in_bytes INTEGER NOT NULL,
     out_packets INTEGER NOT NULL,
     out_bytes INTEGER NOT NULL,
-    PRIMARY KEY (resolution, start_ms)
+    PRIMARY KEY (resolution, start_ms, ifindex)
 );
 
 CREATE TABLE IF NOT EXISTS entity_buckets (
@@ -162,11 +164,13 @@ CREATE TABLE IF NOT EXISTS entity_buckets (
     key TEXT NOT NULL,
     resolution TEXT NOT NULL,
     start_ms INTEGER NOT NULL,
+    ifindex INTEGER NOT NULL DEFAULT 0,
+    interface TEXT NOT NULL DEFAULT '',
     in_packets INTEGER NOT NULL,
     in_bytes INTEGER NOT NULL,
     out_packets INTEGER NOT NULL,
     out_bytes INTEGER NOT NULL,
-    PRIMARY KEY (kind, key, resolution, start_ms)
+    PRIMARY KEY (kind, key, resolution, start_ms, ifindex)
 );
 
 CREATE TABLE IF NOT EXISTS entity_rates (
@@ -595,6 +599,50 @@ impl Db {
                      DROP TABLE observations_v8;",
                 )?;
             }
+            // Schema v10 adds the interface dimension to the time buckets.
+            // Rows written before this database have no per-interface split
+            // and stay wildcard (`ifindex = 0`, empty name).
+            if version > 0 && version < 10 {
+                if table_exists(&conn, "traffic_buckets")? {
+                    conn.execute_batch(
+                        "ALTER TABLE traffic_buckets RENAME TO traffic_buckets_v9; \
+                         CREATE TABLE traffic_buckets ( \
+                             resolution TEXT NOT NULL, start_ms INTEGER NOT NULL, \
+                             ifindex INTEGER NOT NULL DEFAULT 0, \
+                             interface TEXT NOT NULL DEFAULT '', \
+                             in_packets INTEGER NOT NULL, in_bytes INTEGER NOT NULL, \
+                             out_packets INTEGER NOT NULL, out_bytes INTEGER NOT NULL, \
+                             PRIMARY KEY (resolution, start_ms, ifindex) \
+                         ); \
+                         INSERT INTO traffic_buckets \
+                             (resolution, start_ms, ifindex, interface, in_packets, \
+                              in_bytes, out_packets, out_bytes) \
+                         SELECT resolution, start_ms, 0, '', in_packets, in_bytes, \
+                                out_packets, out_bytes FROM traffic_buckets_v9; \
+                         DROP TABLE traffic_buckets_v9;",
+                    )?;
+                }
+                if table_exists(&conn, "entity_buckets")? {
+                    conn.execute_batch(
+                        "ALTER TABLE entity_buckets RENAME TO entity_buckets_v9; \
+                         CREATE TABLE entity_buckets ( \
+                             kind TEXT NOT NULL, key TEXT NOT NULL, \
+                             resolution TEXT NOT NULL, start_ms INTEGER NOT NULL, \
+                             ifindex INTEGER NOT NULL DEFAULT 0, \
+                             interface TEXT NOT NULL DEFAULT '', \
+                             in_packets INTEGER NOT NULL, in_bytes INTEGER NOT NULL, \
+                             out_packets INTEGER NOT NULL, out_bytes INTEGER NOT NULL, \
+                             PRIMARY KEY (kind, key, resolution, start_ms, ifindex) \
+                         ); \
+                         INSERT INTO entity_buckets \
+                             (kind, key, resolution, start_ms, ifindex, interface, \
+                              in_packets, in_bytes, out_packets, out_bytes) \
+                         SELECT kind, key, resolution, start_ms, 0, '', in_packets, \
+                                in_bytes, out_packets, out_bytes FROM entity_buckets_v9; \
+                         DROP TABLE entity_buckets_v9;",
+                    )?;
+                }
+            }
             conn.execute_batch(SCHEMA_SQL)?;
             // Upgraded databases keep their rows: new columns are added in
             // place instead of recreating tables.
@@ -724,7 +772,7 @@ impl Db {
         let mut touched: Vec<u64> = Vec::new();
         let mut domain_events: Vec<DomainObservationDto> = Vec::new();
         let mut changed_addresses: HashSet<(IpAddr, i64)> = HashSet::new();
-        let mut flow_deltas: HashMap<u64, (FlowDirection, TrafficCounters)> = HashMap::new();
+        let mut flow_deltas: HashMap<u64, (FlowDirection, TrafficCounters, i64)> = HashMap::new();
 
         {
             let tx = self.conn.transaction()?;
@@ -772,7 +820,14 @@ impl Db {
             let mut domains_cache: HashMap<(IpAddr, i64), String> = HashMap::new();
             for update in flows {
                 let id = flow_id(&update.key);
-                flow_deltas.insert(id, (update.key.direction, update.delta));
+                flow_deltas.insert(
+                    id,
+                    (
+                        update.key.direction,
+                        update.delta,
+                        i64::from(update.key.interface_index.get()),
+                    ),
+                );
                 upsert_flow(
                     &tx,
                     id,
@@ -803,20 +858,6 @@ impl Db {
                 }
             }
 
-            add_bucket(
-                &tx,
-                "minute",
-                truncate_time(collected_at, 60),
-                inbound,
-                outbound,
-            )?;
-            add_bucket(
-                &tx,
-                "hour",
-                truncate_time(collected_at, 3600),
-                inbound,
-                outbound,
-            )?;
             tx.commit()?;
         }
 
@@ -832,7 +873,7 @@ impl Db {
         }
 
         for (id, dto) in &updated {
-            let Some((direction, delta)) = flow_deltas.get(id) else {
+            let Some((direction, delta, _)) = flow_deltas.get(id) else {
                 continue;
             };
             if delta.bytes == 0 {
@@ -860,13 +901,27 @@ impl Db {
             let tx = self.conn.transaction()?;
             let minute = truncate_time(collected_at, 60);
             let hour = truncate_time(collected_at, 3600);
+            // Traffic totals carry the interface dimension too; each Flow only
+            // contributes to the interface it was observed on.
+            let mut interface_totals: HashMap<(i64, String), (TrafficCounters, TrafficCounters)> =
+                HashMap::new();
             for (id, dto) in &updated {
-                let Some((direction, delta)) = flow_deltas.get(id) else {
+                let Some((direction, delta, ifindex)) = flow_deltas.get(id) else {
                     continue;
                 };
                 if delta.packets == 0 && delta.bytes == 0 {
                     continue;
                 }
+                let interface = dto.interface.clone().unwrap_or_default();
+                let totals = interface_totals
+                    .entry((*ifindex, interface.clone()))
+                    .or_default();
+                let counters = match direction {
+                    FlowDirection::Inbound => &mut totals.0,
+                    FlowDirection::Outbound => &mut totals.1,
+                };
+                add_counters(counters, *delta);
+
                 for (resolution, start) in [("minute", minute), ("hour", hour)] {
                     add_entity_bucket(
                         &tx,
@@ -874,6 +929,8 @@ impl Db {
                         &dto.remote.address,
                         resolution,
                         start,
+                        *ifindex,
+                        &interface,
                         *direction,
                         *delta,
                     )?;
@@ -884,6 +941,8 @@ impl Db {
                             &application.id,
                             resolution,
                             start,
+                            *ifindex,
+                            &interface,
                             *direction,
                             *delta,
                         )?;
@@ -895,11 +954,19 @@ impl Db {
                             &domain.domain,
                             resolution,
                             start,
+                            *ifindex,
+                            &interface,
                             *direction,
                             *delta,
                         )?;
                     }
                 }
+            }
+            for ((ifindex, interface), (inbound, outbound)) in &interface_totals {
+                add_bucket(
+                    &tx, "minute", minute, *ifindex, interface, *inbound, *outbound,
+                )?;
+                add_bucket(&tx, "hour", hour, *ifindex, interface, *inbound, *outbound)?;
             }
             tx.commit()?;
         }
@@ -1313,9 +1380,10 @@ impl Db {
         &self,
         id: &str,
         range: TimeRange,
+        interface: Option<&str>,
         now: SystemTime,
     ) -> Result<TimelineDto, ApiError> {
-        self.buckets_timeline(range, now, Some(("application", id)))
+        self.buckets_timeline(range, now, Some(("application", id)), interface)
     }
 
     fn application_rows(
@@ -2297,7 +2365,7 @@ impl Db {
                 RateDto::default()
             },
             totals,
-            timeline: self.timeline(range, now)?,
+            timeline: self.timeline(range, query.interface.as_deref(), now)?,
             top_endpoints: self.endpoint_rows(&query, TOP_LIST_LIMIT, 0)?.0,
             top_domains: self.domain_rows(&query, TOP_LIST_LIMIT, 0)?.0,
             top_countries,
@@ -2422,8 +2490,13 @@ impl Db {
         Ok(items)
     }
 
-    fn timeline(&self, range: TimeRange, now: SystemTime) -> Result<TimelineDto, ApiError> {
-        self.buckets_timeline(range, now, None)
+    fn timeline(
+        &self,
+        range: TimeRange,
+        interface: Option<&str>,
+        now: SystemTime,
+    ) -> Result<TimelineDto, ApiError> {
+        self.buckets_timeline(range, now, None, interface)
     }
 
     /// Boundary traffic timeline for one Endpoint (remote address).
@@ -2431,12 +2504,18 @@ impl Db {
         &self,
         address: &str,
         range: TimeRange,
+        interface: Option<&str>,
         now: SystemTime,
     ) -> Result<TimelineDto, ApiError> {
         let address: IpAddr = address
             .parse()
             .map_err(|_| ApiError::bad_request(format!("invalid IP address: {address}")))?;
-        self.buckets_timeline(range, now, Some(("endpoint", &address.to_string())))
+        self.buckets_timeline(
+            range,
+            now,
+            Some(("endpoint", &address.to_string())),
+            interface,
+        )
     }
 
     /// Boundary traffic timeline for one Associated Domain.
@@ -2444,13 +2523,14 @@ impl Db {
         &self,
         domain: &str,
         range: TimeRange,
+        interface: Option<&str>,
         now: SystemTime,
     ) -> Result<TimelineDto, ApiError> {
         let domain = normalize_domain(domain);
         if domain.is_empty() {
             return Err(ApiError::bad_request("domain must not be empty"));
         }
-        self.buckets_timeline(range, now, Some(("domain", &domain)))
+        self.buckets_timeline(range, now, Some(("domain", &domain)), interface)
     }
 
     fn buckets_timeline(
@@ -2458,6 +2538,7 @@ impl Db {
         range: TimeRange,
         now: SystemTime,
         entity: Option<(&str, &str)>,
+        interface: Option<&str>,
     ) -> Result<TimelineDto, ApiError> {
         let (resolution, step_ms) = match range {
             TimeRange::Minute15 | TimeRange::Hour1 => ("minute", 60_000i64),
@@ -2466,8 +2547,11 @@ impl Db {
         let end = unix_millis(now).div_euclid(step_ms) * step_ms;
         let start = unix_millis(range.cutoff(now)).div_euclid(step_ms) * step_ms;
 
-        let mut sql =
-            String::from("SELECT start_ms, in_packets, in_bytes, out_packets, out_bytes FROM ");
+        // Rows are split per interface; unfiltered reads sum them back into
+        // the boundary total.
+        let mut sql = String::from(
+            "SELECT start_ms, SUM(in_packets), SUM(in_bytes), SUM(out_packets), SUM(out_bytes) FROM ",
+        );
         let mut params = vec![
             Value::Text(resolution.to_owned()),
             Value::Integer(start),
@@ -2477,18 +2561,25 @@ impl Db {
             Some((kind, key)) => {
                 sql.push_str(
                     "entity_buckets WHERE resolution = ?1 AND start_ms BETWEEN ?2 AND ?3 \
-                     AND kind = ?4 AND key = ?5 ORDER BY start_ms",
+                     AND kind = ?4 AND key = ?5",
                 );
                 params.push(Value::Text(kind.to_owned()));
                 params.push(Value::Text(key.to_owned()));
             }
             None => {
                 sql.push_str(
-                    "traffic_buckets WHERE resolution = ?1 AND start_ms BETWEEN ?2 AND ?3 \
-                     ORDER BY start_ms",
+                    "traffic_buckets WHERE resolution = ?1 AND start_ms BETWEEN ?2 AND ?3",
                 );
             }
         }
+        if let Some(interface) = interface.map(str::trim).filter(|name| !name.is_empty()) {
+            sql.push_str(&format!(
+                " AND interface = ?{} COLLATE NOCASE",
+                params.len() + 1
+            ));
+            params.push(Value::Text(interface.to_owned()));
+        }
+        sql.push_str(" GROUP BY start_ms ORDER BY start_ms");
 
         let mut points: HashMap<i64, TimelinePointDto> = HashMap::new();
         let mut statement = self.conn.prepare(&sql)?;
@@ -3416,17 +3507,21 @@ fn upsert_application(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn add_bucket(
     tx: &rusqlite::Transaction<'_>,
     resolution: &str,
     start: SystemTime,
+    ifindex: i64,
+    interface: &str,
     inbound: TrafficCounters,
     outbound: TrafficCounters,
 ) -> Result<(), ApiError> {
     tx.execute(
-        "INSERT INTO traffic_buckets (resolution, start_ms, in_packets, in_bytes, out_packets, \
-         out_bytes) VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
-         ON CONFLICT(resolution, start_ms) DO UPDATE SET \
+        "INSERT INTO traffic_buckets (resolution, start_ms, ifindex, interface, in_packets, \
+         in_bytes, out_packets, out_bytes) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) \
+         ON CONFLICT(resolution, start_ms, ifindex) DO UPDATE SET \
+         interface = excluded.interface, \
          in_packets = traffic_buckets.in_packets + excluded.in_packets, \
          in_bytes = traffic_buckets.in_bytes + excluded.in_bytes, \
          out_packets = traffic_buckets.out_packets + excluded.out_packets, \
@@ -3434,6 +3529,8 @@ fn add_bucket(
         params![
             resolution,
             unix_millis(start),
+            ifindex,
+            interface,
             inbound.packets as i64,
             inbound.bytes as i64,
             outbound.packets as i64,
@@ -3444,12 +3541,15 @@ fn add_bucket(
 }
 
 /// Adds one Flow delta to an entity (Endpoint or Domain) time bucket.
+#[allow(clippy::too_many_arguments)]
 fn add_entity_bucket(
     tx: &rusqlite::Transaction<'_>,
     kind: &str,
     key: &str,
     resolution: &str,
     start: SystemTime,
+    ifindex: i64,
+    interface: &str,
     direction: FlowDirection,
     delta: TrafficCounters,
 ) -> Result<(), ApiError> {
@@ -3458,9 +3558,11 @@ fn add_entity_bucket(
         FlowDirection::Outbound => (0, 0, delta.packets as i64, delta.bytes as i64),
     };
     tx.prepare_cached(
-        "INSERT INTO entity_buckets (kind, key, resolution, start_ms, in_packets, in_bytes, \
-         out_packets, out_bytes) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) \
-         ON CONFLICT(kind, key, resolution, start_ms) DO UPDATE SET \
+        "INSERT INTO entity_buckets (kind, key, resolution, start_ms, ifindex, interface, \
+         in_packets, in_bytes, out_packets, out_bytes) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10) \
+         ON CONFLICT(kind, key, resolution, start_ms, ifindex) DO UPDATE SET \
+         interface = excluded.interface, \
          in_packets = entity_buckets.in_packets + excluded.in_packets, \
          in_bytes = entity_buckets.in_bytes + excluded.in_bytes, \
          out_packets = entity_buckets.out_packets + excluded.out_packets, \
@@ -3471,6 +3573,8 @@ fn add_entity_bucket(
         key,
         resolution,
         unix_millis(start),
+        ifindex,
+        interface,
         in_packets,
         in_bytes,
         out_packets,
@@ -4357,6 +4461,88 @@ mod tests {
             .expect("legacy row survives");
         assert_eq!(ifindex, 0, "legacy evidence stays wildcard");
         assert_eq!(domain, "example.com");
+
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("db-wal"));
+        let _ = std::fs::remove_file(path.with_extension("db-shm"));
+    }
+
+    #[test]
+    fn migrates_a_v9_database_and_keeps_bucket_totals_as_wildcards() {
+        let unique = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_nanos();
+        let path =
+            std::env::temp_dir().join(format!("zs-buckets-{}-{unique}.db", std::process::id()));
+        let start = unix_millis(SystemTime::now()).div_euclid(60_000) * 60_000;
+        {
+            let conn = Connection::open(&path).expect("open old database");
+            conn.execute_batch(&format!(
+                "CREATE TABLE traffic_buckets ( \
+                     resolution TEXT NOT NULL, start_ms INTEGER NOT NULL, \
+                     in_packets INTEGER NOT NULL, in_bytes INTEGER NOT NULL, \
+                     out_packets INTEGER NOT NULL, out_bytes INTEGER NOT NULL, \
+                     PRIMARY KEY (resolution, start_ms)); \
+                 CREATE TABLE entity_buckets ( \
+                     kind TEXT NOT NULL, key TEXT NOT NULL, resolution TEXT NOT NULL, \
+                     start_ms INTEGER NOT NULL, in_packets INTEGER NOT NULL, \
+                     in_bytes INTEGER NOT NULL, out_packets INTEGER NOT NULL, \
+                     out_bytes INTEGER NOT NULL, \
+                     PRIMARY KEY (kind, key, resolution, start_ms)); \
+                 INSERT INTO traffic_buckets VALUES ('minute', {start}, 1, 10, 2, 20); \
+                 INSERT INTO entity_buckets VALUES \
+                     ('endpoint', '93.184.216.34', 'minute', {start}, 1, 10, 2, 20); \
+                 PRAGMA user_version = 9;"
+            ))
+            .expect("seed old schema");
+        }
+
+        let db = Db::open(&ApiConfig {
+            database: Some(path.clone()),
+            ..ApiConfig::default()
+        })
+        .expect("open upgraded database");
+
+        let timeline = db
+            .timeline(TimeRange::Minute15, None, SystemTime::now())
+            .expect("timeline");
+        let legacy = timeline
+            .points
+            .iter()
+            .find(|point| point.start == start)
+            .expect("legacy bucket survives");
+        assert_eq!(legacy.outbound.bytes, 20);
+        assert_eq!(legacy.inbound.bytes, 10);
+
+        let filtered = db
+            .timeline(TimeRange::Minute15, Some("eth0"), SystemTime::now())
+            .expect("timeline");
+        assert!(
+            filtered
+                .points
+                .iter()
+                .all(|point| point.outbound.bytes == 0),
+            "legacy buckets are wildcard and do not answer an interface filter"
+        );
+
+        let entity = db
+            .endpoint_timeline(
+                "93.184.216.34",
+                TimeRange::Minute15,
+                None,
+                SystemTime::now(),
+            )
+            .expect("entity timeline");
+        assert_eq!(
+            entity
+                .points
+                .iter()
+                .map(|point| point.outbound.bytes)
+                .sum::<u64>(),
+            20
+        );
 
         drop(db);
         let _ = std::fs::remove_file(&path);
