@@ -275,12 +275,16 @@ impl Inner {
             }
         };
         let (enrichment, enrichment_error) = self.db.enrichment_status();
-        let (fingerprint_rules, fingerprints_custom) = {
+        let (fingerprint_rules, fingerprints_custom, fingerprint_services) = {
             let library = self
                 .fingerprints
                 .read()
                 .unwrap_or_else(|error| error.into_inner());
-            (library.rule_count(), library.is_custom())
+            (
+                library.rule_count(),
+                library.is_custom(),
+                library.services(),
+            )
         };
         let proxy = self.proxy.status();
 
@@ -309,6 +313,7 @@ impl Inner {
             fingerprints: dto::FingerprintStatusDto {
                 rules: fingerprint_rules,
                 custom: fingerprints_custom,
+                services: fingerprint_services,
             },
             proxy: dto::ProxyStatusDto {
                 enabled: proxy.enabled,
@@ -1964,6 +1969,112 @@ mod tests {
         state.ingest_batch(batch(2, Vec::new()));
         let body = body_json(call(&state, get("/v1/endpoints?sort=-rate")).await).await;
         assert_eq!(body["items"][0]["outbound_bps"], 0);
+    }
+
+    #[tokio::test]
+    async fn flow_filters_cover_service_scope_and_absolute_time() {
+        let state = state();
+        let incoming = batch(
+            1,
+            vec![
+                {
+                    let mut update = outbound(("93.184.216.34", 443), 40, 4_000, Duration::ZERO);
+                    update.service = Some("TLS".into());
+                    update
+                },
+                {
+                    let mut update = outbound(("192.168.1.10", 22), 40, 4_000, Duration::ZERO);
+                    update.service = Some("SSH".into());
+                    update
+                },
+                // The server side of the SSH pair carries no fingerprint: the
+                // connection filter must keep its totals, not drop the row.
+                flow(
+                    FlowDirection::Inbound,
+                    ("192.168.1.10", 22),
+                    ("10.0.0.2", 40_000),
+                    30,
+                    9_000,
+                    Duration::ZERO,
+                ),
+            ],
+        );
+        state.ingest_batch(incoming);
+
+        // Service filter on directional flows.
+        let body = body_json(call(&state, get("/v1/flows?service=SSH")).await).await;
+        assert_eq!(body["total"], 1);
+        assert_eq!(body["items"][0]["remote"]["address"], "192.168.1.10");
+
+        // Service filter on connections applies after aggregation, so the
+        // unfingerprinted direction still contributes its bytes.
+        let body = body_json(call(&state, get("/v1/connections?service=SSH")).await).await;
+        assert_eq!(body["total"], 1);
+        assert_eq!(body["items"][0]["remote"]["address"], "192.168.1.10");
+        assert_eq!(body["items"][0]["traffic"]["inbound"]["bytes"], 9_000);
+        assert_eq!(body["items"][0]["traffic"]["outbound"]["bytes"], 4_000);
+
+        // Search matches the fingerprint service name too.
+        let body = body_json(call(&state, get("/v1/flows?q=ssh")).await).await;
+        assert_eq!(body["total"], 1);
+        assert_eq!(body["items"][0]["remote"]["address"], "192.168.1.10");
+
+        // Scope lists: the LAN shorthand and a single public scope.
+        let body = body_json(
+            call(
+                &state,
+                get("/v1/flows?scope=private,link_local,unique_local,loopback"),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(body["total"], 2);
+        let body = body_json(call(&state, get("/v1/flows?scope=public")).await).await;
+        assert_eq!(body["total"], 1);
+        assert_eq!(body["items"][0]["remote"]["address"], "93.184.216.34");
+
+        // Absolute time windows.
+        let now = unix_millis(SystemTime::now());
+        let body = body_json(
+            call(
+                &state,
+                get(&format!(
+                    "/v1/flows?start={}&end={}",
+                    now - 60_000,
+                    now + 60_000
+                )),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(body["total"], 3);
+        let body = body_json(call(&state, get("/v1/flows?start=1&end=2")).await).await;
+        assert_eq!(body["total"], 0);
+
+        // start/end validation: pairing, ordering, and range exclusivity.
+        for uri in [
+            "/v1/flows?start=1".to_owned(),
+            "/v1/flows?end=2".to_owned(),
+            "/v1/flows?start=2&end=1".to_owned(),
+            "/v1/flows?range=15m&start=1&end=2".to_owned(),
+        ] {
+            let response = call(&state, get(&uri)).await;
+            assert_problem(&response, StatusCode::UNPROCESSABLE_ENTITY);
+        }
+
+        // Fingerprint service names ride /v1/status for the filter dropdown.
+        let status = body_json(call(&state, get("/v1/status")).await).await;
+        let services: Vec<String> = status["fingerprints"]["services"]
+            .as_array()
+            .expect("services")
+            .iter()
+            .map(|service| service.as_str().expect("service name").to_owned())
+            .collect();
+        assert!(services.iter().any(|service| service == "SSH"));
+        assert!(services.iter().any(|service| service == "TLS"));
+        let mut sorted = services.clone();
+        sorted.sort();
+        assert_eq!(sorted, services);
     }
 
     #[tokio::test]

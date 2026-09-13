@@ -130,12 +130,18 @@ impl FlowStateParam {
 #[derive(Clone, Debug, Default, Deserialize)]
 pub struct FlowQuery {
     /// Case-insensitive substring search over Flow id, direction, protocol,
-    /// state, end reason, source/destination IP and port, interface name and
-    /// associated domains.
+    /// state, end reason, source/destination IP and port, interface name,
+    /// fingerprint service and associated domains.
     pub q: Option<String>,
     pub range: Option<TimeRange>,
+    /// Absolute window in Unix epoch milliseconds. `start` and `end` are only
+    /// accepted together and cannot be combined with `range`.
+    pub start: Option<i64>,
+    pub end: Option<i64>,
     pub direction: Option<FlowDirection>,
     pub protocol: Option<Protocol>,
+    /// Fingerprint service name (`SSH`, `TLS`, `HTTP`, …), case-insensitive.
+    pub service: Option<String>,
     pub ip: Option<std::net::IpAddr>,
     pub src_ip: Option<std::net::IpAddr>,
     pub dst_ip: Option<std::net::IpAddr>,
@@ -146,7 +152,10 @@ pub struct FlowQuery {
     pub country: Option<String>,
     pub asn: Option<u32>,
     pub organization: Option<String>,
-    pub scope: Option<AddressScope>,
+    /// Address scopes to include, matched against the Flow's remote address
+    /// scope. `private,link_local,unique_local,loopback` is the local network.
+    #[serde(default, deserialize_with = "deserialize_scope_list")]
+    pub scope: Vec<AddressScope>,
     /// Address scopes to exclude, matched against the Flow's remote address
     /// scope. `private,link_local,unique_local,loopback` hides local traffic.
     #[serde(default, deserialize_with = "deserialize_scope_list")]
@@ -676,12 +685,14 @@ pub struct SettingsSummaryDto {
     pub retention_days: u16,
 }
 
-#[derive(Clone, Copy, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 pub struct FingerprintStatusDto {
     pub rules: usize,
     /// Whether the active library came from a file or an upload rather than
     /// the embedded default.
     pub custom: bool,
+    /// Sorted unique service names the active library can classify.
+    pub services: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -923,10 +934,10 @@ pub struct DomainObservationDto {
 /// Filters accepted by `GET /v1/stream`.
 ///
 /// Only filters that can be evaluated on a live Flow update are accepted;
-/// historical (`range`) and enrichment-backed filters (`country`, `asn`,
-/// `organization`, `scope`) are rejected so the stream never pretends to
-/// apply a filter it cannot evaluate. `q` uses the same searchable fields as
-/// the REST lists.
+/// historical (`range`, `start`/`end`) and enrichment-backed filters
+/// (`country`, `asn`, `organization`) are rejected so the stream never
+/// pretends to apply a filter it cannot evaluate. `q` uses the same
+/// searchable fields as the REST lists.
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct StreamQuery {
@@ -939,6 +950,8 @@ pub struct StreamQuery {
     pub port: Option<u16>,
     pub domain: Option<String>,
     pub application_id: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_scope_list")]
+    pub scope: Vec<AddressScope>,
     #[serde(default, deserialize_with = "deserialize_scope_list")]
     pub exclude_scope: Vec<AddressScope>,
     pub state: Option<FlowStateParam>,
@@ -969,6 +982,7 @@ impl StreamQuery {
                 .map(str::trim)
                 .filter(|id| !id.is_empty())
                 .map(ToOwned::to_owned),
+            scope: self.scope.clone(),
             exclude_scope: self.exclude_scope.clone(),
             state: self.state,
             has_domain: self.has_domain,
@@ -988,6 +1002,7 @@ pub struct StreamFilter {
     port: Option<u16>,
     domain: Option<String>,
     application_id: Option<String>,
+    scope: Vec<AddressScope>,
     exclude_scope: Vec<AddressScope>,
     state: Option<FlowStateParam>,
     has_domain: Option<bool>,
@@ -998,7 +1013,7 @@ impl StreamFilter {
     /// signature share one serialized tick payload.
     pub fn cache_key(&self) -> String {
         format!(
-            "{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}",
+            "{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}",
             self.q,
             self.direction,
             self.protocol,
@@ -1008,6 +1023,7 @@ impl StreamFilter {
             self.port,
             self.domain,
             self.application_id,
+            self.scope,
             self.exclude_scope,
             self.state,
             self.has_domain,
@@ -1015,6 +1031,9 @@ impl StreamFilter {
     }
 
     pub fn matches(&self, flow: &FlowDto) -> bool {
+        if !self.scope.is_empty() && !self.scope.contains(&flow.remote_profile.scope) {
+            return false;
+        }
         if !self.exclude_scope.is_empty() && self.exclude_scope.contains(&flow.remote_profile.scope)
         {
             return false;

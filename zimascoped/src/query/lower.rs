@@ -41,7 +41,7 @@ impl TryFrom<&FlowQuery> for Selector {
             ("country", query.country.is_some()),
             ("asn", query.asn.is_some()),
             ("organization", query.organization.is_some()),
-            ("scope", query.scope.is_some()),
+            ("scope", !query.scope.is_empty()),
             ("exclude_scope", !query.exclude_scope.is_empty()),
             ("state", query.state.is_some()),
             ("has_domain", query.has_domain.is_some()),

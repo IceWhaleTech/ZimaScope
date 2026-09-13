@@ -1200,7 +1200,7 @@ impl Db {
             .take()
             .map(|q| q.trim().to_ascii_lowercase())
             .filter(|q| !q.is_empty());
-        let (mut clauses, mut params) = self.flow_clauses(&row_query, now, "flows.", false);
+        let (mut clauses, mut params) = self.flow_clauses(&row_query, now, "flows.", false)?;
         clauses.push("flows.app_id IS NOT NULL".to_owned());
         if let Some(search) = search {
             clauses.push(
@@ -1288,10 +1288,20 @@ impl Db {
         let mut row_query = query.clone();
         row_query.direction = None;
         row_query.state = None;
-        let (clauses, params) = self.flow_clauses(&row_query, now, "", true);
+        // Service is a property of the merged pair, not of one directional
+        // row: filtering the WHERE would drop the other direction from the
+        // totals, so it is applied after aggregation instead.
+        let service = row_query.service.take();
+        let (clauses, mut params) = self.flow_clauses(&row_query, now, "", true)?;
+        if let Some(service) = &service {
+            params.push(Value::Text(service.clone()));
+        }
         let where_clause = where_sql(&clauses);
 
         let mut havings: Vec<String> = Vec::new();
+        if service.is_some() {
+            havings.push("MAX(service) = ? COLLATE NOCASE".to_owned());
+        }
         match query.state {
             Some(FlowStateParam::Active) => {
                 havings.push("SUM(CASE WHEN state = 'active' THEN 1 ELSE 0 END) > 0".to_owned())
@@ -1349,7 +1359,6 @@ impl Db {
             params.len() + 1,
             params.len() + 2
         );
-        let mut params = params;
         params.push(Value::Integer(limit as i64));
         params.push(Value::Integer(offset as i64));
 
@@ -1463,7 +1472,7 @@ impl Db {
     ) -> Result<(Vec<FlowDto>, usize), ApiError> {
         let now = SystemTime::now();
         let total = self.count_flows(query, now)?;
-        let (clauses, params) = self.flow_clauses(query, now, "", true);
+        let (clauses, params) = self.flow_clauses(query, now, "", true)?;
         let order = flow_order(query.sort.as_deref())?;
         let sql = format!(
             "SELECT {FLOW_COLUMNS} FROM flows {} ORDER BY {order} LIMIT ?{} OFFSET ?{}",
@@ -1486,7 +1495,7 @@ impl Db {
     }
 
     fn count_flows(&self, query: &FlowQuery, now: SystemTime) -> Result<usize, ApiError> {
-        let (clauses, params) = self.flow_clauses(query, now, "", true);
+        let (clauses, params) = self.flow_clauses(query, now, "", true)?;
         let sql = format!("SELECT COUNT(*) FROM flows {}", where_sql(&clauses));
         let total: i64 = self
             .conn
@@ -1624,7 +1633,7 @@ impl Db {
         offset: usize,
     ) -> Result<(Vec<EndpointSummaryDto>, usize), ApiError> {
         let now = SystemTime::now();
-        let (clauses, params) = self.flow_clauses(query, now, "", true);
+        let (clauses, params) = self.flow_clauses(query, now, "", true)?;
         let where_clause = where_sql(&clauses);
 
         let total: i64 = self.conn.query_row(
@@ -1854,7 +1863,7 @@ impl Db {
         offset: usize,
     ) -> Result<(Vec<DomainSummaryDto>, usize), ApiError> {
         let now = SystemTime::now();
-        let (mut clauses, mut params) = self.flow_clauses(query, now, "flows.", false);
+        let (mut clauses, mut params) = self.flow_clauses(query, now, "flows.", false)?;
         clauses.push("je.value->>'domain' IS NOT NULL".to_owned());
         if let Some(domain) = query.domain.as_deref().map(normalize_domain) {
             clauses.push("je.value->>'domain' = ?".to_owned());
@@ -2095,7 +2104,7 @@ impl Db {
             exclude_scope: exclude_scope.to_vec(),
             ..FlowQuery::default()
         };
-        let (clauses, params) = self.flow_clauses(&query, now, "", true);
+        let (clauses, params) = self.flow_clauses(&query, now, "", true)?;
         let where_clause = where_sql(&clauses);
 
         let mut totals = DirectionTotalsDto::default();
@@ -2179,7 +2188,7 @@ impl Db {
         query: &FlowQuery,
         now: SystemTime,
     ) -> Result<ProxiedTrafficDto, ApiError> {
-        let (mut clauses, params) = self.flow_clauses(query, now, "", true);
+        let (mut clauses, params) = self.flow_clauses(query, now, "", true)?;
         clauses.push("remote_scope = 'fake_ip'".to_owned());
         let sql = format!(
             "SELECT COUNT(*), COALESCE(SUM(bytes), 0), \
@@ -2205,7 +2214,7 @@ impl Db {
         query: &FlowQuery,
         now: SystemTime,
     ) -> Result<Vec<EvidenceCountDto>, ApiError> {
-        let (mut clauses, params) = self.flow_clauses(query, now, "flows.", true);
+        let (mut clauses, params) = self.flow_clauses(query, now, "flows.", true)?;
         clauses.push("je.value->>'evidence' IS NOT NULL".to_owned());
         let sql = format!(
             "SELECT je.value->>'evidence', COUNT(DISTINCT flows.id) FROM flows, \
@@ -2234,7 +2243,7 @@ impl Db {
         query: &FlowQuery,
         now: SystemTime,
     ) -> Result<Vec<CountryCountDto>, ApiError> {
-        let (mut clauses, params) = self.flow_clauses(query, now, "", true);
+        let (mut clauses, params) = self.flow_clauses(query, now, "", true)?;
         clauses.push("remote_country IS NOT NULL".to_owned());
         let sql = format!(
             "SELECT remote_country, SUM(bytes), COUNT(*) FROM flows {} \
@@ -2259,7 +2268,7 @@ impl Db {
         query: &FlowQuery,
         now: SystemTime,
     ) -> Result<Vec<AsnCountDto>, ApiError> {
-        let (mut clauses, params) = self.flow_clauses(query, now, "", true);
+        let (mut clauses, params) = self.flow_clauses(query, now, "", true)?;
         clauses.push("remote_asn IS NOT NULL".to_owned());
         let sql = format!(
             "SELECT remote_asn, MAX(remote_org), SUM(bytes), COUNT(*) FROM flows {} \
@@ -2532,7 +2541,7 @@ impl Db {
         query: &FlowQuery,
         now: SystemTime,
     ) -> Result<Vec<IpProfileDto>, ApiError> {
-        let (clauses, mut params) = self.flow_clauses(query, now, "", true);
+        let (clauses, mut params) = self.flow_clauses(query, now, "", true)?;
         let sql = format!(
             "SELECT DISTINCT remote_addr, remote_scope, remote_country, remote_region, \
              remote_city, remote_asn, remote_org, remote_db_version, remote_enriched_at_ms \
@@ -2854,7 +2863,7 @@ impl Db {
         now: SystemTime,
         prefix: &str,
         association_filters: bool,
-    ) -> (Vec<String>, Vec<Value>) {
+    ) -> Result<(Vec<String>, Vec<Value>), ApiError> {
         let mut clauses = Vec::new();
         let mut params = Vec::new();
 
@@ -2870,13 +2879,38 @@ impl Db {
                  coalesce({prefix}end_reason, '') || ' ' || {prefix}src_addr || ' ' || \
                  coalesce({prefix}src_port, '') || ' ' || {prefix}dst_addr || ' ' || \
                  coalesce({prefix}dst_port, '') || ' ' || coalesce({prefix}interface, '') || \
-                 ' ' || coalesce({prefix}app_id, '') || ' ' || {prefix}domains_json), ?) > 0"
+                 ' ' || coalesce({prefix}app_id, '') || ' ' || coalesce({prefix}service, '') || \
+                 ' ' || {prefix}domains_json), ?) > 0"
             ));
             params.push(Value::Text(q));
         }
-        if let Some(range) = query.range {
-            clauses.push(format!("{prefix}last_seen_ms >= ?"));
-            params.push(Value::Integer(unix_millis(range.cutoff(now))));
+        match (query.start, query.end) {
+            (Some(start), Some(end)) => {
+                if query.range.is_some() {
+                    return Err(ApiError::unprocessable(
+                        "range and start/end are mutually exclusive",
+                    ));
+                }
+                if start > end {
+                    return Err(ApiError::unprocessable("start must not be after end"));
+                }
+                clauses.push(format!(
+                    "({prefix}last_seen_ms >= ? AND {prefix}last_seen_ms <= ?)"
+                ));
+                params.push(Value::Integer(start));
+                params.push(Value::Integer(end));
+            }
+            (None, None) => {
+                if let Some(range) = query.range {
+                    clauses.push(format!("{prefix}last_seen_ms >= ?"));
+                    params.push(Value::Integer(unix_millis(range.cutoff(now))));
+                }
+            }
+            _ => {
+                return Err(ApiError::unprocessable(
+                    "start and end must be provided together",
+                ));
+            }
         }
         if let Some(direction) = query.direction {
             clauses.push(format!("{prefix}direction = ?"));
@@ -2885,6 +2919,15 @@ impl Db {
         if let Some(protocol) = query.protocol {
             clauses.push(format!("{prefix}protocol = ?"));
             params.push(Value::Text(enum_value(protocol)));
+        }
+        if let Some(service) = query
+            .service
+            .as_deref()
+            .map(str::trim)
+            .filter(|service| !service.is_empty())
+        {
+            clauses.push(format!("{prefix}service = ? COLLATE NOCASE"));
+            params.push(Value::Text(service.to_owned()));
         }
         if let Some(ip) = query.ip {
             clauses.push(format!("({prefix}src_addr = ? OR {prefix}dst_addr = ?)"));
@@ -2942,9 +2985,12 @@ impl Db {
             ));
             params.push(Value::Text(organization.to_ascii_lowercase()));
         }
-        if let Some(scope) = query.scope {
-            clauses.push(format!("{prefix}remote_scope = ?"));
-            params.push(Value::Text(enum_value(scope)));
+        if !query.scope.is_empty() {
+            let placeholders = vec!["?"; query.scope.len()].join(", ");
+            clauses.push(format!("{prefix}remote_scope IN ({placeholders})"));
+            for scope in &query.scope {
+                params.push(Value::Text(enum_value(*scope)));
+            }
         }
         if !query.exclude_scope.is_empty() {
             let placeholders = vec!["?"; query.exclude_scope.len()].join(", ");
@@ -2962,7 +3008,7 @@ impl Db {
             params.push(Value::Integer(i64::from(has_domain)));
         }
 
-        (clauses, params)
+        Ok((clauses, params))
     }
 }
 

@@ -337,6 +337,18 @@ impl FingerprintLibrary {
     pub fn is_custom(&self) -> bool {
         self.custom
     }
+
+    /// Sorted unique service names this library can classify.
+    pub fn services(&self) -> Vec<String> {
+        let mut names: Vec<String> = self
+            .rules
+            .iter()
+            .map(|rule| rule.service.to_string())
+            .collect();
+        names.sort();
+        names.dedup();
+        names
+    }
 }
 
 fn compile_rule(index: usize, spec: RuleSpec) -> Result<CompiledRule, FingerprintError> {
