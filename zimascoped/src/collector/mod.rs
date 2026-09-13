@@ -10,6 +10,7 @@ mod aya;
 mod domain;
 pub(crate) mod fingerprint;
 mod health;
+pub mod interfaces;
 mod listeners;
 mod tracker;
 

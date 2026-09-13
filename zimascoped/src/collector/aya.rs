@@ -8,7 +8,7 @@
 //! back to the legacy netlink classification path, where a `clsact` qdisc is
 //! still added.
 
-use std::{fs, num::NonZeroU32, ptr};
+use std::{fs, num::NonZeroU32, path::Path, ptr};
 
 use anyhow::{Context, Result, bail};
 use aya::{
@@ -39,7 +39,10 @@ use zimascope_common::{
     model::{ApplicationHealth, InterfaceHealth},
 };
 
-use super::{CollectorConfig, InterfaceSelector, KernelSource};
+use super::{
+    CollectorConfig, InterfaceSelector, KernelSource,
+    interfaces::{self, SYS_CLASS_NET},
+};
 use crate::policy::{MatchEntry, PolicyOp, config_value};
 
 mod object {
@@ -895,14 +898,15 @@ fn resolve_interfaces(selectors: &[InterfaceSelector]) -> Result<Vec<(NonZeroU32
         bail!("no Device Boundary interfaces configured");
     }
 
+    let root = Path::new(SYS_CLASS_NET);
     let mut resolved = Vec::with_capacity(selectors.len());
     for selector in selectors {
         let name = match selector {
-            InterfaceSelector::DefaultRoute => default_route_interface()?,
+            InterfaceSelector::DefaultRoute => interfaces::system_default_route()?,
             InterfaceSelector::Name(name) => name.to_string(),
-            InterfaceSelector::Index(index) => name_for_index(index.get())?,
+            InterfaceSelector::Index(index) => interfaces::name_for_index(root, index.get())?,
         };
-        let ifindex = ifindex_for_name(&name)?;
+        let ifindex = interfaces::ifindex_for_name(root, &name)?;
         resolved.push((ifindex, name));
     }
 
@@ -917,76 +921,4 @@ fn resolve_interfaces(selectors: &[InterfaceSelector]) -> Result<Vec<(NonZeroU32
     }
 
     Ok(resolved)
-}
-
-/// Picks the non-virtual interface that carries the default route.
-fn default_route_interface() -> Result<String> {
-    let route = fs::read_to_string("/proc/net/route").context("read /proc/net/route")?;
-
-    let mut best: Option<(u32, String)> = None;
-    for line in route.lines().skip(1) {
-        let mut fields = line.split_whitespace();
-        let Some(name) = fields.next() else { continue };
-        let Some(destination) = fields.next() else {
-            continue;
-        };
-        let Some(_gateway) = fields.next() else {
-            continue;
-        };
-        let Some(flags) = fields.next() else { continue };
-        let Some(_ref_count) = fields.next() else {
-            continue;
-        };
-        let Some(_use) = fields.next() else { continue };
-        let Some(metric) = fields.next() else {
-            continue;
-        };
-
-        if destination != "00000000" {
-            continue;
-        }
-        let flags = u32::from_str_radix(flags, 16).unwrap_or(0);
-        if flags & 0x1 == 0 {
-            continue;
-        }
-        let metric = metric.parse::<u32>().unwrap_or(u32::MAX);
-        if is_virtual_interface(name) {
-            continue;
-        }
-        if best
-            .as_ref()
-            .is_none_or(|(best_metric, _)| metric < *best_metric)
-        {
-            best = Some((metric, name.to_string()));
-        }
-    }
-
-    best.map(|(_, name)| name)
-        .context("no default route interface found in /proc/net/route")
-}
-
-fn is_virtual_interface(name: &str) -> bool {
-    const VIRTUAL_PREFIXES: [&str; 6] = ["lo", "docker", "br-", "virbr", "veth", "tun"];
-    VIRTUAL_PREFIXES
-        .iter()
-        .any(|prefix| name.starts_with(prefix))
-}
-
-fn name_for_index(ifindex: u32) -> Result<String> {
-    let entries = fs::read_dir("/sys/class/net").context("read /sys/class/net")?;
-    for entry in entries {
-        let entry = entry.context("read /sys/class/net entry")?;
-        let name = entry.file_name().to_string_lossy().into_owned();
-        if ifindex_for_name(&name).is_ok_and(|index| index.get() == ifindex) {
-            return Ok(name);
-        }
-    }
-    bail!("no interface with ifindex {ifindex}")
-}
-
-fn ifindex_for_name(name: &str) -> Result<NonZeroU32> {
-    let path = format!("/sys/class/net/{name}/ifindex");
-    let value = fs::read_to_string(&path).with_context(|| format!("read {path}"))?;
-    let index: u32 = value.trim().parse().context("parse ifindex")?;
-    NonZeroU32::new(index).with_context(|| format!("interface {name:?} has ifindex 0"))
 }
