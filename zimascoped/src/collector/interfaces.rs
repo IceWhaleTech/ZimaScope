@@ -318,7 +318,6 @@ pub fn name_for_index(root: &Path, ifindex: u32) -> Result<String> {
 }
 
 /// A duplicate-count or configuration hazard for the selected boundary set.
-#[allow(dead_code)]
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
 pub struct BoundaryWarning {
     /// Stable machine code: `bridge_port_overlap`, `uplink_overlap`,
@@ -332,7 +331,6 @@ pub struct BoundaryWarning {
 ///
 /// Warnings never block saving: an interface that is absent now may appear
 /// later (docker0, a VPN tunnel) and the collector attaches it when it does.
-#[allow(dead_code)]
 pub fn boundary_warnings(selected: &[String], infos: &[InterfaceInfo]) -> Vec<BoundaryWarning> {
     let by_name: HashMap<&str, &InterfaceInfo> = infos
         .iter()

@@ -546,6 +546,37 @@ pub struct InterfaceHealthDto {
     pub last_error: Option<String>,
 }
 
+/// One interface available on the host, whether attached or not.
+#[derive(Clone, Debug, Serialize)]
+pub struct InterfaceDto {
+    pub name: String,
+    pub ifindex: u32,
+    pub kind: crate::collector::interfaces::InterfaceKind,
+    pub up: bool,
+    pub default_route: bool,
+    pub master: Option<String>,
+    pub attached: bool,
+    pub ingress_attached: bool,
+    pub egress_attached: bool,
+    pub last_error: Option<String>,
+}
+
+/// A duplicate-count or configuration hazard for the selected boundary set.
+#[derive(Clone, Debug, Serialize)]
+pub struct BoundaryWarningDto {
+    pub kind: &'static str,
+    pub message: String,
+    pub interfaces: Vec<String>,
+}
+
+/// The host interface catalog plus warnings for the configured boundary.
+#[derive(Clone, Debug, Serialize)]
+pub struct InterfacesDto {
+    pub interfaces: Vec<InterfaceDto>,
+    pub selected: Vec<String>,
+    pub warnings: Vec<BoundaryWarningDto>,
+}
+
 #[derive(Clone, Copy, Debug, Serialize)]
 pub struct MapUsageDto {
     pub entries: usize,

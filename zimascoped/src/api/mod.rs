@@ -55,12 +55,13 @@ use tower_http::{
 
 use zimascope_common::{
     kernel_abi::{BucketKey, RuleAction, RuleState},
-    model::{AddressScope, CollectionBatch, TrafficCounters},
+    model::{AddressScope, CollectionBatch, InterfaceHealth, TrafficCounters},
 };
 
 use crate::{
     FingerprintLibrary, PolicyHandle, SharedFingerprints,
     cgroup::CgroupIndex,
+    collector::interfaces,
     policy::{
         ActionSpec, MAX_TRAFFIC_RULES, RuleDirection, TrafficRule, action_from_name, action_name,
         compile, validate_rule,
@@ -75,14 +76,14 @@ use crate::{
 use self::{
     db::{Db, StreamEvent, TrafficRuleDraft, TrafficRuleRecord},
     dto::{
-        API_VERSION, ApplicationDetailDto, ApplicationSummaryDto, AuditEntryDto, ClearHistoryQuery,
-        CollectorHealthDto, ConnectionDto, CreateExportRequest, CreateTrafficRuleRequest,
-        DomainDetailDto, DomainSummaryDto, EndpointDetailDto, EndpointSummaryDto,
-        EnforcementStatusDto, EnrichmentStatusDto, ExportTaskDto, FlowDto, FlowQuery, OverviewDto,
-        Page, ResolveTrafficRuleDto, ResolveTrafficRuleRequest, ResolvedTargetDto,
-        ServiceStatusDto, SettingsSummaryDto, StreamQuery, TimeRange, TimelineDto,
-        TrafficRuleCountersDto, TrafficRuleDto, UpdateTrafficRuleRequest, collector_state_name,
-        unix_millis,
+        API_VERSION, ApplicationDetailDto, ApplicationSummaryDto, AuditEntryDto,
+        BoundaryWarningDto, ClearHistoryQuery, CollectorHealthDto, ConnectionDto,
+        CreateExportRequest, CreateTrafficRuleRequest, DomainDetailDto, DomainSummaryDto,
+        EndpointDetailDto, EndpointSummaryDto, EnforcementStatusDto, EnrichmentStatusDto,
+        ExportTaskDto, FlowDto, FlowQuery, InterfaceDto, InterfacesDto, OverviewDto, Page,
+        ResolveTrafficRuleDto, ResolveTrafficRuleRequest, ResolvedTargetDto, ServiceStatusDto,
+        SettingsSummaryDto, StreamQuery, TimeRange, TimelineDto, TrafficRuleCountersDto,
+        TrafficRuleDto, UpdateTrafficRuleRequest, collector_state_name, unix_millis,
     },
     error::ApiError,
     settings::{Settings, SettingsPatch},
@@ -466,6 +467,7 @@ fn compression_layer() -> CompressionLayer<impl Predicate> {
 fn api_routes(state: ApiState) -> Router {
     Router::new()
         .route("/v1/status", get(status))
+        .route("/v1/interfaces", get(list_interfaces))
         .route("/v1/overview", get(overview))
         .route("/v1/stream", get(stream))
         .route("/v1/flows", get(list_flows))
@@ -550,6 +552,63 @@ pub async fn serve_unix(
 
 async fn status(State(state): State<ApiState>) -> Json<ServiceStatusDto> {
     Json(state.lock().status())
+}
+
+/// Lists host interfaces and warns about duplicate-prone boundary sets.
+///
+/// Interfaces are discovered live: docker0, bridges and VPN tunnels may appear
+/// after daemon startup and stay selectable before they exist.
+async fn list_interfaces(State(state): State<ApiState>) -> Result<Json<InterfacesDto>, ApiError> {
+    let (selected, health) = {
+        let inner = state.lock();
+        (
+            inner.settings.boundary.interfaces.clone(),
+            inner.db.health().cloned(),
+        )
+    };
+
+    let infos = interfaces::system()
+        .map_err(|error| ApiError::internal(format!("enumerate interfaces: {error}")))?;
+    let mut attached: HashMap<&str, &InterfaceHealth> = HashMap::new();
+    if let Some(health) = &health {
+        for interface in &health.attached_interfaces {
+            attached.insert(interface.name.as_ref(), interface);
+        }
+    }
+
+    let interfaces = infos
+        .iter()
+        .map(|info| {
+            let health = attached.get(info.name.as_str());
+            InterfaceDto {
+                name: info.name.clone(),
+                ifindex: info.ifindex.get(),
+                kind: info.kind,
+                up: info.up,
+                default_route: info.default_route,
+                master: info.master.clone(),
+                attached: health.is_some(),
+                ingress_attached: health.is_some_and(|health| health.ingress_attached),
+                egress_attached: health.is_some_and(|health| health.egress_attached),
+                last_error: health
+                    .and_then(|health| health.last_error.as_ref().map(ToString::to_string)),
+            }
+        })
+        .collect();
+    let warnings = interfaces::boundary_warnings(&selected, &infos)
+        .into_iter()
+        .map(|warning| BoundaryWarningDto {
+            kind: warning.kind,
+            message: warning.message,
+            interfaces: warning.interfaces,
+        })
+        .collect();
+
+    Ok(Json(InterfacesDto {
+        interfaces,
+        selected,
+        warnings,
+    }))
 }
 
 #[derive(serde::Deserialize)]
@@ -1535,6 +1594,32 @@ mod tests {
                 .and_then(|value| value.to_str().ok()),
             Some(PROBLEM_CONTENT_TYPE)
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn interface_catalog_lists_host_interfaces_and_boundary_warnings() {
+        let state = state();
+        {
+            let mut inner = state.lock();
+            inner.settings.boundary.interfaces = vec!["zs-missing0".to_owned()];
+        }
+
+        let body = body_json(call(&state, get("/v1/interfaces")).await).await;
+        let interfaces = body["interfaces"]
+            .as_array()
+            .expect("interfaces is an array");
+        assert!(!interfaces.is_empty(), "the host exposes at least loopback");
+        assert!(
+            interfaces
+                .iter()
+                .all(|interface| interface["name"].is_string()
+                    && interface["kind"].is_string()
+                    && interface["ifindex"].as_u64().is_some_and(|index| index > 0)),
+            "every interface carries a name, kind and ifindex"
+        );
+        assert_eq!(body["selected"][0], "zs-missing0");
+        assert_eq!(body["warnings"][0]["kind"], "missing_interface");
     }
 
     #[tokio::test]

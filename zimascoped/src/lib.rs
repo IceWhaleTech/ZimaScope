@@ -13,4 +13,5 @@ pub mod proxy;
 pub mod query;
 
 pub use collector::fingerprint::{FingerprintLibrary, SharedFingerprints, shared_default};
+pub use collector::interfaces::InterfaceKind;
 pub use collector::{BatchReceiver, Collector, CollectorConfig, InterfaceSelector, PolicyHandle};
