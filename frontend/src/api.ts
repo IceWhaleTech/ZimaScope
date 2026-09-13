@@ -14,6 +14,7 @@ import type {
   ExportFormat,
   ExportTask,
   Flow,
+  InterfaceCatalog,
   Overview,
   Page,
   CreateTrafficRuleRequest,
@@ -84,6 +85,8 @@ export interface FlowQuery {
   end?: number;
   direction?: string;
   protocol?: string;
+  /** Device Boundary interface name (`eth0`, `docker0`, `tun0`, …). */
+  interface?: string;
   /** Fingerprint service name (`SSH`, `TLS`, `HTTP`, …). */
   service?: string;
   ip?: string;
@@ -133,8 +136,23 @@ export function fetchConnections(query: FlowQuery = {}): Promise<Page<Connection
   return request(`/v1/connections?${queryString(query)}`);
 }
 
-export function fetchOverview(range: TimeRange = "15m", excludeScope?: string): Promise<Overview> {
-  return request(`/v1/overview?${queryString({ range, exclude_scope: excludeScope })}`);
+export function fetchOverview(
+  range: TimeRange = "15m",
+  excludeScope?: string,
+  interfaceName?: string,
+): Promise<Overview> {
+  return request(
+    `/v1/overview?${queryString({
+      range,
+      exclude_scope: excludeScope,
+      interface: interfaceName,
+    })}`,
+  );
+}
+
+/** Host interfaces plus warnings for the configured Device Boundary. */
+export function fetchInterfaces(): Promise<InterfaceCatalog> {
+  return request("/v1/interfaces");
 }
 
 export function fetchStatus(): Promise<ServiceStatus> {
@@ -153,8 +171,17 @@ export function fetchEndpoint(address: string): Promise<EndpointDetail> {
   return request(`/v1/endpoints/${encodeURIComponent(address)}`);
 }
 
-export function fetchEndpointTimeline(address: string, range: TimeRange = "15m"): Promise<Timeline> {
-  return request(`/v1/endpoints/${encodeURIComponent(address)}/timeline?range=${range}`);
+export function fetchEndpointTimeline(
+  address: string,
+  range: TimeRange = "15m",
+  interfaceName?: string,
+): Promise<Timeline> {
+  return request(
+    `/v1/endpoints/${encodeURIComponent(address)}/timeline?${queryString({
+      range,
+      interface: interfaceName,
+    })}`,
+  );
 }
 
 export function fetchDomains(query: FlowQuery = {}): Promise<Page<DomainSummary>> {
@@ -172,16 +199,31 @@ export function fetchApplication(id: string): Promise<ApplicationDetail> {
 export function fetchApplicationTimeline(
   id: string,
   range: TimeRange = "15m",
+  interfaceName?: string,
 ): Promise<Timeline> {
-  return request(`/v1/applications/${encodeURIComponent(id)}/timeline?range=${range}`);
+  return request(
+    `/v1/applications/${encodeURIComponent(id)}/timeline?${queryString({
+      range,
+      interface: interfaceName,
+    })}`,
+  );
 }
 
 export function fetchDomain(domain: string): Promise<DomainDetail> {
   return request(`/v1/domains/${encodeURIComponent(domain)}`);
 }
 
-export function fetchDomainTimeline(domain: string, range: TimeRange = "15m"): Promise<Timeline> {
-  return request(`/v1/domains/${encodeURIComponent(domain)}/timeline?range=${range}`);
+export function fetchDomainTimeline(
+  domain: string,
+  range: TimeRange = "15m",
+  interfaceName?: string,
+): Promise<Timeline> {
+  return request(
+    `/v1/domains/${encodeURIComponent(domain)}/timeline?${queryString({
+      range,
+      interface: interfaceName,
+    })}`,
+  );
 }
 
 export function fetchSettings(): Promise<Settings> {

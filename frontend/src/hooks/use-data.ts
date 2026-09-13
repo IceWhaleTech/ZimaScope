@@ -7,6 +7,7 @@
 import { keepPreviousData, useInfiniteQuery, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect } from "react";
 import { data, onResync } from "@/store";
+import { useInterfaceFilter } from "@/hooks/use-interface-filter";
 import type { FlowQuery } from "@/api";
 import type {
   CreateTrafficRuleRequest,
@@ -17,22 +18,27 @@ import type {
 } from "@/types";
 
 export const queryKeys = {
-  overview: (range: TimeRange, excludeScope?: string) => ["overview", range, excludeScope ?? ""] as const,
+  overview: (range: TimeRange, excludeScope?: string, interfaceName?: string) =>
+    ["overview", range, excludeScope ?? "", interfaceName ?? ""] as const,
+  interfaces: () => ["interfaces"] as const,
   flows: (query: FlowQuery) => ["flows", query] as const,
   connectionsPage: (query: FlowQuery) => ["connections-page", query] as const,
   flow: (id: string) => ["flow", id] as const,
   endpoints: (query: FlowQuery) => ["endpoints", query] as const,
   endpointsPage: (query: FlowQuery) => ["endpoints-page", query] as const,
   endpoint: (address: string) => ["endpoint", address] as const,
-  endpointTimeline: (address: string, range: TimeRange) => ["endpoint-timeline", address, range] as const,
+  endpointTimeline: (address: string, range: TimeRange, interfaceName?: string) =>
+    ["endpoint-timeline", address, range, interfaceName ?? ""] as const,
   domains: (query: FlowQuery) => ["domains", query] as const,
   domainsPage: (query: FlowQuery) => ["domains-page", query] as const,
   domain: (name: string) => ["domain", name] as const,
-  domainTimeline: (name: string, range: TimeRange) => ["domain-timeline", name, range] as const,
+  domainTimeline: (name: string, range: TimeRange, interfaceName?: string) =>
+    ["domain-timeline", name, range, interfaceName ?? ""] as const,
   applications: (query: FlowQuery) => ["applications", query] as const,
   applicationsPage: (query: FlowQuery) => ["applications-page", query] as const,
   application: (id: string) => ["application", id] as const,
-  applicationTimeline: (id: string, range: TimeRange) => ["application-timeline", id, range] as const,
+  applicationTimeline: (id: string, range: TimeRange, interfaceName?: string) =>
+    ["application-timeline", id, range, interfaceName ?? ""] as const,
   status: () => ["status"] as const,
   settings: () => ["settings"] as const,
   trafficRules: () => ["traffic-rules"] as const,
@@ -51,11 +57,20 @@ export function useStreamResync(): void {
   );
 }
 
-export function useOverview(range: TimeRange, excludeScope?: string) {
+export function useOverview(range: TimeRange, excludeScope?: string, interfaceName?: string) {
   return useQuery({
-    queryKey: queryKeys.overview(range, excludeScope),
-    queryFn: () => data.overview(range, excludeScope),
+    queryKey: queryKeys.overview(range, excludeScope, interfaceName),
+    queryFn: () => data.overview(range, excludeScope, interfaceName),
     staleTime: 15_000,
+  });
+}
+
+/** Host interfaces plus warnings for the configured Device Boundary. */
+export function useInterfaces() {
+  return useQuery({
+    queryKey: queryKeys.interfaces(),
+    queryFn: () => data.interfaces(),
+    staleTime: 30_000,
   });
 }
 
@@ -113,9 +128,11 @@ export function useEndpoint(address: string | null) {
 }
 
 export function useEndpointTimeline(address: string | null, range: TimeRange) {
+  const [interfaceName] = useInterfaceFilter();
+  const selected = interfaceName || undefined;
   return useQuery({
-    queryKey: queryKeys.endpointTimeline(address ?? "", range),
-    queryFn: () => data.endpointTimeline(address!, range),
+    queryKey: queryKeys.endpointTimeline(address ?? "", range, selected),
+    queryFn: () => data.endpointTimeline(address!, range, selected),
     enabled: Boolean(address),
   });
 }
@@ -153,9 +170,11 @@ export function useDomain(name: string | null) {
 }
 
 export function useDomainTimeline(name: string | null, range: TimeRange) {
+  const [interfaceName] = useInterfaceFilter();
+  const selected = interfaceName || undefined;
   return useQuery({
-    queryKey: queryKeys.domainTimeline(name ?? "", range),
-    queryFn: () => data.domainTimeline(name!, range),
+    queryKey: queryKeys.domainTimeline(name ?? "", range, selected),
+    queryFn: () => data.domainTimeline(name!, range, selected),
     enabled: Boolean(name),
   });
 }
@@ -187,9 +206,11 @@ export function useApplication(id: string | null) {
 }
 
 export function useApplicationTimeline(id: string | null, range: TimeRange) {
+  const [interfaceName] = useInterfaceFilter();
+  const selected = interfaceName || undefined;
   return useQuery({
-    queryKey: queryKeys.applicationTimeline(id ?? "", range),
-    queryFn: () => data.applicationTimeline(id!, range),
+    queryKey: queryKeys.applicationTimeline(id ?? "", range, selected),
+    queryFn: () => data.applicationTimeline(id!, range, selected),
     enabled: Boolean(id),
   });
 }

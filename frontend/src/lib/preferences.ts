@@ -4,6 +4,7 @@ import type { NetworkFilter } from "../types";
 
 const THEME_KEY = "zimascope.theme";
 const NETWORK_KEY = "zimascope.network-filter";
+const INTERFACE_KEY = "zimascope.interface-filter";
 const LEGACY_HIDE_LAN_KEY = "zimascope.hide-lan";
 
 export type ThemePreference = "system" | "light" | "dark";
@@ -30,5 +31,13 @@ export const preferences = {
   setNetworkFilter(value: NetworkFilter): void {
     if (value === "all") localStorage.removeItem(NETWORK_KEY);
     else localStorage.setItem(NETWORK_KEY, value);
+  },
+  /** Device Boundary interface name; empty means every attached interface. */
+  interfaceFilter(): string {
+    return localStorage.getItem(INTERFACE_KEY) ?? "";
+  },
+  setInterfaceFilter(value: string): void {
+    if (!value) localStorage.removeItem(INTERFACE_KEY);
+    else localStorage.setItem(INTERFACE_KEY, value);
   },
 };

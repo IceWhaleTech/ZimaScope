@@ -42,6 +42,7 @@ import { EmptyState } from "@/components/empty-state";
 import { EndpointRow, ENDPOINT_COLUMNS } from "@/components/endpoint-table";
 import { ApplicationRow, APPLICATION_COLUMNS } from "@/components/application-table";
 import {
+  InterfaceFilterControl,
   NetworkFilterControl,
   TimeFilter,
   type TimeWindow,
@@ -59,6 +60,7 @@ import {
   useStatus,
 } from "@/hooks/use-data";
 import { useDetails } from "@/hooks/use-details";
+import { useInterfaceFilter } from "@/hooks/use-interface-filter";
 import { useNetworkFilter } from "@/hooks/use-network-filter";
 import { useSetTopbar } from "@/hooks/use-topbar";
 import { setStreamQuery, subscribeTicks } from "@/store";
@@ -308,6 +310,7 @@ export function ExplorerView() {
   const [range, setRange] = useState<TimeRange>("15m");
   const [customTime, setCustomTime] = useState<TimeWindow | null>(null);
   const [network, setNetwork] = useNetworkFilter();
+  const [interfaceName, setInterfaceName] = useInterfaceFilter();
   const [protocol, setProtocol] = useState("");
   const [service, setService] = useState("");
   const [state, setState] = useState("");
@@ -380,6 +383,7 @@ export function ExplorerView() {
       ...timeFilter,
       state: state || undefined,
       protocol: protocol || undefined,
+      interface: interfaceName || undefined,
       service: service || undefined,
       port: port ? Number(port) : undefined,
       evidence: (evidence || undefined) as Evidence | undefined,
@@ -395,7 +399,7 @@ export function ExplorerView() {
       sort: scope === "flows" ? sort : "-last_seen",
       limit: LIMIT,
     }),
-    [appliedQ, range, customTime, state, visibility, protocol, service, port, evidence, confidence, scopeFilterParam, excludeScopeFilter, sort, scope, pinned.ip, pinned.domain, pinned.application, pinned.country, pinned.asn],
+    [appliedQ, range, customTime, state, visibility, protocol, service, port, evidence, confidence, scopeFilterParam, excludeScopeFilter, sort, scope, interfaceName, pinned.ip, pinned.domain, pinned.application, pinned.country, pinned.asn],
   );
   const connectionsFilter = useMemo<FlowQuery>(
     () => ({ ...flowsFilter, hide_noise: hideNoise }),
@@ -407,6 +411,7 @@ export function ExplorerView() {
     ...timeFilter,
     protocol: protocol || undefined,
     service: service || undefined,
+    interface: interfaceName || undefined,
     scope: networkScopeParam(network),
     exclude_scope: excludeScopeParam(network),
     sort: scope === "endpoints" ? sort : "-bytes",
@@ -415,6 +420,7 @@ export function ExplorerView() {
   const domainsQuery = useDomainsInfinite({
     q: appliedQ || undefined,
     ...timeFilter,
+    interface: interfaceName || undefined,
     scope: networkScopeParam(network),
     exclude_scope: excludeScopeParam(network),
     sort: scope === "domains" ? sort : "-bytes",
@@ -423,6 +429,7 @@ export function ExplorerView() {
   const applicationsQuery = useApplicationsInfinite({
     q: appliedQ || undefined,
     ...timeFilter,
+    interface: interfaceName || undefined,
     scope: networkScopeParam(network),
     exclude_scope: excludeScopeParam(network),
     sort: scope === "applications" ? sort : "-bytes",
@@ -934,6 +941,7 @@ export function ExplorerView() {
             onCustom={setCustomTime}
           />
           <NetworkFilterControl value={network} onChange={setNetwork} />
+          <InterfaceFilterControl value={interfaceName} onChange={setInterfaceName} />
           {(scope === "flows" || scope === "endpoints") && (
             <Segmented
               ariaLabel="Transport protocol"

@@ -10,7 +10,15 @@ import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
 import { Segmented } from "@/components/segmented";
+import { useInterfaces } from "@/hooks/use-data";
 import { formatClock, formatDay } from "@/lib/format";
 import type { NetworkFilter, TimeRange } from "@/types";
 
@@ -47,6 +55,43 @@ export function NetworkFilterControl({
       value={value}
       onChange={(next) => onChange(next as NetworkFilter)}
     />
+  );
+}
+
+/**
+ * Device Boundary selector: one interface, or every attached interface.
+ * Empty string means "all" so the control can sit next to the network filter.
+ */
+export function InterfaceFilterControl({
+  value,
+  onChange,
+}: {
+  value: string;
+  onChange: (value: string) => void;
+}) {
+  const catalog = useInterfaces();
+  const interfaces = catalog.data?.interfaces ?? [];
+  const known = interfaces.some((info) => info.name === value);
+  return (
+    <Select value={value || "all"} onValueChange={(next) => onChange(next === "all" ? "" : next)}>
+      <SelectTrigger aria-label="Interface" size="sm" className="w-40">
+        <SelectValue />
+      </SelectTrigger>
+      <SelectContent>
+        <SelectItem value="all">All interfaces</SelectItem>
+        {value && !known && <SelectItem value={value}>{value} · missing</SelectItem>}
+        {interfaces.map((info) => (
+          <SelectItem key={info.name} value={info.name}>
+            <span className="inline-flex items-center gap-1.5">
+              {info.name}
+              {info.default_route && (
+                <span className="text-2xs text-muted-foreground">default</span>
+              )}
+            </span>
+          </SelectItem>
+        ))}
+      </SelectContent>
+    </Select>
   );
 }
 

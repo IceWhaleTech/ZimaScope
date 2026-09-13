@@ -62,8 +62,12 @@ function isNotFound(error: unknown): boolean {
 }
 
 export const data = {
-  overview: (range: TimeRange, excludeScope?: string): Promise<Overview> =>
-    api.fetchOverview(range, excludeScope),
+  overview: (
+    range: TimeRange,
+    excludeScope?: string,
+    interfaceName?: string,
+  ): Promise<Overview> => api.fetchOverview(range, excludeScope, interfaceName),
+  interfaces: () => api.fetchInterfaces(),
   flows: (query: FlowQuery): Promise<Page<Flow>> => api.fetchFlows(query),
   connections: (query: FlowQuery): Promise<Page<Connection>> => api.fetchConnections(query),
   flow: async (id: string): Promise<Flow | null> => {
@@ -83,8 +87,11 @@ export const data = {
       throw error;
     }
   },
-  endpointTimeline: (address: string, range: TimeRange): Promise<Timeline> =>
-    api.fetchEndpointTimeline(address, range),
+  endpointTimeline: (
+    address: string,
+    range: TimeRange,
+    interfaceName?: string,
+  ): Promise<Timeline> => api.fetchEndpointTimeline(address, range, interfaceName),
   domains: (query: FlowQuery): Promise<Page<DomainSummary>> => api.fetchDomains(query),
   domain: async (name: string): Promise<DomainDetail | null> => {
     try {
@@ -94,8 +101,11 @@ export const data = {
       throw error;
     }
   },
-  domainTimeline: (name: string, range: TimeRange): Promise<Timeline> =>
-    api.fetchDomainTimeline(name, range),
+  domainTimeline: (
+    name: string,
+    range: TimeRange,
+    interfaceName?: string,
+  ): Promise<Timeline> => api.fetchDomainTimeline(name, range, interfaceName),
   applications: (query: FlowQuery): Promise<Page<ApplicationSummary>> =>
     api.fetchApplications(query),
   application: async (id: string): Promise<ApplicationDetail | null> => {
@@ -106,8 +116,11 @@ export const data = {
       throw error;
     }
   },
-  applicationTimeline: (id: string, range: TimeRange): Promise<Timeline> =>
-    api.fetchApplicationTimeline(id, range),
+  applicationTimeline: (
+    id: string,
+    range: TimeRange,
+    interfaceName?: string,
+  ): Promise<Timeline> => api.fetchApplicationTimeline(id, range, interfaceName),
   status: (): Promise<ServiceStatus> => api.fetchStatus(),
   settings: (): Promise<Settings> => api.fetchSettings(),
   saveSettings: (patch: SettingsPatch): Promise<Settings> => api.patchSettings(patch),

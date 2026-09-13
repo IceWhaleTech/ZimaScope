@@ -393,6 +393,46 @@ export interface AuditEntry {
   outcome: string;
 }
 
+export type InterfaceKind =
+  | "loopback"
+  | "physical"
+  | "bridge"
+  | "docker_bridge"
+  | "bond"
+  | "vlan"
+  | "tun_tap"
+  | "wireguard"
+  | "veth"
+  | "virtual"
+  | "other";
+
+/** One host interface from `GET /v1/interfaces`. */
+export interface InterfaceInfo {
+  name: string;
+  ifindex: number;
+  kind: InterfaceKind;
+  up: boolean;
+  default_route: boolean;
+  master: string | null;
+  attached: boolean;
+  ingress_attached: boolean;
+  egress_attached: boolean;
+  last_error: string | null;
+}
+
+/** A duplicate-count or configuration hazard for the selected boundary. */
+export interface BoundaryWarning {
+  kind: "bridge_port_overlap" | "uplink_overlap" | "loopback" | "missing_interface" | string;
+  message: string;
+  interfaces: string[];
+}
+
+export interface InterfaceCatalog {
+  interfaces: InterfaceInfo[];
+  selected: string[];
+  warnings: BoundaryWarning[];
+}
+
 export interface SettingsSummary {
   enabled: boolean;
   boundary_interfaces: string[];
