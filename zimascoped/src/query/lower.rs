@@ -37,6 +37,7 @@ impl TryFrom<&FlowQuery> for Selector {
         let unsupported: Vec<&'static str> = [
             ("range", query.range.is_some()),
             ("protocol", query.protocol.is_some()),
+            ("interface", query.interface.is_some()),
             ("domain", query.domain.is_some()),
             ("country", query.country.is_some()),
             ("asn", query.asn.is_some()),
@@ -157,13 +158,17 @@ mod tests {
         let query = FlowQuery {
             range: Some(crate::api::dto::TimeRange::Hour1),
             state: Some(crate::api::dto::FlowStateParam::Active),
+            interface: Some("docker0".to_owned()),
             q: Some("youtube".to_owned()),
             limit: Some(50),
             ip: Some("203.0.113.9".parse().expect("address")),
             ..FlowQuery::default()
         };
         let error = Selector::try_from(&query).expect_err("rejected");
-        assert_eq!(error.fields, vec!["range", "state", "q", "limit"]);
+        assert_eq!(
+            error.fields,
+            vec!["range", "interface", "state", "q", "limit"]
+        );
     }
 
     #[test]

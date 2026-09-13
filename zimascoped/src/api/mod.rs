@@ -614,6 +614,8 @@ async fn list_interfaces(State(state): State<ApiState>) -> Result<Json<Interface
 #[derive(serde::Deserialize)]
 struct OverviewQuery {
     range: Option<TimeRange>,
+    /// Device Boundary interface name; omitted means every attached interface.
+    interface: Option<String>,
     #[serde(default, deserialize_with = "dto::deserialize_scope_list")]
     exclude_scope: Vec<AddressScope>,
 }
@@ -633,7 +635,12 @@ async fn overview(
     state
         .lock()
         .db
-        .overview(range, &query.exclude_scope, SystemTime::now())
+        .overview(
+            range,
+            &query.exclude_scope,
+            query.interface.as_deref(),
+            SystemTime::now(),
+        )
         .map(Json)
 }
 
@@ -2177,6 +2184,41 @@ mod tests {
         }
         let body = body_json(call(&state, get("/v1/endpoints?sort=-rate")).await).await;
         assert_eq!(body["items"][0]["outbound_bps"], 0);
+    }
+
+    #[tokio::test]
+    async fn interface_filter_narrows_flows_connections_and_the_overview() {
+        let state = state();
+        let eth0 = outbound(("93.184.216.34", 443), 40, 4_000, Duration::ZERO);
+        let mut docker0 = outbound(("203.0.113.9", 80), 10, 1_000, Duration::ZERO);
+        docker0.key.interface_index = NonZeroU32::new(8).expect("non-zero ifindex");
+        let mut incoming = batch(1, vec![eth0, docker0]);
+        incoming.health.attached_interfaces.push(InterfaceHealth {
+            ifindex: NonZeroU32::new(8).expect("non-zero ifindex"),
+            name: "docker0".into(),
+            ingress_attached: true,
+            egress_attached: true,
+            last_error: None,
+        });
+        state.ingest_batch(incoming);
+
+        let body = body_json(call(&state, get("/v1/flows?interface=docker0")).await).await;
+        assert_eq!(body["total"], 1);
+        assert_eq!(body["items"][0]["interface"], "docker0");
+        assert_eq!(body["items"][0]["remote"]["address"], "203.0.113.9");
+
+        let body = body_json(call(&state, get("/v1/connections?interface=eth0")).await).await;
+        assert_eq!(body["total"], 1);
+        assert_eq!(body["items"][0]["interface"], "eth0");
+        assert_eq!(body["items"][0]["remote"]["address"], "93.184.216.34");
+
+        let body =
+            body_json(call(&state, get("/v1/overview?range=15m&interface=eth0")).await).await;
+        assert_eq!(body["totals"]["outbound"]["bytes"], 4_000);
+        assert_eq!(body["active_flows"], 1);
+
+        let body = body_json(call(&state, get("/v1/flows?interface=missing0")).await).await;
+        assert_eq!(body["total"], 0);
     }
 
     #[tokio::test]

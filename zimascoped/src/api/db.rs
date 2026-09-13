@@ -2196,11 +2196,13 @@ impl Db {
         &self,
         range: TimeRange,
         exclude_scope: &[AddressScope],
+        interface: Option<&str>,
         now: SystemTime,
     ) -> Result<OverviewDto, ApiError> {
         let query = FlowQuery {
             range: Some(range),
             limit: Some(TOP_LIST_LIMIT),
+            interface: interface.map(str::to_owned),
             exclude_scope: exclude_scope.to_vec(),
             ..FlowQuery::default()
         };
@@ -3019,6 +3021,15 @@ impl Db {
         if let Some(protocol) = query.protocol {
             clauses.push(format!("{prefix}protocol = ?"));
             params.push(Value::Text(enum_value(protocol)));
+        }
+        if let Some(interface) = query
+            .interface
+            .as_deref()
+            .map(str::trim)
+            .filter(|interface| !interface.is_empty())
+        {
+            clauses.push(format!("{prefix}interface = ? COLLATE NOCASE"));
+            params.push(Value::Text(interface.to_owned()));
         }
         if let Some(service) = query
             .service

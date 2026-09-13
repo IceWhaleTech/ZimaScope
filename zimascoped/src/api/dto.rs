@@ -140,6 +140,8 @@ pub struct FlowQuery {
     pub end: Option<i64>,
     pub direction: Option<FlowDirection>,
     pub protocol: Option<Protocol>,
+    /// Device Boundary interface name, e.g. `eth0`, `docker0` or `tun0`.
+    pub interface: Option<String>,
     /// Fingerprint service name (`SSH`, `TLS`, `HTTP`, …), case-insensitive.
     pub service: Option<String>,
     pub ip: Option<std::net::IpAddr>,
