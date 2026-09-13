@@ -11,7 +11,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Link, useNavigate } from "react-router";
 import { useQueryClient } from "@tanstack/react-query";
 import { motion, useReducedMotion } from "motion/react";
-import { ArrowLeftRight, ChevronDown, ChevronRight, Info, TriangleAlert } from "lucide-react";
+import { ArrowDown, ArrowUp, ChevronDown, ChevronRight, Info, TriangleAlert } from "lucide-react";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { TimelineChart, rateSeries, Sparkline } from "@/components/charts";
@@ -216,26 +216,27 @@ export function OverviewView() {
         error={overviewQuery.isError ? errorText(overviewQuery.error) : undefined}
       />
 
-      <section className="grid gap-x-12 gap-y-8 lg:grid-cols-2">
-        <RateCard
+      <section className="layered-surface flex flex-wrap items-center gap-x-12 gap-y-4 rounded-xl px-5 py-4">
+        <CompactRate
           direction="inbound"
-          title="Inbound"
-          subtitle="Entering ZimaOS"
+          label="Download"
           bps={rates?.inbound_bps ?? 0}
           total={overview ? formatBytes(overview.totals.inbound.bytes) : "—"}
           packets={overview ? `${formatNumber(overview.totals.inbound.packets)} packets` : "—"}
           spark={rateHistory.current.inbound}
         />
-        <RateCard
+        <CompactRate
           direction="outbound"
-          title="Outbound"
-          subtitle="Leaving ZimaOS"
+          label="Upload"
           bps={rates?.outbound_bps ?? 0}
           total={overview ? formatBytes(overview.totals.outbound.bytes) : "—"}
           packets={overview ? `${formatNumber(overview.totals.outbound.packets)} packets` : "—"}
           spark={rateHistory.current.outbound}
-          className="lg:pl-12"
         />
+        <span className="ml-auto inline-flex items-center gap-1.5 text-2xs text-muted-foreground">
+          <i className="size-1.5 rounded-full bg-success" />
+          Live · last {rangeLabel(range)}
+        </span>
       </section>
 
       <section className="layered-surface grid grid-cols-2 gap-x-12 gap-y-6 rounded-xl px-5 py-5 xl:grid-cols-4">
@@ -430,68 +431,53 @@ export function OverviewView() {
   );
 }
 
-function RateCard({
+function CompactRate({
   direction,
-  title,
-  subtitle,
+  label,
   bps,
   total,
   packets,
   spark,
-  className,
 }: {
   direction: "inbound" | "outbound";
-  title: string;
-  subtitle: string;
+  label: string;
   bps: number;
   total: string;
   packets: string;
   spark: number[];
-  className?: string;
 }) {
+  const inbound = direction === "inbound";
   const rate = formatRate(bps);
+  const Icon = inbound ? ArrowDown : ArrowUp;
   return (
-    <div className={cn("flex flex-col gap-3", className)}>
-      <div className="flex items-center gap-2.5">
-        <span
-          className={cn(
-            "grid size-9 shrink-0 place-items-center rounded-lg",
-            direction === "inbound" ? "bg-series-inbound/10 text-series-inbound" : "bg-series-outbound/12 text-series-outbound",
-          )}
-        >
-          <ArrowLeftRight
-            className={cn("size-[19px]", direction === "outbound" && "-scale-x-100")}
-            strokeWidth={1.8}
+    <div className="flex min-w-0 items-center gap-3">
+      <span
+        className={cn(
+          "grid size-7 shrink-0 place-items-center rounded-lg",
+          inbound
+            ? "bg-series-inbound/10 text-series-inbound"
+            : "bg-series-outbound/12 text-series-outbound",
+        )}
+      >
+        <Icon className="size-4" strokeWidth={2.2} />
+      </span>
+      <div className="flex min-w-0 flex-col gap-0.5">
+        <span className="flex items-baseline gap-1.5">
+          <SpringNumber
+            value={Number(rate.value)}
+            format={(value) => value.toFixed(rate.value.includes(".") ? 2 : 0)}
+            className="text-xl leading-none font-semibold tracking-[-0.02em] tabular-nums"
           />
+          <span className="text-xs font-medium text-muted-foreground">{rate.unit}</span>
+          <span className="text-2xs text-muted-foreground">{label}</span>
         </span>
-        <div>
-          <h2 className="text-sm font-semibold">{title}</h2>
-          <p className="text-2xs text-muted-foreground">{subtitle}</p>
-        </div>
-        <span className="ml-auto inline-flex items-center gap-1.5 rounded-full bg-success/12 px-2 py-0.5 text-2xs font-medium text-success">
-          <i className="size-1.5 rounded-full bg-success" />
-          Live
+        <span className="truncate text-2xs tabular-nums text-muted-foreground">
+          {total} · {packets} in range
         </span>
       </div>
-      <div className="flex items-baseline gap-2">
-        <SpringNumber
-          value={Number(rate.value)}
-          format={(value) => value.toFixed(rate.value.includes(".") ? 2 : 0)}
-          className="text-[2.25rem] leading-none font-semibold tracking-[-0.025em] tabular-nums"
-        />
-        <span className="text-base font-medium text-muted-foreground">{rate.unit}</span>
-      </div>
-      <Sparkline values={spark.length > 1 ? spark : [1, 1]} series={direction} />
-      <div className="flex gap-8 text-xs">
-        <div>
-          <span className="block text-2xs text-muted-foreground">Total in range</span>
-          <strong className="font-semibold tabular-nums">{total}</strong>
-        </div>
-        <div>
-          <span className="block text-2xs text-muted-foreground">Packets</span>
-          <strong className="font-semibold tabular-nums">{packets}</strong>
-        </div>
-      </div>
+      <span className="hidden w-24 shrink-0 sm:block" aria-hidden>
+        <Sparkline values={spark.length > 1 ? spark : [1, 1]} series={direction} />
+      </span>
     </div>
   );
 }
