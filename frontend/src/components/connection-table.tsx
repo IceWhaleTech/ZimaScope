@@ -9,7 +9,7 @@
 import { memo } from "react";
 import { ChevronRight } from "lucide-react";
 import { TableCell, TableRow } from "@/components/ui/table";
-import { EvidenceChip, FlowStateDot, TrafficValue } from "@/components/flow-bits";
+import { ByteValues, EvidenceChip, FlowStateDot, RateValues } from "@/components/flow-bits";
 import { flagEmoji, formatDuration, relativeTime } from "@/lib/format";
 import { cn } from "@/lib/utils";
 import type { Connection, DirectionTotals } from "@/types";
@@ -210,6 +210,12 @@ export function groupConnections(connections: Connection[], sort: string): Conne
         return group.traffic.inbound.packets;
       case "out_packets":
         return group.traffic.outbound.packets;
+      case "rate":
+        return group.inbound_bps + group.outbound_bps;
+      case "in_rate":
+        return group.inbound_bps;
+      case "out_rate":
+        return group.outbound_bps;
       case "duration_ms":
         return Math.max(0, ...group.connections.map((connection) => connection.duration_ms));
       case "first_seen":
@@ -292,18 +298,10 @@ const ConnectionRow = memo(function ConnectionRow({
         <DomainCell domains={connection.domains} />
       </TableCell>
       <TableCell>
-        <TrafficValue
-          direction="inbound"
-          counters={connection.traffic.inbound}
-          rateBps={connection.inbound_bps}
-        />
+        <RateValues inbound={connection.inbound_bps} outbound={connection.outbound_bps} />
       </TableCell>
       <TableCell>
-        <TrafficValue
-          direction="outbound"
-          counters={connection.traffic.outbound}
-          rateBps={connection.outbound_bps}
-        />
+        <ByteValues inbound={connection.traffic.inbound} outbound={connection.traffic.outbound} />
       </TableCell>
       <TableCell>
         <span className="whitespace-nowrap" title={`started ${relativeTime(connection.first_seen)}`}>
@@ -384,18 +382,10 @@ function GroupRow({
         {domainGroup ? <EvidenceCell domains={group.domains} /> : <DomainCell domains={group.domains} />}
       </TableCell>
       <TableCell>
-        <TrafficValue
-          direction="inbound"
-          counters={group.traffic.inbound}
-          rateBps={group.inbound_bps}
-        />
+        <RateValues inbound={group.inbound_bps} outbound={group.outbound_bps} />
       </TableCell>
       <TableCell>
-        <TrafficValue
-          direction="outbound"
-          counters={group.traffic.outbound}
-          rateBps={group.outbound_bps}
-        />
+        <ByteValues inbound={group.traffic.inbound} outbound={group.traffic.outbound} />
       </TableCell>
       <TableCell>
         <span className="whitespace-nowrap" title={`first ${relativeTime(group.first_seen)}`}>
@@ -470,18 +460,10 @@ const ChildRow = memo(function ChildRow({
         <DomainCell domains={connection.domains} />
       </TableCell>
       <TableCell>
-        <TrafficValue
-          direction="inbound"
-          counters={connection.traffic.inbound}
-          rateBps={connection.inbound_bps}
-        />
+        <RateValues inbound={connection.inbound_bps} outbound={connection.outbound_bps} />
       </TableCell>
       <TableCell>
-        <TrafficValue
-          direction="outbound"
-          counters={connection.traffic.outbound}
-          rateBps={connection.outbound_bps}
-        />
+        <ByteValues inbound={connection.traffic.inbound} outbound={connection.traffic.outbound} />
       </TableCell>
       <TableCell>
         <span className="whitespace-nowrap" title={`started ${relativeTime(connection.first_seen)}`}>
@@ -561,9 +543,14 @@ export function ConnectionRows({
 
 export const CONNECTION_COLUMNS = [
   { label: "Service", sort: "service", width: "10%" },
-  { label: "Remote endpoint", sort: "remote", width: "26%" },
-  { label: "Associated domain", sort: "domain", width: "26%" },
-  { label: "Inbound", sort: "in_bytes", width: "13%" },
-  { label: "Outbound", sort: "out_bytes", width: "13%" },
+  { label: "Remote endpoint", sort: "remote", width: "24%" },
+  { label: "Associated domain", sort: "domain", width: "22%" },
+  { label: "Rate", sort: "rate", sorts: ["rate", "in_rate", "out_rate"], width: "17%" },
+  {
+    label: "Total",
+    sort: "bytes",
+    sorts: ["bytes", "in_bytes", "out_bytes"],
+    width: "15%",
+  },
   { label: "Last seen", sort: "last_seen", width: "12%" },
 ] as const;

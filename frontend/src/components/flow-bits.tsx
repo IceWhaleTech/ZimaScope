@@ -57,37 +57,82 @@ export function DirectionBadge({ direction }: { direction: string }) {
 }
 
 /**
- * One direction of an aggregate's traffic: arrow + bytes with the current rate
- * underneath. The rate line is always rendered so live updates do not change
- * row height; a missing rate reads as zero.
+ * Live rate with its direction arrow, e.g. `↓ 8.4 Mbps`. Inbound means
+ * entering ZimaOS (download); outbound means leaving it (upload).
  */
-export function TrafficValue({
+export function RateValue({
   direction,
-  counters,
-  rateBps,
+  bps,
+  className,
 }: {
   direction: "inbound" | "outbound";
-  counters: Counters;
-  rateBps?: number;
+  bps?: number;
+  className?: string;
 }) {
   const inbound = direction === "inbound";
   const Icon = inbound ? ArrowDown : ArrowUp;
-  const rate = rateBps ?? 0;
   return (
     <span
       className={cn(
-        "inline-flex flex-col items-start gap-0.5 font-medium tabular-nums whitespace-nowrap",
+        "inline-flex items-center gap-1 font-medium tabular-nums whitespace-nowrap",
         inbound ? "text-series-inbound" : "text-series-outbound",
+        className,
       )}
-      title={`${formatNumber(counters.packets)} packets ${inbound ? "inbound (entering ZimaOS)" : "outbound (leaving ZimaOS)"} · ${formatRateText(rate)} over the last interval`}
+      title={`${inbound ? "Download (entering ZimaOS)" : "Upload (leaving ZimaOS)"}: ${formatRateText(bps ?? 0)} over the last interval`}
     >
-      <span className="inline-flex items-center gap-1">
-        <Icon className="size-3" strokeWidth={2.2} />
-        {formatBytes(counters.bytes)}
-      </span>
-      <span className="pl-4 text-2xs font-normal tabular-nums text-muted-foreground">
-        {formatRateText(rate)}
-      </span>
+      <Icon className="size-3" strokeWidth={2.2} />
+      {formatRateText(bps ?? 0)}
+    </span>
+  );
+}
+
+/** Cumulative bytes with a muted direction arrow. */
+function BytesValue({ direction, counters }: { direction: "inbound" | "outbound"; counters: Counters }) {
+  const Icon = direction === "inbound" ? ArrowDown : ArrowUp;
+  return (
+    <span className="inline-flex items-center gap-1 tabular-nums">
+      <Icon className="size-2.5 opacity-60" strokeWidth={2.2} />
+      {formatBytes(counters.bytes)}
+    </span>
+  );
+}
+
+/**
+ * Live rates for one cell: `↓ download ↑ upload` side by side for aggregates,
+ * or a single direction for a directional Flows row.
+ */
+export function RateValues({ inbound, outbound }: { inbound?: number; outbound?: number }) {
+  return (
+    <span className="inline-flex items-center gap-3 whitespace-nowrap">
+      {inbound !== undefined && <RateValue direction="inbound" bps={inbound} />}
+      {outbound !== undefined && <RateValue direction="outbound" bps={outbound} />}
+    </span>
+  );
+}
+
+/**
+ * Cumulative bytes for one cell: both directions for aggregates, or a single
+ * direction for a directional Flows row.
+ */
+export function ByteValues({
+  inbound,
+  outbound,
+}: {
+  inbound?: Counters;
+  outbound?: Counters;
+}) {
+  return (
+    <span className="inline-flex items-center gap-3 whitespace-nowrap text-muted-foreground">
+      {inbound && (
+        <span title={`${formatNumber(inbound.packets)} packets downloaded`}>
+          <BytesValue direction="inbound" counters={inbound} />
+        </span>
+      )}
+      {outbound && (
+        <span title={`${formatNumber(outbound.packets)} packets uploaded`}>
+          <BytesValue direction="outbound" counters={outbound} />
+        </span>
+      )}
     </span>
   );
 }

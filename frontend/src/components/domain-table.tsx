@@ -5,7 +5,7 @@
 
 import { memo } from "react";
 import { TableCell, TableRow } from "@/components/ui/table";
-import { EvidenceChip, TrafficValue } from "@/components/flow-bits";
+import { ByteValues, EvidenceChip, RateValues } from "@/components/flow-bits";
 import { relativeTime } from "@/lib/format";
 import type { DomainSummary } from "@/types";
 
@@ -47,18 +47,10 @@ export const DomainRow = memo(function DomainRow({
         </span>
       </TableCell>
       <TableCell>
-        <TrafficValue
-          direction="inbound"
-          counters={domain.traffic.inbound}
-          rateBps={domain.inbound_bps}
-        />
+        <RateValues inbound={domain.inbound_bps} outbound={domain.outbound_bps} />
       </TableCell>
       <TableCell>
-        <TrafficValue
-          direction="outbound"
-          counters={domain.traffic.outbound}
-          rateBps={domain.outbound_bps}
-        />
+        <ByteValues inbound={domain.traffic.inbound} outbound={domain.traffic.outbound} />
       </TableCell>
       <TableCell>
         <span className="whitespace-nowrap" title={`first seen ${relativeTime(domain.first_seen)}`}>
@@ -70,9 +62,14 @@ export const DomainRow = memo(function DomainRow({
 });
 
 export const DOMAIN_COLUMNS = [
-  { label: "Domain", sort: "domain", width: "30%" },
-  { label: "Evidence", sort: "evidence", width: "16%" },
-  { label: "Inbound", sort: "in_bytes", width: "18%" },
-  { label: "Outbound", sort: "out_bytes", width: "18%" },
-  { label: "Last seen", sort: "last_seen", width: "18%" },
+  { label: "Domain", sort: "domain", width: "32%" },
+  { label: "Evidence", sort: "evidence", width: "12%" },
+  { label: "Rate", sort: "rate", sorts: ["rate", "in_rate", "out_rate"], width: "20%" },
+  {
+    label: "Total",
+    sort: "bytes",
+    sorts: ["bytes", "in_bytes", "out_bytes"],
+    width: "17%",
+  },
+  { label: "Last seen", sort: "last_seen", width: "19%" },
 ] as const;

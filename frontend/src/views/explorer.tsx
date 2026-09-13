@@ -87,7 +87,13 @@ const NOISE_OPTIONS = [
 ];
 
 /** A table column: every exported column declares its sort field and width. */
-type Column = { readonly label: string; readonly sort: string; readonly width: string };
+type Column = {
+  readonly label: string;
+  readonly sort: string;
+  /** Sort fields a merged column cycles through; defaults to `[sort]`. */
+  readonly sorts?: readonly string[];
+  readonly width: string;
+};
 
 const defaultSort = (scope: Scope) => (scope === "flows" ? "-last_seen" : "-bytes");
 
@@ -204,7 +210,29 @@ function HeadLabel({ label }: { label: string }) {
   );
 }
 
-/** Clickable header: toggles ascending/descending on the column's field. */
+/** Compact badge for a merged column's active metric; whole-column metrics are silent. */
+const SORT_BADGE: Record<string, string> = {
+  bytes: "",
+  in_bytes: "down",
+  out_bytes: "up",
+  rate: "",
+  in_rate: "down",
+  out_rate: "up",
+};
+
+/** Spelled-out metric for tooltips. */
+const SORT_TITLE: Record<string, string> = {
+  bytes: "total",
+  in_bytes: "download",
+  out_bytes: "upload",
+  rate: "combined rate",
+  in_rate: "download rate",
+  out_rate: "upload rate",
+};
+
+const metricTitle = (field: string) => SORT_TITLE[field] ?? field;
+
+/** Clickable header: toggles ascending/descending, or cycles a metric set. */
 function SortableHead({
   column,
   sort,
@@ -214,21 +242,43 @@ function SortableHead({
   sort: string;
   onSort: (field: string) => void;
 }) {
+  const cycle = column.sorts ?? [column.sort];
+  const root = sort.replace(/^-/, "");
+  const index = cycle.indexOf(root);
+  const active = index >= 0;
   const descending = sort.startsWith("-");
-  const active = sort.replace(/^-/, "") === column.sort;
   const Icon = active ? (descending ? ArrowDown : ArrowUp) : ArrowUpDown;
+  const metric = active && cycle.length > 1 ? SORT_BADGE[cycle[index]] : undefined;
+  // Cycle semantics: first click sorts by the headline metric descending, the
+  // second flips ascending, the third advances to the next metric.
+  const next = () => {
+    if (!active) return cycle[0];
+    if (descending) return cycle[index];
+    return cycle[(index + 1) % cycle.length];
+  };
+  const title =
+    cycle.length > 1
+      ? active
+        ? `${column.label} sorted by ${metricTitle(cycle[index])} ${descending ? "descending" : "ascending"} — click to ${
+            descending
+              ? "flip ascending"
+              : `sort by ${metricTitle(cycle[(index + 1) % cycle.length])} descending`
+          }`
+        : `Sort by ${metricTitle(cycle[0])} descending; click again to flip direction or change the metric`
+      : `Sort by ${column.label}`;
   return (
     <TableHead>
       <button
         type="button"
-        onClick={() => onSort(column.sort)}
-        title={`Sort by ${column.label}`}
+        onClick={() => onSort(next())}
+        title={title}
         className={cn(
           "group -mx-1 inline-flex items-center gap-1 rounded px-1 py-0.5 text-left transition-colors hover:text-foreground",
           active ? "text-foreground" : "text-muted-foreground",
         )}
       >
         <HeadLabel label={column.label} />
+        {metric && <span className="text-2xs font-normal text-muted-foreground">{metric}</span>}
         <Icon
           className={cn(
             "size-3 shrink-0 transition-opacity",
@@ -960,7 +1010,7 @@ export function ExplorerView() {
           <Table className="table-fixed">
             <colgroup>
               {columns.map((column) => (
-                <col key={column.sort} style={{ width: column.width }} />
+                <col key={column.label} style={{ width: column.width }} />
               ))}
             </colgroup>
             <TableHeader>

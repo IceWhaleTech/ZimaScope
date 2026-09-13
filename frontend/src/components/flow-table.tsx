@@ -10,7 +10,7 @@
 import { memo } from "react";
 import { Boxes, Terminal } from "lucide-react";
 import { TableCell, TableRow } from "@/components/ui/table";
-import { DirectionBadge, EvidenceChip, FlowStateDot, TrafficValue } from "@/components/flow-bits";
+import { ByteValues, DirectionBadge, EvidenceChip, FlowStateDot, RateValues } from "@/components/flow-bits";
 import { flagEmoji, formatDuration, relativeTime } from "@/lib/format";
 import { cn } from "@/lib/utils";
 import type { Flow } from "@/types";
@@ -97,11 +97,18 @@ export const FlowRow = memo(function FlowRow({
         )}
       </TableCell>
       <TableCell>
-        <TrafficValue
-          direction={flow.direction}
-          counters={{ packets: flow.packets, bytes: flow.bytes }}
-          rateBps={flow.direction === "inbound" ? flow.inbound_bps : flow.outbound_bps}
-        />
+        {flow.direction === "inbound" ? (
+          <RateValues inbound={flow.inbound_bps} />
+        ) : (
+          <RateValues outbound={flow.outbound_bps} />
+        )}
+      </TableCell>
+      <TableCell>
+        {flow.direction === "inbound" ? (
+          <ByteValues inbound={{ packets: flow.packets, bytes: flow.bytes }} />
+        ) : (
+          <ByteValues outbound={{ packets: flow.packets, bytes: flow.bytes }} />
+        )}
       </TableCell>
       <TableCell>
         <span className="whitespace-nowrap" title={formatDuration(flow.duration_ms)}>
@@ -113,10 +120,11 @@ export const FlowRow = memo(function FlowRow({
 });
 
 export const FLOW_COLUMNS = [
-  { label: "Direction", sort: "direction", width: "9%" },
-  { label: "Remote endpoint", sort: "remote", width: "22%" },
-  { label: "Application", sort: "application", width: "16%" },
-  { label: "Associated domain", sort: "domain", width: "24%" },
-  { label: "Traffic", sort: "bytes", width: "14%" },
-  { label: "Last seen", sort: "last_seen", width: "15%" },
+  { label: "Direction", sort: "direction", width: "8%" },
+  { label: "Remote endpoint", sort: "remote", width: "20%" },
+  { label: "Application", sort: "application", width: "13%" },
+  { label: "Associated domain", sort: "domain", width: "20%" },
+  { label: "Rate", sort: "rate", width: "17%" },
+  { label: "Total", sort: "bytes", width: "14%" },
+  { label: "Last seen", sort: "last_seen", width: "8%" },
 ] as const;

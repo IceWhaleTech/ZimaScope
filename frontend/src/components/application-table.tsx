@@ -5,7 +5,7 @@
 import { memo } from "react";
 import { Boxes, Terminal } from "lucide-react";
 import { TableCell, TableRow } from "@/components/ui/table";
-import { TrafficValue } from "@/components/flow-bits";
+import { ByteValues, RateValues } from "@/components/flow-bits";
 import { relativeTime } from "@/lib/format";
 import type { ApplicationSummary } from "@/types";
 
@@ -48,18 +48,10 @@ export const ApplicationRow = memo(function ApplicationRow({
         </span>
       </TableCell>
       <TableCell>
-        <TrafficValue
-          direction="inbound"
-          counters={application.traffic.inbound}
-          rateBps={application.inbound_bps}
-        />
+        <RateValues inbound={application.inbound_bps} outbound={application.outbound_bps} />
       </TableCell>
       <TableCell>
-        <TrafficValue
-          direction="outbound"
-          counters={application.traffic.outbound}
-          rateBps={application.outbound_bps}
-        />
+        <ByteValues inbound={application.traffic.inbound} outbound={application.traffic.outbound} />
       </TableCell>
       <TableCell>
         <span className="tabular-nums text-muted-foreground">{application.flow_count}</span>
@@ -74,9 +66,14 @@ export const ApplicationRow = memo(function ApplicationRow({
 });
 
 export const APPLICATION_COLUMNS = [
-  { label: "Application", sort: "name", width: "34%" },
-  { label: "Inbound", sort: "in_bytes", width: "16%" },
-  { label: "Outbound", sort: "out_bytes", width: "16%" },
-  { label: "Flows", sort: "flows", width: "14%" },
-  { label: "Last seen", sort: "last_seen", width: "20%" },
+  { label: "Application", sort: "name", width: "32%" },
+  { label: "Rate", sort: "rate", sorts: ["rate", "in_rate", "out_rate"], width: "20%" },
+  {
+    label: "Total",
+    sort: "bytes",
+    sorts: ["bytes", "in_bytes", "out_bytes"],
+    width: "17%",
+  },
+  { label: "Flows", sort: "flows", width: "12%" },
+  { label: "Last seen", sort: "last_seen", width: "19%" },
 ] as const;
