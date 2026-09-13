@@ -97,13 +97,29 @@ async fn main() {
                         api::router_with_ui(state.clone(), &ui_dir)
                     }
                     Some(ui_dir) => {
-                        eprintln!(
-                            "zimascoped: UI directory {} is missing; serving API only",
-                            ui_dir.display()
-                        );
-                        api::router(state.clone())
+                        if api::has_embedded_ui() {
+                            eprintln!(
+                                "zimascoped: UI directory {} is missing; serving the embedded frontend",
+                                ui_dir.display()
+                            );
+                            api::router_with_embedded_ui(state.clone())
+                        } else {
+                            eprintln!(
+                                "zimascoped: UI directory {} is missing; serving API only",
+                                ui_dir.display()
+                            );
+                            api::router(state.clone())
+                        }
                     }
-                    None => api::router(state.clone()),
+                    None => {
+                        if api::has_embedded_ui() {
+                            eprintln!("zimascoped: serving the embedded frontend");
+                            api::router_with_embedded_ui(state.clone())
+                        } else {
+                            eprintln!("zimascoped: no frontend bundle; serving API only");
+                            api::router(state.clone())
+                        }
+                    }
                 };
                 eprintln!("zimascoped: http server listening on http://{address}");
                 servers.spawn(async move {

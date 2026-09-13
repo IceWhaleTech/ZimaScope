@@ -23,7 +23,7 @@ fn main() -> Result<()> {
         _ => {
             eprintln!(
                 "usage: cargo xtask build-ebpf\n       \
-                 cargo xtask package [--web <dist-dir>] [--out <dir>]"
+                 cargo xtask package [--out <dir>]"
             );
             std::process::exit(2);
         }
@@ -63,6 +63,23 @@ fn build_ebpf() -> Result<()> {
         bail!("eBPF build failed with {status}");
     }
 
+    // The object is embedded into the agent, so DWARF would ride along unused.
+    // Keep .BTF (aya needs it for map/spin-lock definitions) and drop the rest.
+    let object = root.join("target/bpfel-unknown-none/release/zimascope-ebpf");
+    let stripped = ["llvm-objcopy", "objcopy"].iter().find_map(|tool| {
+        Command::new(tool)
+            .arg("--strip-debug")
+            .arg(&object)
+            .status()
+            .ok()
+            .filter(|status| status.success())
+            .map(|_| *tool)
+    });
+    match stripped {
+        Some(tool) => println!("eBPF object stripped with {tool}"),
+        None => println!("eBPF object kept unstripped: no objcopy on PATH"),
+    }
+
     println!("eBPF object ready at target/bpfel-unknown-none/release/zimascope-ebpf");
     Ok(())
 }
@@ -72,16 +89,10 @@ fn package(args: Vec<String>) -> Result<()> {
         bail!("cargo xtask package ships the host binary and only runs on Linux");
     }
 
-    let mut web_dir: Option<PathBuf> = None;
     let mut out_dir = PathBuf::from("target/release-pack");
     let mut args = args.into_iter();
     while let Some(arg) = args.next() {
         match arg.as_str() {
-            "--web" => {
-                web_dir = Some(PathBuf::from(
-                    args.next().context("--web needs a directory")?,
-                ));
-            }
             "--out" => {
                 out_dir = PathBuf::from(args.next().context("--out needs a directory")?);
             }
@@ -92,7 +103,14 @@ fn package(args: Vec<String>) -> Result<()> {
     let root = workspace_root()?;
     build_ebpf()?;
 
-    println!("building the release agent (embedded eBPF object)");
+    // The frontend must be built before the agent: build.rs embeds the dist
+    // bundle into the binary, so a later build would carry a stale bundle.
+    let web = build_frontend(&root)?;
+    if !web.join("index.html").is_file() {
+        bail!("frontend build did not produce index.html");
+    }
+
+    println!("building the release agent (embedded eBPF object and frontend)");
     let status = Command::new("cargo")
         .current_dir(&root)
         .args(["build", "--release", "--package", "zimascoped"])
@@ -101,21 +119,6 @@ fn package(args: Vec<String>) -> Result<()> {
     if !status.success() {
         bail!("agent build failed with {status}");
     }
-
-    let web = match web_dir {
-        Some(dir) => {
-            let dir = if dir.is_absolute() {
-                dir
-            } else {
-                root.join(dir)
-            };
-            if !dir.join("index.html").is_file() {
-                bail!("{} does not contain index.html", dir.display());
-            }
-            dir
-        }
-        None => build_frontend(&root)?,
-    };
 
     let name = format!(
         "zimascope-{VERSION}-{}-linux",
@@ -139,7 +142,6 @@ fn package(args: Vec<String>) -> Result<()> {
     let agent = root.join("target/release/zimascoped");
     fs::copy(&agent, release_dir.join("bin/zimascoped"))
         .with_context(|| format!("copy {}", agent.display()))?;
-    copy_tree(&web, &release_dir.join("web"))?;
     for (file, mode) in [("zimascoped.service", 0o644), ("install.sh", 0o755)] {
         let source = root.join("packaging").join(file);
         let target = release_dir.join(file);
@@ -191,22 +193,6 @@ fn build_frontend(root: &Path) -> Result<PathBuf> {
     }
 
     Ok(frontend.join("dist"))
-}
-
-fn copy_tree(source: &Path, target: &Path) -> Result<()> {
-    fs::create_dir_all(target).with_context(|| format!("create {}", target.display()))?;
-    for entry in fs::read_dir(source).with_context(|| format!("read {}", source.display()))? {
-        let entry = entry?;
-        let file_type = entry.file_type()?;
-        let next = target.join(entry.file_name());
-        if file_type.is_dir() {
-            copy_tree(&entry.path(), &next)?;
-        } else if file_type.is_file() {
-            fs::copy(entry.path(), &next)
-                .with_context(|| format!("copy {}", entry.path().display()))?;
-        }
-    }
-    Ok(())
 }
 
 fn write_checksums(release_dir: &Path) -> Result<()> {

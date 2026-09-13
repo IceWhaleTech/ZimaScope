@@ -32,6 +32,7 @@ use std::{
 
 use axum::{
     Json, Router,
+    body::Body,
     extract::{
         FromRequest, FromRequestParts, OriginalUri, Path as AxumPath, Query, Request, State,
     },
@@ -375,6 +376,71 @@ pub fn router_with_ui(state: ApiState, ui_dir: &Path) -> Router {
         .fallback_service(ServeDir::new(ui_dir).not_found_service(ServeFile::new(index)))
         .method_not_allowed_fallback(method_not_allowed)
         .layer(compression_layer())
+}
+
+/// The frontend bundle compiled into this binary by `build.rs`.
+mod embedded_ui {
+    include!(concat!(env!("OUT_DIR"), "/embedded_ui.rs"));
+}
+
+/// Whether this build carries an embedded frontend bundle.
+pub fn has_embedded_ui() -> bool {
+    !embedded_ui::UI_ASSETS.is_empty()
+}
+
+/// Builds a single-binary router: the `/v1` API plus the embedded frontend.
+pub fn router_with_embedded_ui(state: ApiState) -> Router {
+    api_routes(state)
+        .route("/v1/{*path}", any(not_found))
+        .fallback(embedded_asset)
+        .method_not_allowed_fallback(method_not_allowed)
+        .layer(compression_layer())
+}
+
+/// Serves one embedded file; unknown paths fall back to `index.html` so the
+/// hash-routed SPA boots from any URL.
+async fn embedded_asset(OriginalUri(uri): OriginalUri) -> Response {
+    let path = uri.path().trim_start_matches('/');
+    if !path.is_empty() {
+        if let Some((name, bytes)) = embedded_ui::UI_ASSETS
+            .iter()
+            .find(|(name, _)| *name == path)
+        {
+            return asset_response(name, bytes);
+        }
+    }
+    asset_response("index.html", embedded_ui::UI_INDEX)
+}
+
+fn asset_response(name: &str, bytes: &'static [u8]) -> Response {
+    // Vite fingerprints file names, so files under assets/ are immutable.
+    let cache = if name.starts_with("assets/") {
+        "public, max-age=31536000, immutable"
+    } else {
+        "no-cache"
+    };
+    Response::builder()
+        .header(header::CONTENT_TYPE, asset_content_type(name))
+        .header(header::CACHE_CONTROL, cache)
+        .body(Body::from(bytes))
+        .unwrap_or_else(|_| Response::new(Body::empty()))
+}
+
+fn asset_content_type(name: &str) -> &'static str {
+    match name.rsplit('.').next() {
+        Some("html") => "text/html; charset=utf-8",
+        Some("js") | Some("mjs") => "text/javascript; charset=utf-8",
+        Some("css") => "text/css; charset=utf-8",
+        Some("json") | Some("map") => "application/json",
+        Some("svg") => "image/svg+xml",
+        Some("png") => "image/png",
+        Some("jpg" | "jpeg") => "image/jpeg",
+        Some("ico") => "image/x-icon",
+        Some("woff2") => "font/woff2",
+        Some("woff") => "font/woff",
+        Some("txt") => "text/plain; charset=utf-8",
+        _ => "application/octet-stream",
+    }
 }
 
 /// Gzip for every response that benefits, including the SSE tick stream.
@@ -1528,6 +1594,48 @@ mod tests {
             .get(header::CONTENT_ENCODING)
             .and_then(|value| value.to_str().ok())
             .map(ToOwned::to_owned)
+    }
+
+    #[tokio::test]
+    async fn embedded_ui_serves_the_compiled_bundle() {
+        if !has_embedded_ui() {
+            return;
+        }
+        let state = state();
+        let app = || router_with_embedded_ui(state.clone());
+
+        let response = app().oneshot(get("/")).await.expect("router responds");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some("text/html; charset=utf-8")
+        );
+        assert!(body_text(response).await.contains("<!doctype html>"));
+
+        let (name, _) = embedded_ui::UI_ASSETS[0];
+        let response = app()
+            .oneshot(get(&format!("/{name}")))
+            .await
+            .expect("router responds");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CACHE_CONTROL)
+                .and_then(|value| value.to_str().ok()),
+            Some("public, max-age=31536000, immutable")
+        );
+
+        // Unknown paths fall back to the SPA index.
+        let response = app()
+            .oneshot(get("/explore"))
+            .await
+            .expect("router responds");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(body_text(response).await.contains("<div id=\"app\">"));
     }
 
     #[tokio::test]

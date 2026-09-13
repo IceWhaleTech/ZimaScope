@@ -29,3 +29,4 @@ tower-http = { version = "0.6", features = ["fs"] }
 lto = true
 codegen-units = 1
 panic = "abort"
+strip = true

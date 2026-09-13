@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# Installs a built ZimaScope release: the agent binary (with the eBPF object
-# embedded), the frontend bundle, and the systemd unit. Data lives in
+# Installs a built ZimaScope release: one binary with the eBPF object and the
+# frontend bundle embedded, plus the systemd unit. Data lives in
 # /var/lib/zimascope and is never touched.
 #
 # Usage: sudo packaging/install.sh <release-dir>
 #   <release-dir> must contain:
 #     bin/zimascoped
-#     web/index.html ...
+#     zimascoped.service
 set -euo pipefail
 
 INSTALL_ROOT="/opt/zimascope"
@@ -24,10 +24,6 @@ if [[ -z ${RELEASE_DIR} || ! -x "${RELEASE_DIR}/bin/zimascoped" ]]; then
   echo "install.sh: usage: install.sh <release-dir> (needs bin/zimascoped)" >&2
   exit 1
 fi
-if [[ ! -f "${RELEASE_DIR}/web/index.html" ]]; then
-  echo "install.sh: ${RELEASE_DIR}/web/index.html is missing" >&2
-  exit 1
-fi
 
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
 UNIT_SRC="${SCRIPT_DIR}/${SERVICE_NAME}"
@@ -41,11 +37,9 @@ install -d -m 0755 "${INSTALL_ROOT}/bin"
 install -m 0755 -o root -g root "${RELEASE_DIR}/bin/zimascoped" \
   "${INSTALL_ROOT}/bin/zimascoped"
 
-echo "==> installing frontend to ${INSTALL_ROOT}/web"
+# Releases before the embedded bundle shipped a web/ directory; the binary
+# serves the SPA itself now.
 rm -rf "${INSTALL_ROOT}/web"
-install -d -m 0755 "${INSTALL_ROOT}/web"
-cp -R "${RELEASE_DIR}/web/." "${INSTALL_ROOT}/web/"
-chown -R root:root "${INSTALL_ROOT}/web"
 
 echo "==> installing ${SERVICE_NAME}"
 install -m 0644 -o root -g root "${UNIT_SRC}" "/etc/systemd/system/${SERVICE_NAME}"

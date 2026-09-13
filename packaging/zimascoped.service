@@ -6,7 +6,6 @@ Wants=network-online.target
 [Service]
 Type=simple
 Environment=ZIMASCOPE_HTTP_LISTEN=0.0.0.0:8080
-Environment=ZIMASCOPE_UI_DIR=/opt/zimascope/web
 Environment=ZIMASCOPE_DATABASE=/var/lib/zimascope/zimascope.db
 Environment=ZIMASCOPE_GEOIP_DATABASE=/var/lib/zimascope/geoip
 ExecStart=/opt/zimascope/bin/zimascoped
