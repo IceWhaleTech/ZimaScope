@@ -158,6 +158,9 @@ async fn main() {
     if let Err(error) = state.apply_policy().await {
         eprintln!("zimascoped: traffic rule enforcement unavailable: {error:#}");
     }
+    // Re-apply the boundary in case settings changed between the startup read
+    // and the collector becoming available.
+    state.refresh_boundary().await;
 
     loop {
         tokio::select! {

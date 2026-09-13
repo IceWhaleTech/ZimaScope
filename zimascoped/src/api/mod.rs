@@ -262,8 +262,15 @@ impl ApiState {
         self.lock().settings.boundary.interfaces.clone()
     }
 
-    /// Pushes the current boundary selectors to a running collector.
-    async fn apply_boundary(&self, selectors: Vec<InterfaceSelector>) {
+    /// Pushes the stored boundary selectors to a running collector.
+    ///
+    /// A missing collector handle is a no-op: the next `Collector::start`
+    /// reads the same settings, and a later change always re-applies.
+    pub async fn refresh_boundary(&self) {
+        let selectors = {
+            let inner = self.lock();
+            InterfaceSelector::from_names(&inner.settings.boundary.interfaces)
+        };
         let handle = self.lock().policy_handle.clone();
         let Some(handle) = handle else {
             return;
@@ -824,18 +831,16 @@ async fn put_settings(
     State(state): State<ApiState>,
     ApiJson(body): ApiJson<Settings>,
 ) -> Result<Json<Settings>, ApiError> {
-    let (settings, selectors) = {
+    let settings = {
         let mut inner = state.lock();
         let mut settings = body;
         settings.normalize();
         settings.validate()?;
         apply_settings(&mut inner, settings)?;
-        let settings = inner.settings.clone();
-        let selectors = InterfaceSelector::from_names(&settings.boundary.interfaces);
-        (settings, selectors)
+        inner.settings.clone()
     };
     let _ = state.apply_policy().await;
-    state.apply_boundary(selectors).await;
+    state.refresh_boundary().await;
     Ok(Json(settings))
 }
 
@@ -843,19 +848,17 @@ async fn patch_settings(
     State(state): State<ApiState>,
     ApiJson(patch): ApiJson<SettingsPatch>,
 ) -> Result<Json<Settings>, ApiError> {
-    let (settings, selectors) = {
+    let settings = {
         let mut inner = state.lock();
         let mut settings = inner.settings.clone();
         patch.apply(&mut settings);
         settings.normalize();
         settings.validate()?;
         apply_settings(&mut inner, settings)?;
-        let settings = inner.settings.clone();
-        let selectors = InterfaceSelector::from_names(&settings.boundary.interfaces);
-        (settings, selectors)
+        inner.settings.clone()
     };
     let _ = state.apply_policy().await;
-    state.apply_boundary(selectors).await;
+    state.refresh_boundary().await;
     Ok(Json(settings))
 }
 
