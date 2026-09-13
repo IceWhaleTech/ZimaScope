@@ -1,0 +1,9 @@
+{
+  "name": "zimascope",
+  "version": "v__ZIMASCOPE_VERSION__",
+  "services": [
+    {
+      "name": "zimascoped"
+    }
+  ]
+}

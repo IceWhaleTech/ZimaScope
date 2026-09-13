@@ -1,5 +1,6 @@
 /target
 /target-linux
+/dist
 .idea/
 .zcode/
 frontend/dist/

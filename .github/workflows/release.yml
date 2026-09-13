@@ -1,0 +1,127 @@
+name: Release ZimaScope
+
+on:
+  push:
+    tags:
+      - "v*"
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_TARGET: x86_64-unknown-linux-gnu
+  BIN_NAME: zimascoped
+  PACKAGE_NAME: zimascope
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Resolve version
+        id: version
+        run: |
+          set -euo pipefail
+          version="$(awk '/^\[workspace.package\]/{found=1} found && /^version =/{gsub(/"/, "", $3); print $3; exit}' Cargo.toml)"
+          test -n "${version}"
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "building ZimaScope ${version}"
+
+      - name: Install nightly Rust for the eBPF target
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src
+
+      # Installed after nightly so the host binary uses stable.
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ env.RUST_TARGET }}
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install bpf-linker
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-binstall
+      - run: cargo binstall --no-confirm --force bpf-linker
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install packaging tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y squashfs-tools
+
+      - name: Fetch GeoLite2 databases
+        run: |
+          set -euo pipefail
+          mkdir -p target/geoip
+          base="https://github.com/P3TERX/GeoLite.mmdb/releases/latest/download"
+          curl -fsSL -o target/geoip/GeoLite2-ASN.mmdb "${base}/GeoLite2-ASN.mmdb"
+          curl -fsSL -o target/geoip/GeoLite2-Country.mmdb "${base}/GeoLite2-Country.mmdb"
+          ls -l target/geoip
+
+      - name: Build release binary (eBPF object and frontend embedded)
+        run: cargo xtask package
+
+      - name: Build ZimaOS RAW package
+        run: ./packaging/build-zimaos-raw.sh
+
+      - name: Stage release assets
+        run: |
+          set -euo pipefail
+          mkdir -p dist/release
+          install -m 0755 "target/release/${BIN_NAME}" "dist/release/${BIN_NAME}"
+          install -m 0644 "dist/${PACKAGE_NAME}.raw" "dist/release/${PACKAGE_NAME}.raw"
+          (
+            cd dist/release
+            sha256sum "${BIN_NAME}" "${PACKAGE_NAME}.raw" > SHA256SUMS
+          )
+
+      - name: Upload release assets
+        uses: actions/upload-artifact@v4
+        with:
+          name: zimascope-${{ env.RUST_TARGET }}-${{ steps.version.outputs.version }}
+          path: dist/release/*
+          compression-level: 0
+          if-no-files-found: error
+
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'release'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download release assets
+        uses: actions/download-artifact@v4
+        with:
+          pattern: zimascope-*
+          merge-multiple: true
+          path: dist/release
+
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/release/*
+          fail_on_unmatched_files: true
+          tag_name: ${{ github.event.release.tag_name || github.ref_name }}
