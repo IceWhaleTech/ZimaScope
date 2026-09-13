@@ -5,6 +5,7 @@
  */
 
 import { useEffect, useState } from "react";
+import { useQueryClient } from "@tanstack/react-query";
 import { FileDown, FileText, Loader2, Lock, Trash2, TriangleAlert, Wifi } from "lucide-react";
 import { toast } from "sonner";
 import {
@@ -37,6 +38,7 @@ import {
   useClearHistory,
   useCreateExport,
   useDeleteTrafficRule,
+  useInterfaces,
   useSaveSettings,
   useSettings,
   useStatus,
@@ -47,7 +49,13 @@ import { useSetTopbar } from "@/hooks/use-topbar";
 import { downloadExport } from "@/lib/download";
 import { formatDuration, formatNumber, formatRateText, relativeTime } from "@/lib/format";
 import { cn } from "@/lib/utils";
-import type { ProxySettings, SettingsPatch, TrafficRule } from "@/types";
+import type {
+  InterfaceInfo,
+  InterfaceKind,
+  ProxySettings,
+  SettingsPatch,
+  TrafficRule,
+} from "@/types";
 
 function errorText(error: unknown): string {
   return error instanceof Error ? error.message : "The local agent did not respond.";
@@ -62,9 +70,16 @@ export function SettingsView() {
   const createExport = useCreateExport();
   const settings = settingsQuery.data;
   const status = statusQuery.data;
+  const queryClient = useQueryClient();
 
   const persist = (patch: SettingsPatch, message = "Settings saved") =>
-    saveSettings.mutate(patch, { onSuccess: () => toast.success(message) });
+    saveSettings.mutate(patch, {
+      onSuccess: () => {
+        toast.success(message);
+        // The catalog's warnings are computed against the stored boundary.
+        void queryClient.invalidateQueries({ queryKey: ["interfaces"] });
+      },
+    });
 
   const runExport = (format: "json" | "csv") =>
     createExport.mutate(
@@ -99,6 +114,17 @@ export function SettingsView() {
         status={status}
         saving={saveSettings.isPending}
         onEnabled={(checked) => persist({ enabled: checked }, checked ? "Collection enabled" : "Collection paused")}
+      />
+
+      <BoundaryCard
+        settings={settings}
+        saving={saveSettings.isPending}
+        onSave={(interfaces) =>
+          persist(
+            { boundary: { interfaces } },
+            interfaces.length ? "Device boundary updated" : "Boundary follows the default route",
+          )
+        }
       />
 
       <DomainCard
@@ -244,31 +270,6 @@ function CollectionCard({
       />
       <SettingRow
         column
-        title="Device boundary"
-        detail="Interfaces where traffic enters or leaves this ZimaOS device. Direction is always relative to this boundary."
-        control={
-          settings ? (
-            <div className="flex flex-wrap gap-1.5">
-              {settings.boundary.interfaces.length ? (
-                settings.boundary.interfaces.map((name) => (
-                  <span key={name} className="inline-flex items-center gap-1 rounded-full bg-secondary px-2 py-0.5 text-xs text-secondary-foreground">
-                    <Wifi className="size-3" />
-                    {name}
-                  </span>
-                ))
-              ) : (
-                <span className="inline-flex items-center rounded-full bg-secondary px-2 py-0.5 text-xs text-muted-foreground">
-                  Automatic · follow default route
-                </span>
-              )}
-            </div>
-          ) : (
-            <Skeleton className="h-6 w-40 rounded-full" />
-          )
-        }
-      />
-      <SettingRow
-        column
         last
         title="Collector status"
         detail="Attach state, map occupancy and observation gaps."
@@ -306,6 +307,133 @@ function CollectionCard({
           )
         }
       />
+    </SettingsCard>
+  );
+}
+
+const INTERFACE_KIND_LABELS: Record<InterfaceKind, string> = {
+  loopback: "loopback",
+  physical: "physical",
+  bridge: "bridge",
+  docker_bridge: "docker",
+  bond: "bond",
+  vlan: "vlan",
+  tun_tap: "tun/tap",
+  wireguard: "wireguard",
+  veth: "veth",
+  virtual: "virtual",
+  other: "",
+};
+
+function interfaceState(info: InterfaceInfo): string {
+  if (info.attached) return "attached";
+  if (info.ingress_attached || info.egress_attached) return "partially attached";
+  return info.up ? "up" : "down";
+}
+
+/** Device Boundary picker: choose the interfaces whose traffic is observed. */
+function BoundaryCard({
+  settings,
+  saving,
+  onSave,
+}: {
+  settings: SettingsData | undefined;
+  saving: boolean;
+  onSave: (interfaces: string[]) => void;
+}) {
+  const catalogQuery = useInterfaces();
+  const catalog = catalogQuery.data;
+  const selected = settings?.boundary.interfaces ?? [];
+  const toggle = (name: string) => {
+    const next = selected.includes(name)
+      ? selected.filter((existing) => existing !== name)
+      : [...selected, name];
+    onSave(next);
+  };
+
+  return (
+    <SettingsCard
+      title="Device boundary"
+      description="Interfaces where traffic enters or leaves this ZimaOS device. Direction is always relative to this boundary."
+    >
+      <SettingRow
+        column
+        title="Observed interfaces"
+        detail="Leave every checkbox empty to follow the default route automatically. docker0, bridges and VPN tunnels attach when they appear."
+        control={
+          catalog ? (
+            <div className="grid gap-1.5">
+              <label className="flex items-center gap-2 text-xs text-muted-foreground">
+                <input
+                  type="checkbox"
+                  className="size-3.5 accent-primary"
+                  checked={selected.length === 0}
+                  disabled={saving}
+                  onChange={() => onSave([])}
+                />
+                Automatic · follow the default route
+              </label>
+              {catalog.interfaces.map((info) => (
+                <label
+                  key={info.name}
+                  className={cn(
+                    "flex items-center justify-between gap-2 rounded-md border px-2.5 py-1.5 text-xs",
+                    selected.includes(info.name) && "border-primary/40 bg-secondary/60",
+                  )}
+                >
+                  <span className="inline-flex min-w-0 items-center gap-1.5">
+                    <input
+                      type="checkbox"
+                      className="size-3.5 accent-primary"
+                      checked={selected.includes(info.name)}
+                      disabled={saving}
+                      onChange={() => toggle(info.name)}
+                    />
+                    <Wifi className="size-3.5 shrink-0 text-muted-foreground" />
+                    <span className="truncate font-medium">{info.name}</span>
+                    {INTERFACE_KIND_LABELS[info.kind] && (
+                      <span className="text-2xs text-muted-foreground">
+                        {INTERFACE_KIND_LABELS[info.kind]}
+                      </span>
+                    )}
+                    {info.default_route && <Badge variant="secondary">default</Badge>}
+                  </span>
+                  <span className="shrink-0 text-2xs text-muted-foreground">
+                    {interfaceState(info)}
+                  </span>
+                </label>
+              ))}
+            </div>
+          ) : (
+            <div className="flex flex-col gap-2 py-1">
+              {Array.from({ length: 3 }, (_, index) => (
+                <Skeleton key={index} className="h-7" />
+              ))}
+            </div>
+          )
+        }
+      />
+      {catalog?.warnings.length ? (
+        <SettingRow
+          column
+          last
+          title="Warnings"
+          detail="These combinations can double-count or miss traffic."
+          control={
+            <ul className="grid gap-1.5">
+              {catalog.warnings.map((warning) => (
+                <li
+                  key={`${warning.kind}:${warning.interfaces.join(",")}`}
+                  className="flex items-start gap-2 text-2xs leading-relaxed text-warning"
+                >
+                  <TriangleAlert className="mt-px size-3.5 shrink-0" />
+                  <span>{warning.message}</span>
+                </li>
+              ))}
+            </ul>
+          }
+        />
+      ) : null}
     </SettingsCard>
   );
 }
