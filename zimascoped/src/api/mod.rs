@@ -44,7 +44,13 @@ use axum::{
 };
 use tokio::sync::broadcast;
 use tokio_stream::{Stream, StreamExt, wrappers::BroadcastStream};
-use tower_http::services::{ServeDir, ServeFile};
+use tower_http::{
+    compression::{
+        CompressionLayer,
+        predicate::{NotForContentType, Predicate, SizeAbove},
+    },
+    services::{ServeDir, ServeFile},
+};
 
 use zimascope_common::{
     kernel_abi::{BucketKey, RuleAction, RuleState},
@@ -350,6 +356,7 @@ pub fn router(state: ApiState) -> Router {
     api_routes(state)
         .fallback(not_found)
         .method_not_allowed_fallback(method_not_allowed)
+        .layer(compression_layer())
 }
 
 /// Builds the production router: the `/v1` API plus the built frontend served
@@ -362,6 +369,19 @@ pub fn router_with_ui(state: ApiState, ui_dir: &Path) -> Router {
         .route("/v1/{*path}", any(not_found))
         .fallback_service(ServeDir::new(ui_dir).not_found_service(ServeFile::new(index)))
         .method_not_allowed_fallback(method_not_allowed)
+        .layer(compression_layer())
+}
+
+/// Gzip for every response that benefits, including the SSE tick stream.
+///
+/// The default predicate deliberately skips `text/event-stream`; the tick
+/// payload is the largest thing this API serves, so it opts back in. gRPC and
+/// images stay uncompressed, and tiny responses stay below the size floor.
+fn compression_layer() -> CompressionLayer<impl Predicate> {
+    let predicate = SizeAbove::default()
+        .and(NotForContentType::GRPC)
+        .and(NotForContentType::IMAGES);
+    CompressionLayer::new().gzip(true).compress_when(predicate)
 }
 
 /// All API routes, in one place so the dev and production routers stay in
@@ -1464,6 +1484,45 @@ mod tests {
         assert_eq!(body["collector"]["state"], "running");
         assert_eq!(body["collector"]["map"]["capacity"], 128);
         assert_eq!(body["collector"]["interfaces"][0]["name"], "eth0");
+    }
+
+    #[tokio::test]
+    async fn compression_negotiates_gzip_including_sse() {
+        let state = state();
+
+        let request = Request::builder()
+            .uri("/v1/status")
+            .header(header::ACCEPT_ENCODING, "gzip")
+            .body(Body::empty())
+            .expect("valid request");
+        let response = call(&state, request).await;
+        assert_eq!(content_encoding(&response).as_deref(), Some("gzip"));
+
+        let request = Request::builder()
+            .uri("/v1/stream")
+            .header(header::ACCEPT_ENCODING, "gzip")
+            .body(Body::empty())
+            .expect("valid request");
+        let response = call(&state, request).await;
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some("text/event-stream")
+        );
+        assert_eq!(content_encoding(&response).as_deref(), Some("gzip"));
+
+        let response = call(&state, get("/v1/status")).await;
+        assert_eq!(content_encoding(&response), None);
+    }
+
+    fn content_encoding(response: &Response) -> Option<String> {
+        response
+            .headers()
+            .get(header::CONTENT_ENCODING)
+            .and_then(|value| value.to_str().ok())
+            .map(ToOwned::to_owned)
     }
 
     #[tokio::test]
