@@ -15,7 +15,7 @@ use zimascope_common::{
     model::{self, ApplicationHealth, InterfaceHealth},
 };
 
-use super::KernelSource;
+use super::{InterfaceSelector, KernelSource};
 use crate::policy::PolicyOp;
 
 #[derive(Default)]
@@ -26,6 +26,7 @@ struct State {
     services: Vec<kernel_abi::ServiceSample>,
     stats: KernelStats,
     interfaces: Vec<InterfaceHealth>,
+    boundary: Vec<String>,
     application_attached: bool,
     udp_attached: bool,
     application_error: Option<Box<str>>,
@@ -200,6 +201,11 @@ impl InMemoryHandle {
                 last_error: None,
             });
     }
+
+    /// Labels of the boundary selectors the last reconcile received.
+    pub fn boundary(&self) -> Vec<String> {
+        self.state.lock().expect("test state").boundary.clone()
+    }
 }
 
 impl KernelSource for InMemoryKernelSource {
@@ -261,6 +267,12 @@ impl KernelSource for InMemoryKernelSource {
             bail!("injected kernel stats read failure");
         }
         Ok(state.stats)
+    }
+
+    fn reconcile(&mut self, selectors: &[InterfaceSelector]) -> Result<()> {
+        self.state.lock().expect("test state").boundary =
+            selectors.iter().map(InterfaceSelector::label).collect();
+        Ok(())
     }
 
     fn attachment_health(&self) -> Vec<InterfaceHealth> {

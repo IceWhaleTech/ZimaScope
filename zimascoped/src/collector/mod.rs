@@ -48,15 +48,42 @@ pub struct CollectorConfig {
     pub interfaces: Vec<InterfaceSelector>,
     pub idle_timeout: Duration,
     pub collection_interval: Duration,
+    /// How often the boundary selectors are re-resolved so interfaces that
+    /// appear later (docker0, a VPN tunnel) attach without a restart.
+    pub reconcile_interval: Duration,
     /// Hot-swappable fingerprint library shared with the local API.
     pub fingerprints: SharedFingerprints,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum InterfaceSelector {
     DefaultRoute,
     Name(Box<str>),
     Index(NonZeroU32),
+}
+
+impl InterfaceSelector {
+    /// Maps persisted boundary names to selectors; an empty list follows the
+    /// default route (the safe default from PRD 8.1.3).
+    pub fn from_names(names: &[String]) -> Vec<Self> {
+        if names.is_empty() {
+            vec![Self::DefaultRoute]
+        } else {
+            names
+                .iter()
+                .map(|name| Self::Name(name.as_str().into()))
+                .collect()
+        }
+    }
+
+    /// Human-readable selector label used in logs and health.
+    pub fn label(&self) -> String {
+        match self {
+            Self::DefaultRoute => "default route".to_owned(),
+            Self::Name(name) => name.to_string(),
+            Self::Index(index) => format!("ifindex {}", index.get()),
+        }
+    }
 }
 
 impl Default for CollectorConfig {
@@ -65,6 +92,7 @@ impl Default for CollectorConfig {
             interfaces: vec![InterfaceSelector::DefaultRoute],
             idle_timeout: Duration::from_secs(30),
             collection_interval: Duration::from_secs(1),
+            reconcile_interval: Duration::from_secs(5),
             fingerprints: fingerprint::shared_default(),
         }
     }
@@ -108,6 +136,14 @@ pub(crate) trait KernelSource: Send {
 
     fn read_stats(&mut self) -> Result<kernel_abi::KernelStats>;
     fn attachment_health(&self) -> Vec<InterfaceHealth>;
+
+    /// Re-resolves the boundary selectors and incrementally attaches or
+    /// detaches hooks. Failures are reported as degraded interface health, not
+    /// as worker errors; the next reconcile retries.
+    fn reconcile(&mut self, _selectors: &[InterfaceSelector]) -> Result<()> {
+        Ok(())
+    }
+
     fn application_health(&self) -> ApplicationHealth;
     fn apply_policy(&mut self, operations: &[PolicyOp]) -> Result<()>;
     fn read_rule_states(
@@ -139,6 +175,10 @@ enum PolicyCommand {
         keys: Vec<kernel_abi::BucketKey>,
         reply: oneshot::Sender<Result<Vec<Option<kernel_abi::RuleState>>, String>>,
     },
+    SetBoundary {
+        selectors: Vec<InterfaceSelector>,
+        reply: oneshot::Sender<Result<(), String>>,
+    },
 }
 
 impl PolicyHandle {
@@ -155,6 +195,13 @@ impl PolicyHandle {
     ) -> Result<Vec<Option<kernel_abi::RuleState>>> {
         let keys = keys.to_vec();
         self.request(move |reply| PolicyCommand::RuleStates { keys, reply })
+            .await
+    }
+
+    /// Replaces the boundary selector set and reconciles attachments now, so
+    /// settings changes take effect without restarting the daemon.
+    pub async fn set_boundary(&self, selectors: Vec<InterfaceSelector>) -> Result<()> {
+        self.request(move |reply| PolicyCommand::SetBoundary { selectors, reply })
             .await
     }
 
@@ -210,6 +257,12 @@ impl Collector {
                         Some(PolicyCommand::RuleStates { keys, reply }) => {
                             let result = core
                                 .read_rule_states(&keys)
+                                .map_err(|error| format!("{error:#}"));
+                            let _ = reply.send(result);
+                        }
+                        Some(PolicyCommand::SetBoundary { selectors, reply }) => {
+                            let result = core
+                                .set_boundary(selectors)
                                 .map_err(|error| format!("{error:#}"));
                             let _ = reply.send(result);
                         }
@@ -275,6 +328,10 @@ struct CollectorCore {
     domains: DomainDecoder,
     fingerprints: SharedFingerprints,
     health: HealthTracker,
+    /// Configured boundary selectors, re-resolved on every reconcile.
+    boundary: Vec<InterfaceSelector>,
+    reconcile_interval: Duration,
+    last_reconcile: Instant,
     sequence: u64,
     last_poll: Instant,
     map_entries: usize,
@@ -317,6 +374,9 @@ impl CollectorCore {
             domains: DomainDecoder::new(),
             fingerprints: config.fingerprints,
             health: HealthTracker::new(),
+            boundary: config.interfaces,
+            reconcile_interval: config.reconcile_interval,
+            last_reconcile: Instant::now(),
             sequence: 0,
             last_poll: Instant::now(),
             map_entries: 0,
@@ -343,6 +403,19 @@ impl CollectorCore {
         let interval = poll_started.saturating_duration_since(self.last_poll);
         self.last_poll = poll_started;
         self.sequence = self.sequence.wrapping_add(1);
+
+        // Interfaces may appear or disappear between polls (docker0, VPN
+        // tunnels, USB NICs); re-resolve on the reconcile cadence and attach
+        // or detach the difference without touching the rest.
+        if !self.reconcile_interval.is_zero()
+            && poll_started.saturating_duration_since(self.last_reconcile)
+                >= self.reconcile_interval
+        {
+            self.last_reconcile = poll_started;
+            if let Err(error) = self.source.reconcile(&self.boundary) {
+                eprintln!("zimascoped: boundary reconcile failed: {error:#}");
+            }
+        }
 
         // Refresh pre-existing listener ownership before Flow reconciliation,
         // so refreshed entries outlive this poll's owner-cache purge.
@@ -496,6 +569,13 @@ impl CollectorCore {
         })
     }
 
+    /// Replaces the boundary selector set and reconciles attachments now.
+    fn set_boundary(&mut self, selectors: Vec<InterfaceSelector>) -> Result<()> {
+        self.boundary = selectors;
+        self.last_reconcile = Instant::now();
+        self.source.reconcile(&self.boundary)
+    }
+
     /// Reads kernel counters for the requested rule-direction pairs.
     fn read_rule_states(
         &mut self,
@@ -561,7 +641,7 @@ mod tests {
     };
 
     use super::{
-        Collector, CollectorConfig, CollectorCore,
+        Collector, CollectorConfig, CollectorCore, InterfaceSelector,
         test_source::{
             InMemoryKernelSource, abi_dns_sample, abi_key, abi_owner_key, abi_owner_value,
             abi_tls_sample, abi_value,
@@ -594,6 +674,57 @@ mod tests {
         let health = collector.shutdown().await.expect("shutdown succeeds");
         assert_eq!(health.state, CollectorState::Stopped);
         assert_eq!(counter.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn boundary_names_map_to_selectors_or_the_default_route() {
+        assert_eq!(
+            InterfaceSelector::from_names(&[]),
+            vec![InterfaceSelector::DefaultRoute]
+        );
+        assert_eq!(
+            InterfaceSelector::from_names(&["eth0".to_owned(), "docker0".to_owned()]),
+            vec![
+                InterfaceSelector::Name("eth0".into()),
+                InterfaceSelector::Name("docker0".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn periodic_reconcile_re_resolves_the_boundary() {
+        let source = InMemoryKernelSource::new().with_interface(7, "eth0");
+        let handle = source.handle();
+        let mut core = CollectorCore::from_source(
+            CollectorConfig {
+                interfaces: vec![InterfaceSelector::Name("docker0".into())],
+                reconcile_interval: Duration::from_millis(1),
+                ..CollectorConfig::default()
+            },
+            Box::new(source),
+        );
+
+        std::thread::sleep(Duration::from_millis(5));
+        core.poll_once();
+
+        assert_eq!(handle.boundary(), vec!["docker0".to_owned()]);
+    }
+
+    #[tokio::test]
+    async fn boundary_commands_reconcile_the_running_source() {
+        let source = InMemoryKernelSource::new().with_interface(7, "eth0");
+        let handle = source.handle();
+        let core = open_collector(source, Duration::from_secs(30));
+        let (collector, _batches) = Collector::run_worker(core, Duration::from_millis(10));
+
+        collector
+            .policy_handle()
+            .set_boundary(vec![InterfaceSelector::Name("docker0".into())])
+            .await
+            .expect("boundary applied");
+
+        assert_eq!(handle.boundary(), vec!["docker0".to_owned()]);
+        collector.shutdown().await.expect("shutdown succeeds");
     }
 
     #[tokio::test]

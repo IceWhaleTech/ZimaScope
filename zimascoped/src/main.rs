@@ -5,7 +5,7 @@ use std::{
 };
 
 use zimascoped::{
-    Collector, CollectorConfig, FingerprintLibrary,
+    Collector, CollectorConfig, FingerprintLibrary, InterfaceSelector,
     api::{self, ApiConfig, ApiState},
 };
 
@@ -132,7 +132,11 @@ async fn main() {
         }
     }
 
+    // The persisted Device Boundary decides where hooks attach; an empty list
+    // keeps the safe default of following the default route.
+    let interfaces = InterfaceSelector::from_names(&state.boundary_interfaces());
     let (collector, mut batches) = match Collector::start(CollectorConfig {
+        interfaces,
         fingerprints,
         ..CollectorConfig::default()
     })

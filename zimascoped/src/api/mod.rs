@@ -59,7 +59,7 @@ use zimascope_common::{
 };
 
 use crate::{
-    FingerprintLibrary, PolicyHandle, SharedFingerprints,
+    FingerprintLibrary, InterfaceSelector, PolicyHandle, SharedFingerprints,
     cgroup::CgroupIndex,
     collector::interfaces,
     policy::{
@@ -252,6 +252,25 @@ impl ApiState {
     /// Records why collection is unavailable so `/v1/status` can explain it.
     pub fn set_collector_error(&self, error: impl Into<String>) {
         self.lock().collector_error = Some(error.into());
+    }
+
+    /// Boundary interface names persisted in settings.
+    ///
+    /// An empty list means "follow the default route"; the daemon turns names
+    /// into selectors with [`InterfaceSelector::from_names`].
+    pub fn boundary_interfaces(&self) -> Vec<String> {
+        self.lock().settings.boundary.interfaces.clone()
+    }
+
+    /// Pushes the current boundary selectors to a running collector.
+    async fn apply_boundary(&self, selectors: Vec<InterfaceSelector>) {
+        let handle = self.lock().policy_handle.clone();
+        let Some(handle) = handle else {
+            return;
+        };
+        if let Err(error) = handle.set_boundary(selectors).await {
+            eprintln!("zimascoped: apply boundary interfaces: {error:#}");
+        }
     }
 
     fn subscribe(&self) -> broadcast::Receiver<Arc<StreamEvent>> {
@@ -798,15 +817,18 @@ async fn put_settings(
     State(state): State<ApiState>,
     ApiJson(body): ApiJson<Settings>,
 ) -> Result<Json<Settings>, ApiError> {
-    let settings = {
+    let (settings, selectors) = {
         let mut inner = state.lock();
         let mut settings = body;
         settings.normalize();
         settings.validate()?;
         apply_settings(&mut inner, settings)?;
-        inner.settings.clone()
+        let settings = inner.settings.clone();
+        let selectors = InterfaceSelector::from_names(&settings.boundary.interfaces);
+        (settings, selectors)
     };
     let _ = state.apply_policy().await;
+    state.apply_boundary(selectors).await;
     Ok(Json(settings))
 }
 
@@ -814,16 +836,19 @@ async fn patch_settings(
     State(state): State<ApiState>,
     ApiJson(patch): ApiJson<SettingsPatch>,
 ) -> Result<Json<Settings>, ApiError> {
-    let settings = {
+    let (settings, selectors) = {
         let mut inner = state.lock();
         let mut settings = inner.settings.clone();
         patch.apply(&mut settings);
         settings.normalize();
         settings.validate()?;
         apply_settings(&mut inner, settings)?;
-        inner.settings.clone()
+        let settings = inner.settings.clone();
+        let selectors = InterfaceSelector::from_names(&settings.boundary.interfaces);
+        (settings, selectors)
     };
     let _ = state.apply_policy().await;
+    state.apply_boundary(selectors).await;
     Ok(Json(settings))
 }
 

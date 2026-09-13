@@ -8,7 +8,7 @@
 
 use std::{collections::HashMap, fs, io, num::NonZeroU32, path::Path};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 
 pub const SYS_CLASS_NET: &str = "/sys/class/net";
 pub const PROC_NET_ROUTE: &str = "/proc/net/route";
@@ -273,20 +273,87 @@ pub fn select_default_route(
         .or_else(|| candidates.first().copied())
 }
 
-/// Resolves the host default-route interface name, if any.
-pub fn system_default_route() -> Result<String> {
-    let infos = system().context("enumerate /sys/class/net")?;
-    let contents = fs::read_to_string(PROC_NET_ROUTE).context("read /proc/net/route")?;
+/// Resolves the default-route interface name under `root`, if any.
+pub fn default_route_for(root: &Path, route_file: &Path) -> io::Result<Option<String>> {
+    let infos = enumerate(root, route_file)?;
+    let contents = fs::read_to_string(route_file).unwrap_or_default();
     let routes = parse_default_routes(&contents);
     let kinds: HashMap<&str, InterfaceKind> = infos
         .iter()
         .map(|info| (info.name.as_str(), info.kind))
         .collect();
-    select_default_route(&routes, |name| {
+    Ok(select_default_route(&routes, |name| {
         kinds.get(name).copied().unwrap_or(InterfaceKind::Other)
     })
-    .map(|route| route.name.clone())
-    .context("no default route interface found in /proc/net/route")
+    .map(|route| route.name.clone()))
+}
+
+/// Interfaces that exist now and selectors that are not present yet.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ResolvedBoundary {
+    pub interfaces: Vec<(NonZeroU32, String)>,
+    /// Human-readable selector labels (a missing docker0, a VPN tunnel that is
+    /// not up yet).
+    pub pending: Vec<String>,
+}
+
+/// Best-effort resolution of the configured boundary selectors.
+///
+/// Callers attach what exists and retry the pending set on the next reconcile
+/// instead of failing startup.
+pub fn resolve_selectors(
+    root: &Path,
+    route_file: &Path,
+    selectors: &[super::InterfaceSelector],
+) -> Result<ResolvedBoundary> {
+    use super::InterfaceSelector;
+
+    if selectors.is_empty() {
+        bail!("no Device Boundary interfaces configured");
+    }
+
+    let mut resolved: Vec<(NonZeroU32, String)> = Vec::new();
+    let mut pending = Vec::new();
+    for selector in selectors {
+        let name = match selector {
+            InterfaceSelector::DefaultRoute => {
+                match default_route_for(root, route_file).unwrap_or(None) {
+                    Some(name) => name,
+                    None => {
+                        pending.push("default route".to_owned());
+                        continue;
+                    }
+                }
+            }
+            InterfaceSelector::Name(name) => name.to_string(),
+            InterfaceSelector::Index(index) => match name_for_index(root, index.get()) {
+                Ok(name) => name,
+                Err(_) => {
+                    pending.push(format!("ifindex {}", index.get()));
+                    continue;
+                }
+            },
+        };
+        match ifindex_for_name(root, &name) {
+            Ok(ifindex) => resolved.push((ifindex, name)),
+            Err(_) => pending.push(name),
+        }
+    }
+
+    for (position, (_, name)) in resolved.iter().enumerate() {
+        if resolved
+            .iter()
+            .take(position)
+            .any(|(_, other)| other == name)
+        {
+            bail!("duplicate Device Boundary interface {name:?}");
+        }
+    }
+
+    Ok(ResolvedBoundary {
+        interfaces: resolved,
+        pending,
+    })
 }
 
 /// Resolves an interface name to its ifindex under `root`.
@@ -668,6 +735,71 @@ wg0\t00000000\t00000000\t0003\t0\t0\t600\t00000000\t0\t0\t0\n";
         assert_eq!(infos[1].name, "docker0");
         assert_eq!(infos[1].kind, InterfaceKind::DockerBridge);
         assert!(!infos[1].default_route, "the physical default route wins");
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn resolve_selectors_keeps_missing_interfaces_pending() {
+        use crate::collector::InterfaceSelector;
+
+        let root = temp_dir("selectors");
+        fs::create_dir_all(root.join("eth0")).expect("create eth0");
+        fs::write(root.join("eth0/ifindex"), "2\n").expect("write ifindex");
+        fs::write(root.join("eth0/type"), "1\n").expect("write type");
+        fs::create_dir_all(root.join("eth0/device")).expect("create device");
+        let route = root.join("route");
+        fs::write(
+            &route,
+            "Iface\tDestination\tGateway\tFlags\tRefCnt\tUse\tMetric\tMask\tMTU\tWindow\tIRTT\n\
+             eth0\t00000000\t0102A8C0\t0003\t0\t0\t100\t00000000\t0\t0\t0\n",
+        )
+        .expect("write route");
+
+        let boundary = resolve_selectors(
+            &root,
+            &route,
+            &[
+                InterfaceSelector::Name("docker0".into()),
+                InterfaceSelector::Index(NonZeroU32::new(9).expect("nonzero")),
+                InterfaceSelector::Name("eth0".into()),
+            ],
+        )
+        .expect("resolve");
+        assert_eq!(
+            boundary.interfaces,
+            vec![(NonZeroU32::new(2).expect("nonzero"), "eth0".to_owned())]
+        );
+        assert_eq!(
+            boundary.pending,
+            vec!["docker0".to_owned(), "ifindex 9".to_owned()]
+        );
+
+        let boundary =
+            resolve_selectors(&root, &route, &[InterfaceSelector::DefaultRoute]).expect("resolve");
+        assert_eq!(
+            boundary.interfaces,
+            vec![(NonZeroU32::new(2).expect("nonzero"), "eth0".to_owned())]
+        );
+        assert!(boundary.pending.is_empty());
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn resolve_selectors_reject_duplicates() {
+        use crate::collector::InterfaceSelector;
+
+        let root = temp_dir("selectors-dup");
+        fs::create_dir_all(root.join("eth0")).expect("create eth0");
+        fs::write(root.join("eth0/ifindex"), "2\n").expect("write ifindex");
+        let route = root.join("route");
+
+        let selectors = vec![
+            InterfaceSelector::Name("eth0".into()),
+            InterfaceSelector::Name("eth0".into()),
+        ];
+        assert!(resolve_selectors(&root, &route, &selectors).is_err());
 
         let _ = fs::remove_dir_all(&root);
     }

@@ -8,7 +8,7 @@
 //! back to the legacy netlink classification path, where a `clsact` qdisc is
 //! still added.
 
-use std::{fs, num::NonZeroU32, path::Path, ptr};
+use std::{collections::HashMap, fs, num::NonZeroU32, path::Path, ptr};
 
 use anyhow::{Context, Result, bail};
 use aya::{
@@ -151,6 +151,8 @@ struct AttachedInterface {
     tcx: bool,
     ingress: Option<TcLink>,
     egress: Option<TcLink>,
+    /// Why the last attach attempt failed, when it did.
+    last_error: Option<Box<str>>,
 }
 
 impl AyaKernelSource {
@@ -215,9 +217,16 @@ impl AyaKernelSource {
             Ok(link) => (Some(link), None),
             Err(error) => (None, Some(format!("{error:#}").into())),
         };
-
-        let interfaces = resolve_interfaces(&config.interfaces)?;
-        let attached = attach_interfaces(&mut ebpf, &interfaces)
+        let root = Path::new(SYS_CLASS_NET);
+        let route = Path::new(interfaces::PROC_NET_ROUTE);
+        let boundary = interfaces::resolve_selectors(root, route, &config.interfaces)?;
+        if !boundary.pending.is_empty() {
+            eprintln!(
+                "zimascoped: boundary interfaces not present yet: {}",
+                boundary.pending.join(", ")
+            );
+        }
+        let attached = attach_interfaces(&mut ebpf, &boundary.interfaces)
             .context("attach ZimaScope TC ingress/egress hooks")?;
 
         Ok(Self {
@@ -339,7 +348,7 @@ impl KernelSource for AyaKernelSource {
                     name: attached.name.clone(),
                     ingress_attached: false,
                     egress_attached: false,
-                    last_error: None,
+                    last_error: attached.last_error.clone(),
                 };
 
                 // The legacy netlink path cannot be queried portably; the
@@ -347,6 +356,12 @@ impl KernelSource for AyaKernelSource {
                 if !attached.tcx {
                     health.ingress_attached = attached.ingress.is_some();
                     health.egress_attached = attached.egress.is_some();
+                    return health;
+                }
+
+                // A failed attach already carries the root cause; do not
+                // replace it with a generic "no longer attached" query result.
+                if attached.ingress.is_none() || attached.egress.is_none() {
                     return health;
                 }
 
@@ -382,6 +397,66 @@ impl KernelSource for AyaKernelSource {
             udp_attached: self.udp_link.is_some(),
             last_error: self.owner_error.clone().or_else(|| self.udp_error.clone()),
         }
+    }
+
+    fn reconcile(&mut self, selectors: &[InterfaceSelector]) -> Result<()> {
+        let root = Path::new(SYS_CLASS_NET);
+        let route = Path::new(interfaces::PROC_NET_ROUTE);
+        let boundary = interfaces::resolve_selectors(root, route, selectors)?;
+        if !boundary.pending.is_empty() {
+            eprintln!(
+                "zimascoped: boundary interfaces not present yet: {}",
+                boundary.pending.join(", ")
+            );
+        }
+
+        let tcx = kernel_supports_tcx();
+        let wanted: HashMap<u32, &str> = boundary
+            .interfaces
+            .iter()
+            .map(|(ifindex, name)| (ifindex.get(), name.as_str()))
+            .collect();
+        let mut current: HashMap<u32, AttachedInterface> = std::mem::take(&mut self.attached)
+            .into_iter()
+            .map(|interface| (interface.ifindex.get(), interface))
+            .collect();
+
+        current.retain(|ifindex, interface| {
+            if wanted.contains_key(ifindex) {
+                return true;
+            }
+            detach_links(interface);
+            false
+        });
+
+        for (ifindex, name) in &boundary.interfaces {
+            let healthy = current
+                .get(&ifindex.get())
+                .is_some_and(|interface| interface.ingress.is_some() && interface.egress.is_some());
+            if healthy {
+                continue;
+            }
+            if let Some(mut stale) = current.remove(&ifindex.get()) {
+                detach_links(&mut stale);
+            }
+            let entry = match attach_one(&mut self.ebpf, *ifindex, name, tcx) {
+                Ok(entry) => entry,
+                Err(error) => AttachedInterface {
+                    ifindex: *ifindex,
+                    name: name.as_str().into(),
+                    tcx,
+                    ingress: None,
+                    egress: None,
+                    last_error: Some(format!("{error:#}").into()),
+                },
+            };
+            current.insert(ifindex.get(), entry);
+        }
+
+        let mut attached: Vec<AttachedInterface> = current.into_values().collect();
+        attached.sort_by_key(|interface| interface.ifindex);
+        self.attached = attached;
+        Ok(())
     }
 
     fn apply_policy(&mut self, operations: &[PolicyOp]) -> Result<()> {
@@ -841,7 +916,18 @@ fn attach_one(
         tcx,
         ingress: Some(ingress),
         egress: Some(egress),
+        last_error: None,
     })
+}
+
+/// Detaches both hooks of one interface, ignoring per-link errors.
+fn detach_links(interface: &mut AttachedInterface) {
+    for link in [interface.ingress.take(), interface.egress.take()]
+        .into_iter()
+        .flatten()
+    {
+        let _ = link.detach();
+    }
 }
 
 fn attach_hook(
@@ -890,35 +976,4 @@ fn detach_all(attached: &mut Vec<AttachedInterface>) {
             let _ = link.detach();
         }
     }
-}
-
-/// Resolves configured selectors into `(ifindex, name)` pairs.
-fn resolve_interfaces(selectors: &[InterfaceSelector]) -> Result<Vec<(NonZeroU32, String)>> {
-    if selectors.is_empty() {
-        bail!("no Device Boundary interfaces configured");
-    }
-
-    let root = Path::new(SYS_CLASS_NET);
-    let mut resolved = Vec::with_capacity(selectors.len());
-    for selector in selectors {
-        let name = match selector {
-            InterfaceSelector::DefaultRoute => interfaces::system_default_route()?,
-            InterfaceSelector::Name(name) => name.to_string(),
-            InterfaceSelector::Index(index) => interfaces::name_for_index(root, index.get())?,
-        };
-        let ifindex = interfaces::ifindex_for_name(root, &name)?;
-        resolved.push((ifindex, name));
-    }
-
-    for (position, (_, name)) in resolved.iter().enumerate() {
-        if resolved
-            .iter()
-            .take(position)
-            .any(|(_, other)| other == name)
-        {
-            bail!("duplicate Device Boundary interface {name:?}");
-        }
-    }
-
-    Ok(resolved)
 }
