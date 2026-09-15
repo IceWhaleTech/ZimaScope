@@ -256,9 +256,9 @@ function CollectionCard({
 }) {
   const health = status?.collector ?? null;
   return (
-    <SettingsCard title="Collection" description="Whether ZimaScope observes the device boundary.">
+    <SettingsCard title="Collection" description="Whether Z-Scope observes the device boundary.">
       <SettingRow
-        title="Enable ZimaScope"
+        title="Enable Z-Scope"
         detail="Pausing stops collection; retained history stays available."
         control={
           settings ? (

@@ -1,6 +1,6 @@
 # Rust Collector Design
 
-This document is the implementation contract for the ZimaScope collection path. It complements [ADR-0001](../adr/0001-map-aggregation-and-single-collector.md).
+This document is the implementation contract for the Z-Scope collection path. It complements [ADR-0001](../adr/0001-map-aggregation-and-single-collector.md).
 
 ## Module shape
 
@@ -432,7 +432,7 @@ use anyhow::{bail, Context, Result};
 impl CollectorCore {
     fn open(config: CollectorConfig) -> Result<Self> {
         let mut source = AyaKernelSource::load()
-            .context("load ZimaScope eBPF program")?;
+            .context("load Z-Scope eBPF program")?;
 
         let abi = source
             .read_abi_metadata()
@@ -448,7 +448,7 @@ impl CollectorCore {
 
         source
             .attach(&config.interfaces)
-            .context("attach ZimaScope TC ingress/egress hooks")?;
+            .context("attach Z-Scope TC ingress/egress hooks")?;
 
         Ok(Self::from_source(config, Box::new(source)))
     }

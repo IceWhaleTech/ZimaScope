@@ -1,4 +1,4 @@
-//! ZimaScope eBPF object entry points.
+//! Z-Scope eBPF object entry points.
 
 #![no_std]
 #![no_main]

@@ -1,5 +1,5 @@
 /**
- * ZimaScope — local-first network observability at the device boundary.
+ * Z-Scope — local-first network observability at the device boundary.
  * Routes, providers and the data layer meet here.
  */
 

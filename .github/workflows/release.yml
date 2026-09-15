@@ -1,4 +1,4 @@
-name: Release ZimaScope
+name: Release Z-Scope
 
 on:
   push:
@@ -38,7 +38,7 @@ jobs:
           version="$(awk '/^\[workspace.package\]/{found=1} found && /^version =/{gsub(/"/, "", $3); print $3; exit}' Cargo.toml)"
           test -n "${version}"
           echo "version=${version}" >> "$GITHUB_OUTPUT"
-          echo "building ZimaScope ${version}"
+          echo "building Z-Scope ${version}"
 
       - name: Install nightly Rust for the eBPF target
         uses: dtolnay/rust-toolchain@nightly

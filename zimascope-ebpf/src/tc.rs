@@ -3,7 +3,7 @@
 //! Every path passes the packet with `TC_ACT_UNSPEC` unless a Traffic Rule
 //! drops it with `TC_ACT_SHOT`. Under tcx multiprog a program that returns
 //! `TC_ACT_OK` also stops the chain, so `TC_ACT_UNSPEC` is what lets other
-//! classifiers attached to the same interface still run; when ZimaScope is
+//! classifiers attached to the same interface still run; when Z-Scope is
 //! last the kernel treats it as pass.
 //!
 //! The packet path never parses domain evidence. For candidate packets it

@@ -1,4 +1,4 @@
-# ZimaScope 前端复用方案调研
+# Z-Scope 前端复用方案调研
 
 调研日期：2026-09-11
 
@@ -8,7 +8,7 @@
 
 推荐组合：
 
-- ZimaScope Rust daemon 继续拥有采集、聚合、历史记录和权限边界。
+- Z-Scope Rust daemon 继续拥有采集、聚合、历史记录和权限边界。
 - Grafana 作为独立进程或容器运行，由 ZimaOS 反向代理到同源路径；优先直接打开完整 dashboard，也可使用 iframe/kiosk 模式嵌入。
 - 低基数时间序列通过 Prometheus/OpenMetrics 兼容端点提供；Top N、健康状态和有限结果集通过本地 JSON REST API 配合 Grafana Infinity datasource 提供。
 - dashboard、datasource 和权限设置全部 provision，用户安装后无需手工配置。
@@ -20,7 +20,7 @@
 
 ## 关键约束
 
-ZimaScope 的 UI 不只是常规指标看板。PRD 还要求 Flow 搜索/分页/详情、Domain Evidence、Observation Gap、隐私控制和导出。因此任何通用 dashboard 都只能直接覆盖“概览、趋势、Top N、健康”部分；越接近完整产品体验，越需要少量领域 UI。
+Z-Scope 的 UI 不只是常规指标看板。PRD 还要求 Flow 搜索/分页/详情、Domain Evidence、Observation Gap、隐私控制和导出。因此任何通用 dashboard 都只能直接覆盖“概览、趋势、Top N、健康”部分；越接近完整产品体验，越需要少量领域 UI。
 
 浏览器和第三方 dashboard 服务不能直接消费 Unix socket。建议 Unix socket 保留为 daemon 内部控制面，同时提供仅绑定 loopback 或仅经 ZimaOS 反向代理可达的 HTTP API。不要把每个 IP、域名或五元组编码为 Prometheus label；Prometheus 官方文档明确提醒每个唯一 label 组合都会形成新的时间序列，高基数会显著增加存储量。[Prometheus naming and labels](https://prometheus.io/docs/practices/naming/)
 
@@ -38,12 +38,12 @@ ZimaScope 的 UI 不只是常规指标看板。PRD 还要求 Flow 搜索/分页/
 
 下表中的“资源占用”是按部署构成做的相对判断，不是跨项目基准测试；这些项目的官方文档没有给出可直接横向比较的固定内存数字。
 
-| 方案 | 许可证 | 可直接复用程度 | 实时能力 | 后端数据契约 | 定制/主题 | 相对资源占用 | ZimaScope 适配度 |
+| 方案 | 许可证 | 可直接复用程度 | 实时能力 | 后端数据契约 | 定制/主题 | 相对资源占用 | Z-Scope 适配度 |
 |---|---|---:|---|---|---|---|---|
 | Grafana OSS + provisioned dashboards | AGPL-3.0 | 很高 | 自动刷新；Grafana Live 可用 WebSocket 推送 | Prometheus 等原生 datasource；Infinity 可查 JSON/REST | 深色/浅色、dashboard JSON、变量、插件；深度品牌化有限 | 中高：额外 Grafana 服务与 SQLite；官方最低建议 512 MB / 1 CPU core | **最佳短期选择** |
 | Perses standalone/embedded | Apache-2.0 | 中高 | refresh interval；主要按查询刷新 | 原生偏 Prometheus/Loki/Tempo/Pyroscope；可扩展插件 | React + MUI + ECharts，嵌入和主题控制更自然 | standalone 为中等；仅嵌入 npm 包则无额外后端但 JS 依赖较多 | **最佳原生集成备选** |
 | SigNoz frontend/整套平台 | 核心大部分 MIT，`ee/` 另有企业许可证 | 整套部署高，单独前端低 | 平台内实时/近实时查询 | 强依赖 SigNoz backend、OpenTelemetry 数据模型和完整安装栈 | UI 完整漂亮，但不是稳定的通用嵌入 SDK | 很高：完整 observability backend/存储栈；官方 Docker 前提至少 4 GB | 不推荐 |
-| Netdata Agent dashboard | GPL-3.0 | 对 Netdata 指标很高，对 ZimaScope 很低 | 强，Agent dashboard 面向实时节点指标 | Netdata 自有 chart/context/API 模型 | 现成亮/暗主题；产品级改造空间有限 | 中高：额外运行完整 Netdata Agent，且与现有采集重复 | 不推荐 |
+| Netdata Agent dashboard | GPL-3.0 | 对 Netdata 指标很高，对 Z-Scope 很低 | 强，Agent dashboard 面向实时节点指标 | Netdata 自有 chart/context/API 模型 | 现成亮/暗主题；产品级改造空间有限 | 中高：额外运行完整 Netdata Agent，且与现有采集重复 | 不推荐 |
 | Refine + UI kit | MIT | 中 | `liveProvider` 可接实时 provider | REST/GraphQL CRUD data provider，需自行定义全部资源 | 高；可选 Ant Design/MUI 等 | 低中：纯 Web app | 仅适合业务页面骨架 |
 | Apache ECharts（或 Recharts） | Apache-2.0（Recharts 为 MIT） | 低 | ECharts 支持动态与流式数据 | 任意 JS 数据，由应用负责转换 | 很高 | 低；可按需打包 | 图表层备选，不是 dashboard 复用方案 |
 
@@ -59,13 +59,13 @@ Grafana 是完整的 observability dashboard 产品，不只是 chart library。
 
 - Grafana 支持 dashboard/panel embed；嵌入视图仍需有 Viewer 权限，除非自托管实例启用 anonymous access。[Share dashboards and panels](https://grafana.com/docs/grafana/latest/dashboards/share-dashboards-panels/)
 - `allow_embedding` 默认为关闭；关闭时 Grafana 会发送 `X-Frame-Options: deny`。如果使用 iframe，必须显式开启，并同时正确处理 cookie、同源代理和 WebSocket 转发。[Grafana configuration](https://grafana.com/docs/grafana/latest/setup-grafana/configure-grafana/)
-- Grafana 支持用配置文件 provision datasource 和 dashboard，适合随 ZimaScope 版本发布只读 dashboard JSON，而不是让最终用户手工搭建。[Provision Grafana](https://grafana.com/docs/grafana/latest/administration/provisioning/)
+- Grafana 支持用配置文件 provision datasource 和 dashboard，适合随 Z-Scope 版本发布只读 dashboard JSON，而不是让最终用户手工搭建。[Provision Grafana](https://grafana.com/docs/grafana/latest/administration/provisioning/)
 - 实际集成时优先让 ZimaOS 反代 `/zimascope/` 到 Grafana，并使用同源认证；若只是打开独立 ZimaOS 应用页面，直接使用 Grafana kiosk/只读视图会比 iframe 更少出错。
 
 **数据接入**
 
 - 聚合指标最适合 Prometheus/OpenMetrics 数据源。
-- Grafana Infinity datasource 是 Grafana 官方维护的通用 REST datasource，可读取 JSON、CSV、TSV、XML 和 GraphQL，适合作为 ZimaScope 尚无原生 datasource 时的桥接层。官方同时说明它不适合处理大量数据，因此 API 必须返回 Top N、单页 Flow 或预聚合结果，不能把完整 Flow 历史交给它。[Infinity datasource docs](https://grafana.com/docs/plugins/yesoreyeram-infinity-datasource/latest/) [Infinity repository and Apache-2.0 license](https://github.com/grafana/grafana-infinity-datasource)
+- Grafana Infinity datasource 是 Grafana 官方维护的通用 REST datasource，可读取 JSON、CSV、TSV、XML 和 GraphQL，适合作为 Z-Scope 尚无原生 datasource 时的桥接层。官方同时说明它不适合处理大量数据，因此 API 必须返回 Top N、单页 Flow 或预聚合结果，不能把完整 Flow 历史交给它。[Infinity datasource docs](https://grafana.com/docs/plugins/yesoreyeram-infinity-datasource/latest/) [Infinity repository and Apache-2.0 license](https://github.com/grafana/grafana-infinity-datasource)
 - 如果后续确实需要 WebSocket push，Grafana Live 是基于 Pub/Sub 的 soft real-time 引擎，backend datasource plugin 可以向 panel streaming；它会增加插件开发和连接管理复杂度。[Grafana Live](https://grafana.com/docs/grafana/latest/setup-grafana/set-up-grafana-live/)
 
 **适合与不足**
@@ -83,27 +83,27 @@ Perses 是面向 observability 的 CNCF 项目，采用 Apache-2.0。[Perses rep
 
 - 嵌入栈当前基于 React 18、MUI、TanStack Query 和 ECharts，主题可以通过 MUI theme 与 Perses chart theme 控制。
 - 官方嵌入示例需要装配多个 Provider，且文档明确表示团队仍在减少所需 dependencies/providers；这说明嵌入 API 是正式方向，但目前还不是极简组件。[Embedding panels](https://github.com/perses/perses/blob/main/docs/embedding-panels.md)
-- 默认 datasource 生态偏 Prometheus、Loki、Tempo 和 Pyroscope。ZimaScope 若使用 Perses，聚合指标接入自然，但 Flow/Domain 的 REST 查询仍需自定义 datasource/plugin 或业务组件。
+- 默认 datasource 生态偏 Prometheus、Loki、Tempo 和 Pyroscope。Z-Scope 若使用 Perses，聚合指标接入自然，但 Flow/Domain 的 REST 查询仍需自定义 datasource/plugin 或业务组件。
 - 前端 packages 会带入 MUI、ECharts、TanStack、react-grid-layout 等依赖，bundle 不会像单一 chart library 那样小；但“嵌入模式”无需再运行完整 dashboard server。[Perses shared packages](https://github.com/perses/shared)
 
-Perses 更适合这样的目标：ZimaScope 最终要成为视觉上完全属于 ZimaOS 的产品，同时愿意自行实现约一半领域交互。若当前重点是最快出成品，它不如 Grafana；若重点是长期产品整合和宽松许可证，它优于 Grafana。
+Perses 更适合这样的目标：Z-Scope 最终要成为视觉上完全属于 ZimaOS 的产品，同时愿意自行实现约一半领域交互。若当前重点是最快出成品，它不如 Grafana；若重点是长期产品整合和宽松许可证，它优于 Grafana。
 
 ### 3. SigNoz：不建议拆前端复用
 
 SigNoz 的页面完整、美观，也覆盖 metrics/logs/traces/dashboard，但其 frontend 是 SigNoz 产品前端，不是面向第三方应用发布的嵌入式 dashboard SDK。官方 frontend README 要求先运行 SigNoz backend，并通过 `VITE_FRONTEND_API_ENDPOINT` 指向它；目录中包含大量 SigNoz API clients、page containers 和产品状态管理。[SigNoz frontend README](https://github.com/SigNoz/signoz/blob/main/frontend/README.md)
 
-- 自托管 SigNoz 面向完整 OpenTelemetry observability 平台，而 ZimaScope 已有自己的 Rust collector 和领域模型。为复用 UI 而适配 SigNoz ingestion/query schema，会把项目变成 SigNoz 的数据生产者和部署包装，而不是轻量本地服务。[SigNoz repository](https://github.com/SigNoz/signoz) [Self-host documentation](https://signoz.io/docs/install/self-host/)
+- 自托管 SigNoz 面向完整 OpenTelemetry observability 平台，而 Z-Scope 已有自己的 Rust collector 和领域模型。为复用 UI 而适配 SigNoz ingestion/query schema，会把项目变成 SigNoz 的数据生产者和部署包装，而不是轻量本地服务。[SigNoz repository](https://github.com/SigNoz/signoz) [Self-host documentation](https://signoz.io/docs/install/self-host/)
 - 官方 Docker 安装文档要求至少为 Docker 分配 4 GB 内存，仅这一前提就明显高于 Grafana 的官方最低建议，也不符合低规格设备上的轻量目标。[SigNoz Docker installation](https://signoz.io/docs/install/docker/)
 - SigNoz 核心仓库大部分代码按 MIT Expat 发布，但 `ee/` 和 `cmd/enterprise/` 使用各自许可证，复用时必须逐目录确认。[SigNoz LICENSE](https://github.com/SigNoz/signoz/blob/main/LICENSE)
-- 单独 fork frontend 会继承紧耦合 API、升级合并和品牌改造成本；部署整套平台则资源和运维成本明显偏离 ZimaScope 的“轻量、本地优先”。
+- 单独 fork frontend 会继承紧耦合 API、升级合并和品牌改造成本；部署整套平台则资源和运维成本明显偏离 Z-Scope 的“轻量、本地优先”。
 
 ### 4. Netdata dashboard：不建议
 
 Netdata Agent 自带非常成熟的实时节点 dashboard，本地可从 `http://NODE:19999` 访问，断网时使用 bundled dashboard；它也提供 Agent REST API。[Netdata dashboards](https://github.com/netdata/netdata/blob/master/docs/dashboards-and-charts/README.md) [Netdata Agent API](https://github.com/netdata/netdata/blob/master/src/web/api/README.md)
 
-但它的 UI 与 Netdata Agent 的 chart/context/alert 模型是一体的。复用完整 UI 意味着同时运行 Netdata Agent，并把 ZimaScope 数据改造成 Netdata metrics/functions；这与现有 eBPF collector 重复，且 Flow、Domain Evidence 等领域对象不自然。官方 UI 主题主要是 light/dark，不能等同于可嵌入组件库。[Netdata themes](https://github.com/netdata/netdata/blob/master/docs/dashboards-and-charts/themes.md)
+但它的 UI 与 Netdata Agent 的 chart/context/alert 模型是一体的。复用完整 UI 意味着同时运行 Netdata Agent，并把 Z-Scope 数据改造成 Netdata metrics/functions；这与现有 eBPF collector 重复，且 Flow、Domain Evidence 等领域对象不自然。官方 UI 主题主要是 light/dark，不能等同于可嵌入组件库。[Netdata themes](https://github.com/netdata/netdata/blob/master/docs/dashboards-and-charts/themes.md)
 
-Netdata 主仓库为 GPL-3.0。[Netdata LICENSE](https://github.com/netdata/netdata/blob/master/LICENSE) 它更适合“直接采用 Netdata 作为监控产品”，不适合“保留 ZimaScope backend，只借用前端”。
+Netdata 主仓库为 GPL-3.0。[Netdata LICENSE](https://github.com/netdata/netdata/blob/master/LICENSE) 它更适合“直接采用 Netdata 作为监控产品”，不适合“保留 Z-Scope backend，只借用前端”。
 
 ### 5. Refine / Ant Design Pro 类框架：只适合补齐业务页
 
@@ -121,7 +121,7 @@ Apache ECharts 提供 Canvas/SVG、动态数据、WebSocket 流式更新、大�
 
 ### Phase 1：Grafana-first MVP
 
-1. 把 Grafana OSS 作为 ZimaScope 安装包中的独立受管服务，使用独立 SQLite 数据库和只读 Viewer。
+1. 把 Grafana OSS 作为 Z-Scope 安装包中的独立受管服务，使用独立 SQLite 数据库和只读 Viewer。
 2. 由 ZimaOS 反向代理 Grafana 与 Rust HTTP API；两者只监听本地或私有网络，不把 daemon API 直接暴露到公网。
 3. provision 一个 datasource 和一组版本化 dashboard JSON，禁止用户安装后再做必需配置。
 4. 先提供四个 dashboard：Overview、Flows、Endpoints & Domains、Collector Health。

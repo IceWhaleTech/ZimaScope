@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Installs a built ZimaScope release: one binary with the eBPF object and the
+# Installs a built Z-Scope release: one binary with the eBPF object and the
 # frontend bundle embedded, plus the systemd unit. Data lives in
 # /var/lib/zimascope and is never touched.
 #
@@ -72,4 +72,4 @@ curl -fsS --max-time 3 "http://127.0.0.1:8080/v1/status" | head -c 200
 echo
 curl -fsS --max-time 3 "http://127.0.0.1:8080/" | grep -qi "<!doctype html>" \
   && echo "==> UI is being served by the agent"
-echo "==> ZimaScope installed: http://<host>:8080/  (API: /v1)"
+echo "==> Z-Scope installed: http://<host>:8080/  (API: /v1)"

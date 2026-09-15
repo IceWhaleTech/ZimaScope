@@ -187,7 +187,7 @@ pub(crate) fn test_database() -> GeoIpDatabase {
     }
 
     let mut database = Database::default();
-    database.metadata.database_type = "ZimaScope-Test".into();
+    database.metadata.database_type = "Z-Scope-Test".into();
     database.metadata.binary_format_major_version = 2;
     database.metadata.binary_format_minor_version = 0;
     database.metadata.build_epoch = 1_788_739_200;
@@ -228,7 +228,7 @@ mod tests {
             .expect("lookup succeeds")
             .expect("known address");
 
-        assert_eq!(database.version(), "ZimaScope-Test@1788739200");
+        assert_eq!(database.version(), "Z-Scope-Test@1788739200");
         assert!(!database.is_empty());
         assert_eq!(record.country.as_deref(), Some("US"));
         assert_eq!(record.region.as_deref(), Some("California"));

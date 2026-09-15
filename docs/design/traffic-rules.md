@@ -14,7 +14,7 @@ document stay authoritative.
 
 ## Scope
 
-ZimaScope polices user-confirmed Traffic Rules with eBPF programs inside the
+Z-Scope polices user-confirmed Traffic Rules with eBPF programs inside the
 existing TC attachment. It never shapes, queues or delays packets: over-limit
 traffic is dropped, so TCP reacts through congestion control and UDP sees loss.
 

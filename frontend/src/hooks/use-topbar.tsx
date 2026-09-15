@@ -24,7 +24,7 @@ export function TopbarProvider({ children }: { children: ReactNode }) {
   const [info, setInfo] = useState<TopbarInfo>({ title: "Overview", meta: "" });
   const value = useMemo(() => ({ info, setInfo }), [info]);
   useEffect(() => {
-    document.title = `${info.title} · ZimaScope`;
+    document.title = `${info.title} · Z-Scope`;
   }, [info.title]);
   return <TopbarContext.Provider value={value}>{children}</TopbarContext.Provider>;
 }

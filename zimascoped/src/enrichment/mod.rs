@@ -179,7 +179,7 @@ mod tests {
         assert_eq!(profile.organization.as_deref(), Some("Google LLC"));
         assert_eq!(
             profile.database_version.as_deref(),
-            Some("ZimaScope-Test@1788739200")
+            Some("Z-Scope-Test@1788739200")
         );
 
         let stats = enricher.stats();
@@ -200,7 +200,7 @@ mod tests {
         assert!(profile.asn.is_none());
         assert_eq!(
             profile.database_version.as_deref(),
-            Some("ZimaScope-Test@1788739200")
+            Some("Z-Scope-Test@1788739200")
         );
         assert_eq!(enricher.stats().unknown_addresses, 1);
     }

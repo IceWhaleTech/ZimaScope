@@ -1,4 +1,4 @@
-//! The single collection path for ZimaScope.
+//! The single collection path for Z-Scope.
 //!
 //! `Collector` is the worker interface described in
 //! `docs/design/rust-collector.md`. Aya objects, polling, map shards, ring
@@ -351,7 +351,7 @@ impl CollectorCore {
     #[cfg(target_os = "linux")]
     fn open(config: CollectorConfig) -> Result<Self> {
         let source =
-            aya::AyaKernelSource::open(&config).context("open ZimaScope eBPF collector")?;
+            aya::AyaKernelSource::open(&config).context("open Z-Scope eBPF collector")?;
         let mut core = Self::new(config, Box::new(source));
         // Services already listening at startup never emit TCP_LISTEN_CB, so
         // seed their ownership once before the first poll; poll_once refreshes
@@ -364,7 +364,7 @@ impl CollectorCore {
 
     #[cfg(not(target_os = "linux"))]
     fn open(_config: CollectorConfig) -> Result<Self> {
-        anyhow::bail!("ZimaScope collection is only supported on Linux")
+        anyhow::bail!("Z-Scope collection is only supported on Linux")
     }
 
     fn new(config: CollectorConfig, source: Box<dyn KernelSource>) -> Self {
@@ -591,7 +591,7 @@ impl CollectorCore {
         let detach_result = self
             .source
             .detach()
-            .context("detach ZimaScope collection hooks");
+            .context("detach Z-Scope collection hooks");
         self.shutdown_complete = detach_result.is_ok();
         self.health.close_all(SystemTime::now());
         let health = self.health.snapshot(

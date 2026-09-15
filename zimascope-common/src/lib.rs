@@ -1,4 +1,4 @@
-//! Shared types for ZimaScope.
+//! Shared types for Z-Scope.
 //!
 //! [`kernel_abi`] contains the fixed-size, `#[repr(C)]` types shared with the
 //! eBPF programs and is `no_std`-compatible. [`model`] contains the user-space

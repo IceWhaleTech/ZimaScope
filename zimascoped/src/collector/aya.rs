@@ -92,7 +92,7 @@ pod_newtype! {
 /// Reads one fixed-size sample from a ring-buffer slot.
 ///
 /// Returns `None` when the slot is shorter than the sample. The bytes come
-/// from ZimaScope's own eBPF maps, so the sample's bit patterns are trusted.
+/// from Z-Scope's own eBPF maps, so the sample's bit patterns are trusted.
 fn sample_from_ring<T: Copy>(bytes: &[u8]) -> Option<T> {
     if bytes.len() < core::mem::size_of::<T>() {
         return None;
@@ -159,12 +159,12 @@ impl AyaKernelSource {
     pub fn open(config: &CollectorConfig) -> Result<Self> {
         if object::EBPF_OBJECT.is_empty() {
             bail!(
-                "ZimaScope eBPF object is not embedded; build zimascope-ebpf for \
+                "Z-Scope eBPF object is not embedded; build zimascope-ebpf for \
                  bpfel-unknown-none first (set ZIMASCOPE_EBPF_OBJECT to its path)"
             );
         }
 
-        let mut ebpf = Ebpf::load(object::EBPF_OBJECT).context("load ZimaScope eBPF object")?;
+        let mut ebpf = Ebpf::load(object::EBPF_OBJECT).context("load Z-Scope eBPF object")?;
 
         verify_abi(&mut ebpf)?;
 
@@ -227,7 +227,7 @@ impl AyaKernelSource {
             );
         }
         let attached = attach_interfaces(&mut ebpf, &boundary.interfaces)
-            .context("attach ZimaScope TC ingress/egress hooks")?;
+            .context("attach Z-Scope TC ingress/egress hooks")?;
 
         Ok(Self {
             ebpf,

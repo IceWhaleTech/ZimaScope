@@ -4,7 +4,7 @@ status: accepted
 
 # Aggregate flows in eBPF maps behind one Collector
 
-ZimaScope will aggregate packet and byte counters in bounded per-CPU eBPF maps attached at TC ingress/egress, then expose collection through one user-space `Collector` module. Per-packet delivery to user space is rejected because its wakeups, copies, and backpressure make the 1% CPU budget unpredictable; only bounded, deduplicated domain-evidence events may use a ring buffer because DNS, TLS SNI, and HTTP Host cannot be reconstructed from counters.
+Z-Scope will aggregate packet and byte counters in bounded per-CPU eBPF maps attached at TC ingress/egress, then expose collection through one user-space `Collector` module. Per-packet delivery to user space is rejected because its wakeups, copies, and backpressure make the 1% CPU budget unpredictable; only bounded, deduplicated domain-evidence events may use a ring buffer because DNS, TLS SNI, and HTTP Host cannot be reconstructed from counters.
 
 ## Considered Options
 

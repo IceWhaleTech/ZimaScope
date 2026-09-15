@@ -1,5 +1,5 @@
 #!/bin/sh
-# Builds the ZimaOS module package (.raw) for ZimaScope.
+# Builds the ZimaOS module package (.raw) for Z-Scope.
 #
 # The package is a squashfs image that systemd-sysext merges under /usr. zpkg
 # requires the image basename to equal both the zpkg module name and the
@@ -171,7 +171,7 @@ fi
 ASSET_ARCH=$(resolve_arch)
 ZIMASCOPE_VERSION=$(resolve_version)
 if [ -z "$ZIMASCOPE_VERSION" ]; then
-  printf 'cannot resolve ZimaScope version from Cargo.toml\n' >&2
+  printf 'cannot resolve Z-Scope version from Cargo.toml\n' >&2
   exit 1
 fi
 
@@ -213,4 +213,4 @@ sed -e "s/__ZIMASCOPE_VERSION__/${ZIMASCOPE_VERSION_SED}/g" \
 remove_output_file "$OUTPUT_PATH"
 mksquashfs "$RAW_ROOT" "$OUTPUT_PATH" -noappend -comp gzip -no-xattrs -all-root
 
-printf 'Built %s (ZimaScope %s, %s)\n' "$OUTPUT_PATH" "$ZIMASCOPE_VERSION" "$ASSET_ARCH"
+printf 'Built %s (Z-Scope %s, %s)\n' "$OUTPUT_PATH" "$ZIMASCOPE_VERSION" "$ASSET_ARCH"

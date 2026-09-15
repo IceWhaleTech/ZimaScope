@@ -1,6 +1,6 @@
-# ZimaScope Network Observability
+# Z-Scope Network Observability
 
-ZimaScope describes network activity at the boundary of a ZimaOS device. This glossary keeps product language honest when encrypted protocols or shared infrastructure prevent exact attribution.
+Z-Scope describes network activity at the boundary of a ZimaOS device. This glossary keeps product language honest when encrypted protocols or shared infrastructure prevent exact attribution.
 
 ## Language
 
@@ -41,7 +41,7 @@ Locally enriched information about an IP address, including address scope, count
 _Avoid_: Exact IP location
 
 **Fake IP**:
-A synthetic address handed out by a local proxy's fake-IP DNS, where the proxy resolves and dials the real destination. ZimaScope classifies the RFC 2544 range (198.18.0.0/15) and reports it without country or ASN attribution.
+A synthetic address handed out by a local proxy's fake-IP DNS, where the proxy resolves and dials the real destination. Z-Scope classifies the RFC 2544 range (198.18.0.0/15) and reports it without country or ASN attribution.
 _Avoid_: Proxy IP, virtual server
 
 **Application Identity**:
@@ -53,7 +53,7 @@ The share of boundary traffic that carries an Application Identity. Unattributed
 _Avoid_: Attribution accuracy
 
 **Observation Gap**:
-A known interval or protocol condition in which ZimaScope could not observe, process or retain complete network metadata.
+A known interval or protocol condition in which Z-Scope could not observe, process or retain complete network metadata.
 _Avoid_: No traffic
 
 **Fingerprint**:
@@ -65,7 +65,7 @@ A user-confirmed policy that limits or blocks Flows matching an Endpoint, a CIDR
 _Avoid_: Firewall rule, QoS rule
 
 **Limit**:
-A Traffic Rule action that drops over-limit packets so matching traffic settles at or below the configured rate. This is policing; ZimaScope never queues or delays packets.
+A Traffic Rule action that drops over-limit packets so matching traffic settles at or below the configured rate. This is policing; Z-Scope never queues or delays packets.
 _Avoid_: Shaping, throttling, bandwidth guarantee
 
 **Block**:

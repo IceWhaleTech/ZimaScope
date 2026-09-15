@@ -1,4 +1,4 @@
-// Typed client for the local ZimaScope API (Unix socket, behind the ZimaOS
+// Typed client for the local Z-Scope API (Unix socket, behind the ZimaOS
 // reverse proxy or the Vite dev proxy).
 
 import type {

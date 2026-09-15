@@ -4,7 +4,7 @@ status: accepted
 
 # Store Flow history in SQLite behind a thin SQL layer
 
-ZimaScope will persist and query Flow history with SQLite accessed through `rusqlite` (bundled), not an ORM. The API read model is a small SQL schema: `flows`, `observations`, `traffic_buckets`, `settings`, `exports`. Dynamic filtering, sorting, aggregation, timeline bucketing, and pagination are expressed as SQL instead of hand-written in-memory indexes.
+Z-Scope will persist and query Flow history with SQLite accessed through `rusqlite` (bundled), not an ORM. The API read model is a small SQL schema: `flows`, `observations`, `traffic_buckets`, `settings`, `exports`. Dynamic filtering, sorting, aggregation, timeline bucketing, and pagination are expressed as SQL instead of hand-written in-memory indexes.
 
 ## Considered Options
 

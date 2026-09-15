@@ -94,7 +94,7 @@ collection and ingest still contributes `comm` and `uid`.
   the low 16 bits are already the `_be` value.
 - Under tcx multiprog, `TC_ACT_OK` stops the chain. TC programs must return
   `TC_ACT_UNSPEC` to let other classifiers on the same interface run; when
-  ZimaScope is the last program the kernel treats it as pass.
+  Z-Scope is the last program the kernel treats it as pass.
 - `cgroup_bpf_link_attach` rejects nonzero attach flags, so the cgroup attach
   uses `CgroupAttachMode::Single` (flags 0); links coexist without replacing
   programs owned by other tools.

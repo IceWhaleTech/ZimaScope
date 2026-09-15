@@ -1,4 +1,4 @@
-//! Wire types for the local ZimaScope API (v1).
+//! Wire types for the local Z-Scope API (v1).
 //!
 //! The API is JSON-only and speaks in the product glossary: Flows, Endpoints,
 //! Associated Domains, IP Profiles, Observation Gaps and AgentHealth.

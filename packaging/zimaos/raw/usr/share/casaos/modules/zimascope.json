@@ -4,7 +4,7 @@
   "ui": {
     "name": "zimascope",
     "title": {
-      "en_us": "ZimaScope"
+      "en_us": "Z-Scope"
     },
     "description": "Network observability at the ZimaOS device boundary",
     "prefetch": false,

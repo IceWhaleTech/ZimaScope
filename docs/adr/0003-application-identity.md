@@ -4,7 +4,7 @@ status: accepted
 
 # Attribute Application Identity to Flows instead of counting socket traffic separately
 
-ZimaScope will attribute processes and applications to existing boundary Flows by capturing socket ownership at connect/listen time with a cgroup `sock_ops` eBPF program and joining it to Flow snapshots in user space. Packet and byte counters stay owned by TC; the Application Identity is metadata on top of the boundary truth. A second socket-layer byte accounting system is rejected because its totals cannot be reconciled with the Device Boundary product language (retransmissions, L2 headers, forwarded traffic), and `/proc`-scanning attribution is rejected because it misses short-lived connections and costs a full descriptor sweep per interval.
+Z-Scope will attribute processes and applications to existing boundary Flows by capturing socket ownership at connect/listen time with a cgroup `sock_ops` eBPF program and joining it to Flow snapshots in user space. Packet and byte counters stay owned by TC; the Application Identity is metadata on top of the boundary truth. A second socket-layer byte accounting system is rejected because its totals cannot be reconciled with the Device Boundary product language (retransmissions, L2 headers, forwarded traffic), and `/proc`-scanning attribution is rejected because it misses short-lived connections and costs a full descriptor sweep per interval.
 
 ## Considered Options
 

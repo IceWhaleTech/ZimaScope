@@ -1,6 +1,6 @@
-# ZimaScope frontend
+# Z-Scope frontend
 
-Local-first observability UI for the ZimaScope agent, styled after Apple's
+Local-first observability UI for the Z-Scope agent, styled after Apple's
 design language: solid canvases, materials only where chrome floats over
 content, system typography, and critically damped motion that respects
 `prefers-reduced-motion`, `prefers-reduced-transparency` and

@@ -1,8 +1,8 @@
-# ZimaScope 产品需求文档
+# Z-Scope 产品需求文档
 
 | 项目 | 内容 |
 |---|---|
-| 产品名称 | ZimaScope |
+| 产品名称 | Z-Scope |
 | 产品标语 | See where your ZimaOS traffic flows. |
 | 文档版本 | 0.1 |
 | 文档状态 | 立项草案 |
@@ -12,7 +12,7 @@
 
 ## 1. 产品概述
 
-ZimaScope 是面向 ZimaOS 用户的轻量网络可观测能力，用于回答以下问题：
+Z-Scope 是面向 ZimaOS 用户的轻量网络可观测能力，用于回答以下问题：
 
 - ZimaOS 当前有多少入站和出站流量？
 - 哪些 IP、端口、国家/地区、ASN 或云厂商占用了流量？
@@ -20,7 +20,7 @@ ZimaScope 是面向 ZimaOS 用户的轻量网络可观测能力，用于回答�
 - 哪些连接成功、失败、被重置或表现异常？
 - 在能够识别时，是哪个 ZimaOS 应用、容器或进程产生了流量？
 
-ZimaScope 不定位为 Wireshark 替代品，也不默认保存完整数据包或业务内容。产品重点是将内核观察到的网络元数据聚合成普通用户能够理解、管理员能够排障的视图。
+Z-Scope 不定位为 Wireshark 替代品，也不默认保存完整数据包或业务内容。产品重点是将内核观察到的网络元数据聚合成普通用户能够理解、管理员能够排障的视图。
 
 ## 2. 背景与问题
 
@@ -91,7 +91,7 @@ NAS 用户通常运行下载工具、媒体服务、同步服务、远程访问�
 
 ### 场景 A：定位异常上行
 
-用户看到 NAS 上行达到 80 Mbps，打开 ZimaScope 后看到主要 Outbound Flow 的目标 IP、Associated Domain、ASN、应用端口和流量占比，从而判断是正常备份还是异常外联。
+用户看到 NAS 上行达到 80 Mbps，打开 Z-Scope 后看到主要 Outbound Flow 的目标 IP、Associated Domain、ASN、应用端口和流量占比，从而判断是正常备份还是异常外联。
 
 ### 场景 B：确认陌生目的地
 
@@ -152,7 +152,7 @@ NAS 用户通常运行下载工具、媒体服务、同步服务、远程访问�
 
 ### 8.1 服务初始化
 
-1. 安装或系统升级后，ZimaScope 默认可用但允许用户关闭。
+1. 安装或系统升级后，Z-Scope 默认可用但允许用户关闭。
 2. 首次启用时检测内核、BTF、eBPF、TC 和所需 capability。
 3. 自动选择默认路由所在的非虚拟接口作为 Device Boundary。
 4. 如果存在多个候选接口，使用安全默认值并提示用户确认。
@@ -168,7 +168,7 @@ NAS 用户通常运行下载工具、媒体服务、同步服务、远程访问�
 5. 内核侧以 map 聚合；用户态默认每秒读取并生成展示快照。
 6. map 达到容量时使用可预测的淘汰策略，并累计 eviction 指标。
 7. 无法解析、截断、未知协议和 map 更新失败必须计数，但不得阻断网络流量。
-8. 所有 eBPF 路径默认返回放行结果；ZimaScope V1 不改变数据包。
+8. 所有 eBPF 路径默认返回放行结果；Z-Scope V1 不改变数据包。
 
 ### 8.3 方向与去重
 
@@ -264,7 +264,7 @@ Domain 详情展示：首次/最后观察、evidence 分布、解析到的 IP、
 
 设置项至少包括：
 
-- 启用/暂停 ZimaScope。
+- 启用/暂停 Z-Scope。
 - Device Boundary 接口。
 - 域名观察总开关。
 - TLS SNI、HTTP Host 观察子开关。
@@ -288,7 +288,7 @@ Domain 详情展示：首次/最后观察、evidence 分布、解析到的 IP、
 
 ```text
 ZimaOS
-└── ZimaScope
+└── Z-Scope
     ├── Overview
     ├── Flows
     ├── Endpoints
@@ -374,7 +374,7 @@ Linux TC ingress/egress
         |
 Aya eBPF parser + bounded maps
         |
-ZimaScope daemon
+Z-Scope daemon
   ├── map polling and aggregation
   ├── DNS/SNI/Host bounded event processing
   ├── domain association cache
@@ -416,8 +416,8 @@ zimascope/
 
 CPU 为 V1 硬性验收指标，必须在 ZimaOS 最低支持硬件上达到：
 
-- 在默认功能开启和标准负载下，ZimaScope 总体增量 CPU 使用率最高不超过单个逻辑核的 1%。
-- 总体增量 CPU 包括 daemon 用户态开销以及可归因于 eBPF 采集的内核态开销，以启用 ZimaScope 前后的基线对比测量。
+- 在默认功能开启和标准负载下，Z-Scope 总体增量 CPU 使用率最高不超过单个逻辑核的 1%。
+- 总体增量 CPU 包括 daemon 用户态开销以及可归因于 eBPF 采集的内核态开销，以启用 Z-Scope 前后的基线对比测量。
 - 标准负载的流量速率、PPS、Flow 数量、包大小分布和测量窗口必须在首个性能基准提交中固化，后续版本不得放宽该口径。
 - 常驻内存不超过 100 MiB；默认配置目标低于 64 MiB。
 - eBPF map 内存有明确上限，默认 Flow 容量不超过 65,536。
@@ -446,7 +446,7 @@ CPU 为 V1 硬性验收指标，必须在 ZimaOS 最低支持硬件上达到：
 - 域名和 IP 历史视为敏感数据，仅授权的 ZimaOS 管理员可访问。
 - API 使用 ZimaOS 现有身份和权限体系，不另设弱口令。
 - eBPF 加载所需 capability 应最小化；加载后尽可能降低用户态权限。
-- GeoIP 更新包和 ZimaScope 发布包必须验证签名或校验值。
+- GeoIP 更新包和 Z-Scope 发布包必须验证签名或校验值。
 - 导出文件由用户主动生成，并明确提示其中包含网络活动元数据。
 
 ## 14. API 需求
@@ -471,7 +471,7 @@ API 必须支持时间范围、排序、游标或稳定分页，并对高基数�
 
 ## 15. 可观测性
 
-ZimaScope 必须能够观察自身：
+Z-Scope 必须能够观察自身：
 
 - 各接口 TC hook 状态。
 - map 容量、当前条目和淘汰数。
@@ -537,7 +537,7 @@ ZimaScope 必须能够观察自身：
 10. daemon 异常退出、map 满或数据库失败时不影响网络连通。
 11. UI 明确显示 attach 失败、事件丢失和 Observation Gap。
 12. 导出不包含 payload、HTTP path、认证 header 或正文。
-13. 在最低支持硬件和标准负载下，ZimaScope 总体增量 CPU 使用率最高不超过单个逻辑核的 1%，并达到内存和响应时间指标。
+13. 在最低支持硬件和标准负载下，Z-Scope 总体增量 CPU 使用率最高不超过单个逻辑核的 1%，并达到内存和响应时间指标。
 
 ## 18. 成功指标
 
@@ -545,7 +545,7 @@ ZimaScope 必须能够观察自身：
 
 - 启用用户中，能够成功看到 Flow 的比例。
 - 从概览进入 Endpoint/Domain 详情的使用率。
-- 支持工单中，通过 ZimaScope 导出缩短定位时间的比例。
+- 支持工单中，通过 Z-Scope 导出缩短定位时间的比例。
 - 用户在一次会话中成功回答“最大流量去向”的任务完成率。
 
 ### 产品质量指标
@@ -595,7 +595,7 @@ chore: add zimaos service packaging upgrade and uninstall cleanup
 
 以下事项需要在实现相关功能前确定：
 
-1. ZimaScope 是默认启用，还是由用户首次进入后启用。
+1. Z-Scope 是默认启用，还是由用户首次进入后启用。
 2. V1 是否将 TLS SNI 纳入 P0；若延期，首版域名主要来自 DNS。
 3. 默认详细历史是 7 天还是 30 天，以及最低硬件磁盘配额。
 4. ZimaOS 当前可复用的 App/container identity 数据源。
@@ -614,4 +614,4 @@ chore: add zimaos service packaging upgrade and uninstall cleanup
 - V1 不做阻断、限速或云端管理。
 - Application Identity、IPv6 和 TCP 深度质量指标进入 V1.1。
 
-在该边界下，ZimaScope 能形成完整、可信且可交付的产品闭环，同时保留向应用归属和安全洞察演进的空间。
+在该边界下，Z-Scope 能形成完整、可信且可交付的产品闭环，同时保留向应用归属和安全洞察演进的空间。

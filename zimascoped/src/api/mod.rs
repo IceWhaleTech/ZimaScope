@@ -1,4 +1,4 @@
-//! Local REST API for the ZimaScope agent.
+//! Local REST API for the Z-Scope agent.
 //!
 //! The API is versioned under `/v1`, JSON-only, and served on a Unix socket.
 //! Collection is never blocked by API work: batches are ingested into SQLite

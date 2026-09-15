@@ -305,7 +305,7 @@ kernel_counters! {
     policy_missing_state,
 }
 
-/// A known interval in which ZimaScope could not observe complete metadata.
+/// A known interval in which Z-Scope could not observe complete metadata.
 #[derive(Clone, Debug)]
 pub struct ObservationGap {
     pub started_at: SystemTime,
