@@ -182,7 +182,23 @@ export function OverviewView() {
       rateHistory.current.outbound.shift();
     }
     const byId = new Map(tick.flows.map((flow) => [flow.id, flow]));
-    setRecent((previous) => previous.map((flow) => byId.get(flow.id) ?? flow));
+    const patches = new Map(tick.flow_updates.map((patch) => [patch.id, patch]));
+    setRecent((previous) =>
+      previous.map((flow) => {
+        const full = byId.get(flow.id);
+        if (full) return full;
+        const patch = patches.get(flow.id);
+        if (!patch) return flow;
+        return {
+          ...flow,
+          packets: patch.packets,
+          bytes: patch.bytes,
+          last_seen: patch.last_seen,
+          inbound_bps: patch.inbound_bps,
+          outbound_bps: patch.outbound_bps,
+        };
+      }),
+    );
 
     overviewTicks.current += 1;
     if (overviewTicks.current % 6 === 0) {
@@ -266,10 +282,10 @@ export function OverviewView() {
         <TimelineChart points={timelinePoints} />
         <div className="flex items-center gap-4 text-2xs text-muted-foreground">
           <span className="inline-flex items-center gap-1.5">
-            <i className="size-1.5 rounded-full bg-series-inbound" />Inbound
+            <i className="size-1.5 rounded-full bg-series-inbound" />Download
           </span>
           <span className="inline-flex items-center gap-1.5">
-            <i className="size-1.5 rounded-full bg-series-outbound" />Outbound
+            <i className="size-1.5 rounded-full bg-series-outbound" />Upload
           </span>
           <span className="ml-auto inline-flex items-center gap-1">
             <Info className="size-3" />

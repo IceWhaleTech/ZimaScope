@@ -11,7 +11,7 @@ import { useEffect, useState, type ReactNode } from "react";
 import { useNavigate } from "react-router";
 import { motion } from "motion/react";
 import { toast } from "sonner";
-import { ArrowLeftRight, Boxes, ChevronRight, Globe, Terminal, X } from "lucide-react";
+import { ArrowLeftRight, Boxes, ChevronRight, CircleHelp, Globe, Radio, Terminal, X } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { Skeleton } from "@/components/ui/skeleton";
@@ -32,14 +32,27 @@ import {
   useFlow,
 } from "@/hooks/use-data";
 import {
+  directionLabel,
   formatBytes,
   formatClock,
   formatDuration,
   formatNumber,
   relativeTime,
   evidenceTitle,
+  unattributedLabel,
+  unattributedTitle,
 } from "@/lib/format";
-import type { ApplicationDetail, DomainDetail, EndpointDetail, Flow, TimeRange } from "@/types";
+import { cn } from "@/lib/utils";
+import type {
+  ApplicationDetail,
+  ApplicationRef,
+  ApplicationUsage,
+  DomainDetail,
+  EndpointDetail,
+  Flow,
+  TimeRange,
+  UnattributedReason,
+} from "@/types";
 
 const enter = {
   initial: { opacity: 0, y: 6 },
@@ -148,6 +161,55 @@ function TruncationNote({ shown, total }: { shown: number; total: number }) {
   );
 }
 
+/** Application Identity chip; attributed Flows click through to the Application. */
+function ApplicationChip({
+  application,
+  reason,
+  onClick,
+}: {
+  application: ApplicationRef | null;
+  reason?: UnattributedReason | null;
+  onClick?: () => void;
+}) {
+  const Icon = application
+    ? application.kind === "container"
+      ? Boxes
+      : Terminal
+    : reason === "lan_broadcast"
+      ? Radio
+      : CircleHelp;
+  const className = cn(
+    "inline-flex max-w-full items-center gap-1.5 rounded-full border border-border/60 px-2 py-0.5 text-sm font-medium",
+    application ? "text-foreground" : "text-muted-foreground italic",
+  );
+  const title = application
+    ? `${application.kind === "container" ? "Container" : "Process"} · ${application.id}`
+    : unattributedTitle(reason);
+  const content = (
+    <>
+      <Icon className="size-3 shrink-0" />
+      <span className="truncate">{application?.name ?? unattributedLabel(reason)}</span>
+    </>
+  );
+  if (!application || !onClick) {
+    return (
+      <span className={className} title={title}>
+        {content}
+      </span>
+    );
+  }
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      className={cn(className, "transition-colors hover:bg-accent")}
+      title={title}
+    >
+      {content}
+    </button>
+  );
+}
+
 const TREND_RANGES = [
   { value: "15m", label: "15m" },
   { value: "1h", label: "1h" },
@@ -187,10 +249,10 @@ function EntityTrend({
       )}
       <div className="flex items-center gap-4 text-2xs text-muted-foreground">
         <span className="inline-flex items-center gap-1.5">
-          <i className="size-1.5 rounded-full bg-series-inbound" />Inbound
+          <i className="size-1.5 rounded-full bg-series-inbound" />Download
         </span>
         <span className="inline-flex items-center gap-1.5">
-          <i className="size-1.5 rounded-full bg-series-outbound" />Outbound
+          <i className="size-1.5 rounded-full bg-series-outbound" />Upload
         </span>
       </div>
     </TabSection>
@@ -249,6 +311,15 @@ function FlowDetailBody({ flow }: { flow: Flow }) {
           <StateBadge state={flow.state} />
           <DirectionBadge direction={flow.direction} />
           <ScopeChip scope={network.scope} />
+          <ApplicationChip
+            application={flow.application}
+            reason={flow.unattributed_reason}
+            onClick={
+              flow.application
+                ? () => open({ kind: "application", id: flow.application!.id })
+                : undefined
+            }
+          />
         </div>
 
         <StatTiles
@@ -329,28 +400,6 @@ function FlowDetailBody({ flow }: { flow: Flow }) {
             <TabSection caption="Direction relative to the device boundary">
               <DefList
                 rows={[
-                  ...(flow.application
-                    ? [
-                        {
-                          label: "Application",
-                          value: (
-                            <button
-                              type="button"
-                              onClick={() => open({ kind: "application", id: flow.application!.id })}
-                              className="inline-flex max-w-full items-center gap-1 truncate text-xs font-medium text-foreground underline-offset-2 hover:underline"
-                              title={flow.application.id}
-                            >
-                              {flow.application.kind === "container" ? (
-                                <Boxes className="size-3 shrink-0" />
-                              ) : (
-                                <Terminal className="size-3 shrink-0" />
-                              )}
-                              <span className="truncate">{flow.application.name}</span>
-                            </button>
-                          ),
-                        },
-                      ]
-                    : []),
                   {
                     label: flow.direction === "outbound" ? "From" : "Remote source",
                     value: <span className="font-mono text-xs">{source}</span>,
@@ -373,7 +422,7 @@ function FlowDetailBody({ flow }: { flow: Flow }) {
           )}
         </motion.div>
 
-        <div className="flex gap-2">
+        <div className="flex flex-wrap gap-2">
           <Button
             onClick={() => {
               close();
@@ -395,6 +444,22 @@ function FlowDetailBody({ flow }: { flow: Flow }) {
               Filter by domain
             </Button>
           )}
+          {flow.application && (
+            <Button
+              variant="secondary"
+              onClick={() => {
+                close();
+                navigate(`/flows?application=${encodeURIComponent(flow.application!.id)}`);
+              }}
+            >
+              {flow.application.kind === "container" ? (
+                <Boxes className="size-3.5" />
+              ) : (
+                <Terminal className="size-3.5" />
+              )}
+              Filter by application
+            </Button>
+          )}
         </div>
       </motion.div>
     </ScrollArea>
@@ -406,6 +471,7 @@ function FlowDetailBody({ flow }: { flow: Flow }) {
 const ENDPOINT_TABS: Tab[] = [
   { value: "traffic", label: "Traffic" },
   { value: "ports", label: "Ports" },
+  { value: "applications", label: "Apps" },
   { value: "domains", label: "Domains" },
   { value: "network", label: "Network" },
 ];
@@ -472,7 +538,7 @@ function EndpointDetailBody({ detail }: { detail: EndpointDetail }) {
                         </div>
                         <UsageBar ratio={port.bytes / maxPort} />
                         <span className="text-2xs text-muted-foreground">
-                          {port.protocol.toUpperCase()} · {port.direction} · {port.flow_count} flows
+                          {port.protocol.toUpperCase()} · {directionLabel(port.direction).toLowerCase()} · {port.flow_count} flows
                         </span>
                       </li>
                     ))}
@@ -482,6 +548,12 @@ function EndpointDetailBody({ detail }: { detail: EndpointDetail }) {
               ) : (
                 <p className="text-xs text-muted-foreground">No port data</p>
               )}
+            </TabSection>
+          )}
+
+          {tab === "applications" && (
+            <TabSection caption="Applications using this endpoint, by traffic">
+              <ApplicationUsageList applications={detail.applications} totalBytes={detail.bytes} />
             </TabSection>
           )}
 
@@ -558,6 +630,7 @@ function EndpointDetailBody({ detail }: { detail: EndpointDetail }) {
 
 const DOMAIN_TABS: Tab[] = [
   { value: "traffic", label: "Traffic" },
+  { value: "applications", label: "Apps" },
   { value: "evidence", label: "Evidence" },
   { value: "addresses", label: "Addresses" },
   { value: "destinations", label: "Destinations" },
@@ -612,6 +685,12 @@ function DomainDetailBody({ detail }: { detail: DomainDetail }) {
 
         <motion.div key={tab} {...enter} className="flex flex-col gap-4">
           {tab === "traffic" && <EntityTrend kind="domain" target={detail.domain} />}
+
+          {tab === "applications" && (
+            <TabSection caption="Applications using this domain, by traffic">
+              <ApplicationUsageList applications={detail.applications} totalBytes={detail.bytes} />
+            </TabSection>
+          )}
 
           {tab === "evidence" && (
             <TabSection caption="How this name was observed">
@@ -721,6 +800,104 @@ function UsageBar({ ratio }: { ratio: number }) {
         style={{ width: `${Math.max(2, Math.min(100, ratio * 100)).toFixed(1)}%` }}
       />
     </div>
+  );
+}
+
+/**
+ * One entity's traffic split by Application Identity. Attributed rows open the
+ * Application; the unattributed remainder stays a plain row. Bar width is the
+ * share of the entity's total bytes.
+ */
+function ApplicationUsageList({
+  applications,
+  totalBytes,
+}: {
+  applications: ApplicationUsage[];
+  totalBytes: number;
+}) {
+  const { open } = useDetails();
+  if (!applications.length) {
+    return <p className="text-xs text-muted-foreground">No flows observed yet.</p>;
+  }
+  const shown = applications.slice(0, LIST_LIMIT);
+  const unexplained = applications.some(
+    (usage) => !usage.application && usage.unattributed_reason !== "lan_broadcast",
+  );
+  const broadcast = applications.some(
+    (usage) => !usage.application && usage.unattributed_reason === "lan_broadcast",
+  );
+  return (
+    <>
+      <ul className="flex flex-col gap-2.5">
+        {shown.map((usage) => {
+          const application = usage.application;
+          const Icon = application
+            ? application.kind === "container"
+              ? Boxes
+              : Terminal
+            : usage.unattributed_reason === "lan_broadcast"
+              ? Radio
+              : CircleHelp;
+          const body = (
+            <>
+              <div className="flex items-baseline justify-between gap-2">
+                <span
+                  className={cn(
+                    "inline-flex min-w-0 items-center gap-1.5 text-xs font-medium",
+                    !application && "text-muted-foreground italic",
+                  )}
+                >
+                  <Icon className="size-3 shrink-0 text-muted-foreground" />
+                  <span className="truncate">
+                    {application?.name ?? unattributedLabel(usage.unattributed_reason)}
+                  </span>
+                </span>
+                <strong className="shrink-0 text-xs tabular-nums">{formatBytes(usage.bytes)}</strong>
+              </div>
+              <UsageBar ratio={totalBytes > 0 ? usage.bytes / totalBytes : 0} />
+              <span className="text-2xs text-muted-foreground" title="↓ download · ↑ upload">
+                ↓{formatBytes(usage.traffic.inbound.bytes)} ↑{formatBytes(usage.traffic.outbound.bytes)} ·{" "}
+                {usage.flow_count} flow{usage.flow_count === 1 ? "" : "s"}
+              </span>
+            </>
+          );
+          return (
+            <li key={application?.id ?? usage.unattributed_reason ?? "unattributed"}>
+              {application ? (
+                <button
+                  type="button"
+                  onClick={() => open({ kind: "application", id: application.id })}
+                  title={application.id}
+                  className="flex w-full flex-col gap-1 rounded-md px-1 py-1 text-left transition-colors hover:bg-accent"
+                >
+                  {body}
+                </button>
+              ) : (
+                <div
+                  className="flex w-full flex-col gap-1 px-1 py-1"
+                  title={unattributedTitle(usage.unattributed_reason)}
+                >
+                  {body}
+                </div>
+              )}
+            </li>
+          );
+        })}
+      </ul>
+      <TruncationNote shown={shown.length} total={applications.length} />
+      {unexplained && (
+        <p className="text-2xs text-muted-foreground">
+          Attribution comes from observed socket ownership. UDP without a captured send, port-rewriting
+          container NAT, or a process that exited before resolution stays unattributed.
+        </p>
+      )}
+      {!unexplained && broadcast && (
+        <p className="text-2xs text-muted-foreground">
+          LAN broadcast is inbound multicast or broadcast from other devices with no local listener or
+          sender; it is reported as-is, not attributed to an Application.
+        </p>
+      )}
+    </>
   );
 }
 

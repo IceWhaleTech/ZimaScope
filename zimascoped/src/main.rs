@@ -29,7 +29,10 @@ const GEOIP_ENV: &str = "ZIMASCOPE_GEOIP_DATABASE";
 /// the database; uploads through the API are persisted here.
 const FINGERPRINTS_ENV: &str = "ZIMASCOPE_FINGERPRINTS";
 
-#[tokio::main(flavor = "current_thread")]
+// Storage queries are synchronous and occasionally expensive: on the
+// multi-threaded runtime a slow aggregate blocks one worker at most, while the
+// collector tick and SSE fan-out keep running on the others.
+#[tokio::main]
 async fn main() {
     let socket_path = std::env::var_os(SOCKET_ENV)
         .map(PathBuf::from)

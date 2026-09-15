@@ -291,6 +291,24 @@ impl ApiState {
     }
 }
 
+/// Runs one read-model query on the blocking pool.
+///
+/// SQLite work is synchronous; keeping it off the async workers means a slow
+/// aggregate delays no collector tick and no SSE broadcast. The storage mutex
+/// is acquired inside the blocking task, so ordering is unchanged.
+async fn db_read<T, F>(state: ApiState, read: F) -> Result<T, ApiError>
+where
+    T: Send + 'static,
+    F: FnOnce(&Db) -> Result<T, ApiError> + Send + 'static,
+{
+    tokio::task::spawn_blocking(move || {
+        let inner = state.lock();
+        read(&inner.db)
+    })
+    .await
+    .map_err(|error| ApiError::internal(format!("storage task failed: {error}")))?
+}
+
 impl Inner {
     fn status(&self) -> ServiceStatusDto {
         let health = self.db.health();
@@ -476,15 +494,15 @@ fn asset_content_type(name: &str) -> &'static str {
 /// payload is the largest thing this API serves, so it opts back in. gRPC and
 /// images stay uncompressed, and tiny responses stay below the size floor.
 ///
-/// `Fastest` trades a little ratio (the SSE stream still compresses ~10x) for
-/// noticeably less CPU, which a 1s tick cadence makes worth it.
+/// `Default` buys a noticeably smaller tick (the stream is highly repetitive)
+/// at CPU the daemon has spare, so it is worth more than `Fastest` here.
 fn compression_layer() -> CompressionLayer<impl Predicate> {
     let predicate = SizeAbove::default()
         .and(NotForContentType::GRPC)
         .and(NotForContentType::IMAGES);
     CompressionLayer::new()
         .gzip(true)
-        .quality(CompressionLevel::Fastest)
+        .quality(CompressionLevel::Default)
         .compress_when(predicate)
 }
 
@@ -650,24 +668,26 @@ async fn list_connections(
     State(state): State<ApiState>,
     ApiQuery(query): ApiQuery<FlowQuery>,
 ) -> Result<Json<Page<ConnectionDto>>, ApiError> {
-    state.lock().db.list_connections(&query).map(Json)
+    db_read(state, move |db| db.list_connections(&query))
+        .await
+        .map(Json)
 }
 
 async fn overview(
     State(state): State<ApiState>,
     ApiQuery(query): ApiQuery<OverviewQuery>,
 ) -> Result<Json<OverviewDto>, ApiError> {
-    let range = query.range.unwrap_or_default();
-    state
-        .lock()
-        .db
-        .overview(
+    db_read(state, move |db| {
+        let range = query.range.unwrap_or_default();
+        db.overview(
             range,
             &query.exclude_scope,
             query.interface.as_deref(),
             SystemTime::now(),
         )
-        .map(Json)
+    })
+    .await
+    .map(Json)
 }
 
 /// Streams one `tick` per collection interval over Server-Sent Events.
@@ -720,28 +740,34 @@ async fn list_flows(
     State(state): State<ApiState>,
     ApiQuery(query): ApiQuery<FlowQuery>,
 ) -> Result<Json<Page<FlowDto>>, ApiError> {
-    state.lock().db.list_flows(&query).map(Json)
+    db_read(state, move |db| db.list_flows(&query))
+        .await
+        .map(Json)
 }
 
 async fn get_flow(
     State(state): State<ApiState>,
     AxumPath(id): AxumPath<String>,
 ) -> Result<Json<FlowDto>, ApiError> {
-    state.lock().db.get_flow(&id).map(Json)
+    db_read(state, move |db| db.get_flow(&id)).await.map(Json)
 }
 
 async fn list_endpoints(
     State(state): State<ApiState>,
     ApiQuery(query): ApiQuery<FlowQuery>,
 ) -> Result<Json<Page<EndpointSummaryDto>>, ApiError> {
-    state.lock().db.list_endpoints(&query).map(Json)
+    db_read(state, move |db| db.list_endpoints(&query))
+        .await
+        .map(Json)
 }
 
 async fn get_endpoint(
     State(state): State<ApiState>,
     AxumPath(ip): AxumPath<String>,
 ) -> Result<Json<EndpointDetailDto>, ApiError> {
-    state.lock().db.get_endpoint(&ip).map(Json)
+    db_read(state, move |db| db.get_endpoint(&ip))
+        .await
+        .map(Json)
 }
 
 #[derive(serde::Deserialize)]
@@ -756,12 +782,12 @@ async fn get_endpoint_timeline(
     AxumPath(ip): AxumPath<String>,
     ApiQuery(query): ApiQuery<TimelineQuery>,
 ) -> Result<Json<TimelineDto>, ApiError> {
-    let range = query.range.unwrap_or_default();
-    state
-        .lock()
-        .db
-        .endpoint_timeline(&ip, range, query.interface.as_deref(), SystemTime::now())
-        .map(Json)
+    db_read(state, move |db| {
+        let range = query.range.unwrap_or_default();
+        db.endpoint_timeline(&ip, range, query.interface.as_deref(), SystemTime::now())
+    })
+    .await
+    .map(Json)
 }
 
 async fn get_domain_timeline(
@@ -769,45 +795,53 @@ async fn get_domain_timeline(
     AxumPath(domain): AxumPath<String>,
     ApiQuery(query): ApiQuery<TimelineQuery>,
 ) -> Result<Json<TimelineDto>, ApiError> {
-    let range = query.range.unwrap_or_default();
-    state
-        .lock()
-        .db
-        .domain_timeline(
+    db_read(state, move |db| {
+        let range = query.range.unwrap_or_default();
+        db.domain_timeline(
             &domain,
             range,
             query.interface.as_deref(),
             SystemTime::now(),
         )
-        .map(Json)
+    })
+    .await
+    .map(Json)
 }
 
 async fn list_domains(
     State(state): State<ApiState>,
     ApiQuery(query): ApiQuery<FlowQuery>,
 ) -> Result<Json<Page<DomainSummaryDto>>, ApiError> {
-    state.lock().db.list_domains(&query).map(Json)
+    db_read(state, move |db| db.list_domains(&query))
+        .await
+        .map(Json)
 }
 
 async fn get_domain(
     State(state): State<ApiState>,
     AxumPath(domain): AxumPath<String>,
 ) -> Result<Json<DomainDetailDto>, ApiError> {
-    state.lock().db.get_domain(&domain).map(Json)
+    db_read(state, move |db| db.get_domain(&domain))
+        .await
+        .map(Json)
 }
 
 async fn list_applications(
     State(state): State<ApiState>,
     ApiQuery(query): ApiQuery<FlowQuery>,
 ) -> Result<Json<Page<ApplicationSummaryDto>>, ApiError> {
-    state.lock().db.list_applications(&query).map(Json)
+    db_read(state, move |db| db.list_applications(&query))
+        .await
+        .map(Json)
 }
 
 async fn get_application(
     State(state): State<ApiState>,
     AxumPath(id): AxumPath<String>,
 ) -> Result<Json<ApplicationDetailDto>, ApiError> {
-    state.lock().db.get_application(&id).map(Json)
+    db_read(state, move |db| db.get_application(&id))
+        .await
+        .map(Json)
 }
 
 async fn get_application_timeline(
@@ -815,12 +849,12 @@ async fn get_application_timeline(
     AxumPath(id): AxumPath<String>,
     ApiQuery(query): ApiQuery<TimelineQuery>,
 ) -> Result<Json<TimelineDto>, ApiError> {
-    let range = query.range.unwrap_or_default();
-    state
-        .lock()
-        .db
-        .application_timeline(&id, range, query.interface.as_deref(), SystemTime::now())
-        .map(Json)
+    db_read(state, move |db| {
+        let range = query.range.unwrap_or_default();
+        db.application_timeline(&id, range, query.interface.as_deref(), SystemTime::now())
+    })
+    .await
+    .map(Json)
 }
 
 async fn get_settings(State(state): State<ApiState>) -> Json<Settings> {
@@ -2104,6 +2138,108 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn entity_details_report_application_usage_and_unattributed() {
+        let state = state();
+        let mut attributed = outbound(("93.184.216.34", 443), 40, 4_000, Duration::ZERO);
+        attributed.application = Some(ApplicationRef {
+            tgid: 4242,
+            uid: 1000,
+            cgroup_id: 0,
+            comm: "curl".into(),
+        });
+        let unattributed = outbound(("93.184.216.34", 80), 10, 1_000, Duration::ZERO);
+        let mut incoming = batch(1, vec![attributed, unattributed]);
+        // Domain association follows the remote address, so both flows carry it.
+        incoming.domains = vec![observation(
+            "example.com",
+            "93.184.216.34",
+            DomainEvidence::TlsSni,
+            AssociationConfidence::Direct,
+        )];
+        state.ingest_batch(incoming);
+
+        let body = body_json(call(&state, get("/v1/endpoints/93.184.216.34")).await).await;
+        let applications = body["applications"].as_array().expect("applications");
+        assert_eq!(applications.len(), 2);
+        assert_eq!(applications[0]["application"]["name"], "curl");
+        assert_eq!(applications[0]["application"]["kind"], "process");
+        assert_eq!(applications[0]["traffic"]["outbound"]["bytes"], 4_000);
+        assert_eq!(applications[0]["flow_count"], 1);
+        assert!(applications[1]["application"].is_null());
+        assert_eq!(applications[1]["bytes"], 1_000);
+        assert_eq!(applications[1]["flow_count"], 1);
+
+        let body = body_json(call(&state, get("/v1/domains/example.com")).await).await;
+        let applications = body["applications"].as_array().expect("applications");
+        assert_eq!(applications.len(), 2);
+        assert_eq!(applications[0]["application"]["id"], "proc:comm:curl");
+        assert_eq!(applications[0]["bytes"], 4_000);
+        assert!(applications[1]["application"].is_null());
+        assert_eq!(applications[1]["traffic"]["outbound"]["bytes"], 1_000);
+
+        // The merged connection carries the outbound Application Identity.
+        let body = body_json(call(&state, get("/v1/connections")).await).await;
+        let connection = body["items"]
+            .as_array()
+            .expect("connections")
+            .iter()
+            .find(|item| {
+                item["remote"]["address"] == "93.184.216.34" && item["remote"]["port"] == 443
+            })
+            .expect("connection to 93.184.216.34:443");
+        assert_eq!(connection["application"]["name"], "curl");
+        let body = body_json(call(&state, get("/v1/connections?sort=-application")).await).await;
+        assert_eq!(body["items"][0]["application"]["name"], "curl");
+    }
+
+    #[tokio::test]
+    async fn inbound_broadcast_without_owner_is_explained_not_attributed() {
+        let multicast = state();
+        let unicast = state();
+        // An mDNS query entering the boundary: no listener and no local send,
+        // so there is nobody to attribute it to — but the absence is expected.
+        multicast.ingest_batch(batch(
+            1,
+            vec![flow(
+                FlowDirection::Inbound,
+                ("10.0.0.50", 53_000),
+                ("224.0.0.251", 5353),
+                5,
+                500,
+                Duration::ZERO,
+            )],
+        ));
+
+        let body = body_json(call(&multicast, get("/v1/flows")).await).await;
+        assert!(body["items"][0]["application"].is_null());
+        assert_eq!(body["items"][0]["unattributed_reason"], "lan_broadcast");
+
+        let body = body_json(call(&multicast, get("/v1/connections")).await).await;
+        assert_eq!(body["items"][0]["unattributed_reason"], "lan_broadcast");
+
+        let body = body_json(call(&multicast, get("/v1/endpoints/10.0.0.50")).await).await;
+        let applications = body["applications"].as_array().expect("applications");
+        assert_eq!(applications.len(), 1);
+        assert!(applications[0]["application"].is_null());
+        assert_eq!(applications[0]["unattributed_reason"], "lan_broadcast");
+
+        // A unicast inbound Flow without owner evidence stays unclassified.
+        unicast.ingest_batch(batch(
+            1,
+            vec![flow(
+                FlowDirection::Inbound,
+                ("10.0.0.51", 40_000),
+                ("10.0.0.2", 9_999),
+                2,
+                200,
+                Duration::ZERO,
+            )],
+        ));
+        let body = body_json(call(&unicast, get("/v1/flows")).await).await;
+        assert!(body["items"][0]["unattributed_reason"].is_null());
+    }
+
+    #[tokio::test]
     async fn entities_report_interval_rates() {
         let state = state();
         let mut incoming = batch(
@@ -2146,14 +2282,8 @@ mod tests {
         assert_eq!(body["items"][0]["outbound_bps"], 32_000);
         assert_eq!(body["items"][0]["inbound_bps"], 0);
 
-        // Rates trail over a window: one idle interval halves the average and
-        // the value reaches zero only after the window has fully rolled over.
+        // Rates cover the latest interval only: one idle interval reports zero.
         state.ingest_batch(batch(2, Vec::new()));
-        let body = body_json(call(&state, get("/v1/flows")).await).await;
-        assert_eq!(body["items"][0]["outbound_bps"], 16_000);
-        for sequence in 3..=(super::db::RATE_WINDOW_TICKS as u64 + 1) {
-            state.ingest_batch(batch(sequence, Vec::new()));
-        }
         let body = body_json(call(&state, get("/v1/flows")).await).await;
         assert_eq!(body["items"][0]["outbound_bps"], 0);
         let body = body_json(call(&state, get("/v1/endpoints")).await).await;
@@ -2212,11 +2342,8 @@ mod tests {
         let body = body_json(call(&state, get("/v1/domains?sort=-rate")).await).await;
         assert_eq!(body["items"][0]["domain"], "fast.example");
 
-        // Rates trail over a window, so ordering survives a few idle intervals
-        // and only falls back to zero once the window has rolled over.
-        for sequence in 2..=(super::db::RATE_WINDOW_TICKS as u64 + 1) {
-            state.ingest_batch(batch(sequence, Vec::new()));
-        }
+        // Rates cover the latest interval only, so one idle interval zeroes them.
+        state.ingest_batch(batch(2, Vec::new()));
         let body = body_json(call(&state, get("/v1/endpoints?sort=-rate")).await).await;
         assert_eq!(body["items"][0]["outbound_bps"], 0);
     }
@@ -3228,6 +3355,14 @@ mod tests {
         String::from_utf8(frame.into_data().expect("data frame").to_vec()).expect("UTF-8 frame")
     }
 
+    /// Payload of one SSE frame.
+    fn data_line(frame: &str) -> &str {
+        frame
+            .lines()
+            .find_map(|line| line.strip_prefix("data: "))
+            .expect("data line")
+    }
+
     fn assert_event_stream(response: &Response) {
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(
@@ -3311,7 +3446,7 @@ mod tests {
         assert_event_stream(&response);
         let mut body = response.into_body();
 
-        // Aggregates ride every third interval; sequence 4 is one of them.
+        // Aggregates ride every tick.
         let mut incoming = batch(
             4,
             vec![
@@ -3357,6 +3492,98 @@ mod tests {
         assert_eq!(tick["overview"]["active_flows"], 2);
         assert_eq!(tick["overview"]["flows_with_domain"], 1);
         assert_eq!(tick["overview"]["flows_total"], 2);
+    }
+
+    #[tokio::test]
+    async fn live_ticks_patch_counter_only_flows() {
+        let state = state();
+        let response = call(&state, get("/v1/stream")).await;
+        assert_event_stream(&response);
+        let mut body = response.into_body();
+
+        state.ingest_batch(batch(
+            1,
+            vec![outbound(("93.184.216.34", 443), 10, 4_000, Duration::ZERO)],
+        ));
+        let frame = next_frame(&mut body).await;
+        let tick: serde_json::Value = serde_json::from_str(data_line(&frame)).expect("tick JSON");
+        let flows = tick["flows"].as_array().expect("flows");
+        assert_eq!(flows.len(), 1, "first observation is a full record");
+        let id = flows[0]["id"].as_str().expect("flow id").to_owned();
+        assert!(
+            tick["flow_updates"].as_array().expect("patches").is_empty(),
+            "a first observation never patches"
+        );
+
+        // Same tuple, same details, more counters: only the compact patch.
+        state.ingest_batch(batch(
+            2,
+            vec![outbound(("93.184.216.34", 443), 5, 1_000, Duration::ZERO)],
+        ));
+        let frame = next_frame(&mut body).await;
+        let tick: serde_json::Value = serde_json::from_str(data_line(&frame)).expect("tick JSON");
+        assert!(
+            tick["flows"].as_array().expect("flows").is_empty(),
+            "counter-only movement must not repeat the full record"
+        );
+        let updates = tick["flow_updates"].as_array().expect("patches");
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0]["id"], id);
+        assert_eq!(updates[0]["remote"], "93.184.216.34");
+        assert!(updates[0]["bytes"].as_u64().expect("bytes") > 0);
+    }
+
+    #[tokio::test]
+    async fn live_ticks_skip_flows_without_changes() {
+        let state = state();
+        let response = call(&state, get("/v1/stream")).await;
+        assert_event_stream(&response);
+        let mut body = response.into_body();
+
+        state.ingest_batch(batch(
+            1,
+            vec![outbound(("93.184.216.34", 443), 10, 4_000, Duration::ZERO)],
+        ));
+        let _ = next_frame(&mut body).await;
+
+        // The same Flow is observed again without counter movement: it must
+        // not ride the tick at all, not even as a patch.
+        state.ingest_batch(batch(
+            2,
+            vec![outbound(("93.184.216.34", 443), 0, 0, Duration::ZERO)],
+        ));
+        let frame = next_frame(&mut body).await;
+        let tick: serde_json::Value = serde_json::from_str(data_line(&frame)).expect("tick JSON");
+        assert!(tick["flows"].as_array().expect("flows").is_empty());
+        assert!(tick["flow_updates"].as_array().expect("patches").is_empty());
+    }
+
+    #[tokio::test]
+    async fn ended_flows_always_travel_as_full_records() {
+        let state = state();
+        let response = call(&state, get("/v1/stream")).await;
+        assert_event_stream(&response);
+        let mut body = response.into_body();
+
+        state.ingest_batch(batch(
+            1,
+            vec![outbound(("93.184.216.34", 443), 10, 4_000, Duration::ZERO)],
+        ));
+        let _ = next_frame(&mut body).await;
+
+        let mut closed = outbound(("93.184.216.34", 443), 0, 0, Duration::ZERO);
+        closed.state = FlowState::Ended(zimascope_common::model::EndReason::IdleTimeout);
+        state.ingest_batch(batch(2, vec![closed]));
+
+        let frame = next_frame(&mut body).await;
+        let tick: serde_json::Value = serde_json::from_str(data_line(&frame)).expect("tick JSON");
+        let flows = tick["flows"].as_array().expect("flows");
+        assert_eq!(flows.len(), 1, "a closed Flow must send its record");
+        assert_eq!(flows[0]["state"], "ended");
+        assert!(
+            tick["flow_updates"].as_array().expect("patches").is_empty(),
+            "a closed Flow is never patched"
+        );
     }
 
     #[tokio::test]

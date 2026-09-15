@@ -40,13 +40,14 @@ use crate::proxy::{ProxyKey, ProxyResolver};
 use super::application::{ApplicationResolver, ResolvedApplication};
 use super::dto::{
     ApplicationDestinationDto, ApplicationDetailDto, ApplicationRefDto, ApplicationSummaryDto,
-    AsnCountDto, CollectorHealthDto, ConnectionDto, CountersDto, CountryCountDto,
-    CreateExportRequest, DirectionTotalsDto, DomainAddressDto, DomainDetailDto,
+    ApplicationUsageDto, AsnCountDto, CollectorHealthDto, ConnectionDto, CountersDto,
+    CountryCountDto, CreateExportRequest, DirectionTotalsDto, DomainAddressDto, DomainDetailDto,
     DomainObservationDto, DomainRefDto, DomainSummaryDto, DomainVisibilityDto, EndpointDetailDto,
     EndpointDto, EndpointSummaryDto, EvidenceCountDto, ExportFormat, ExportTaskDto, FlowDto,
-    FlowQuery, FlowStateParam, IpProfileDto, OverviewDto, Page, PortUsageDto, ProxiedTrafficDto,
-    RateDto, TickDto, TickOverviewDto, TickTrafficDto, TimeRange, TimelineDto, TimelinePointDto,
-    enum_from_value, enum_value, flow_state_name, unix_millis,
+    FlowPatchDto, FlowQuery, FlowStateParam, IpProfileDto, OverviewDto, Page, PortUsageDto,
+    ProxiedTrafficDto, RateDto, TickDto, TickOverviewDto, TickTrafficDto, TimeRange, TimelineDto,
+    TimelinePointDto, UnattributedReason, enum_from_value, enum_value, flow_state_name,
+    unix_millis,
 };
 use super::error::ApiError;
 use super::settings::Settings;
@@ -61,19 +62,24 @@ const EXPORT_MAX_RECORDS: usize = 10_000;
 const MAX_DOMAIN_CANDIDATES: usize = 8;
 /// Peer addresses embedded in one Application detail response.
 const MAX_APPLICATION_DESTINATIONS: usize = 12;
+/// Attributed Applications embedded in one Endpoint or Domain detail response.
+/// The unattributed row is always kept, beyond this cap.
+const MAX_ENTITY_APPLICATIONS: usize = 12;
 
 /// How often retention and capacity enforcement runs. The flow table is
 /// capped; a few seconds of slack is invisible, the full-table scans are not.
 const POLICY_INTERVAL: Duration = Duration::from_secs(5);
 
-/// How long the whole-history overview counters are reused.
-const OVERVIEW_CACHE_TTL: Duration = Duration::from_secs(5);
+/// How long one serialized `/v1/overview` result is reused across clients.
+/// The page aggregates scan Flow history, so several tabs asking at once
+/// should share one computation. Any ingested Flow invalidates it immediately.
+const OVERVIEW_PAGE_CACHE_TTL: Duration = Duration::from_secs(2);
+/// Distinct `(range, scope, interface)` overview variants kept at once.
+const OVERVIEW_PAGE_CACHE_CAPACITY: usize = 16;
 
-/// How many collection intervals pass between SSE aggregate refreshes.
-/// Flows still ride every tick; the endpoint/domain/application summaries are
-/// whole-history scans, and the lists that consume them refresh on their own
-/// cadence anyway.
-const AGGREGATE_TICKS: u64 = 3;
+/// How many collection intervals pass between full Collection health payloads
+/// on the stream. Health moves rarely and clients read `/v1/status` anyway.
+const HEALTH_TICK_INTERVAL: u64 = 10;
 const TOP_LIST_LIMIT: usize = 10;
 /// Upper bound on aggregate rows embedded in one SSE tick. Overflow is
 /// recovered by the client's periodic full refresh.
@@ -83,7 +89,7 @@ const MINUTE_BUCKET_RETENTION_MS: i64 = 2 * 60 * 60 * 1000;
 const HOUR_BUCKET_RETENTION_MS: i64 = 8 * 24 * 60 * 60 * 1000;
 const MS_PER_DAY: i64 = 24 * 60 * 60 * 1000;
 
-const SCHEMA_VERSION: i64 = 10;
+const SCHEMA_VERSION: i64 = 14;
 
 const SCHEMA_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS flows (
@@ -114,12 +120,84 @@ CREATE TABLE IF NOT EXISTS flows (
     remote_enriched_at_ms INTEGER NOT NULL,
     domains_json TEXT NOT NULL DEFAULT '[]',
     service TEXT,
-    app_id TEXT
+    app_id TEXT,
+    dst_scope TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_flows_last_seen ON flows(last_seen_ms);
-CREATE INDEX IF NOT EXISTS idx_flows_remote ON flows(remote_addr);
+-- Composite indexes keep the GROUP BY aggregates that order by address or
+-- Application from scanning every row: the range on `last_seen_ms` is applied
+-- while walking the grouped index, so only in-range rows reach the table.
+CREATE INDEX IF NOT EXISTS idx_flows_remote_last_seen ON flows(remote_addr, last_seen_ms);
 CREATE INDEX IF NOT EXISTS idx_flows_state ON flows(state);
-CREATE INDEX IF NOT EXISTS idx_flows_app_id ON flows(app_id);
+CREATE INDEX IF NOT EXISTS idx_flows_app_last_seen ON flows(app_id, last_seen_ms);
+
+-- Normalized Associated Domain index. `flows.domains_json` stays the source of
+-- truth on the row; these triggers mirror it here so domain aggregates join a
+-- small table instead of expanding JSON for every Flow.
+CREATE TABLE IF NOT EXISTS flow_domains (
+    flow_id INTEGER NOT NULL,
+    domain TEXT NOT NULL,
+    evidence TEXT NOT NULL,
+    confidence TEXT NOT NULL,
+    PRIMARY KEY (flow_id, domain)
+) WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS idx_flow_domains_domain ON flow_domains(domain);
+CREATE TRIGGER IF NOT EXISTS trg_flow_domains_insert AFTER INSERT ON flows
+WHEN NEW.domains_json <> '[]'
+BEGIN
+    INSERT OR REPLACE INTO flow_domains (flow_id, domain, evidence, confidence)
+    SELECT NEW.id, je.value->>'domain', je.value->>'evidence', je.value->>'confidence'
+    FROM json_each(NEW.domains_json) je
+    WHERE je.value->>'domain' IS NOT NULL;
+END;
+CREATE TRIGGER IF NOT EXISTS trg_flow_domains_update AFTER UPDATE OF domains_json ON flows
+WHEN NEW.domains_json IS NOT OLD.domains_json
+BEGIN
+    DELETE FROM flow_domains WHERE flow_id = NEW.id;
+    INSERT OR REPLACE INTO flow_domains (flow_id, domain, evidence, confidence)
+    SELECT NEW.id, je.value->>'domain', je.value->>'evidence', je.value->>'confidence'
+    FROM json_each(NEW.domains_json) je
+    WHERE je.value->>'domain' IS NOT NULL;
+END;
+CREATE TRIGGER IF NOT EXISTS trg_flow_domains_delete AFTER DELETE ON flows
+BEGIN
+    DELETE FROM flow_domains WHERE flow_id = OLD.id;
+END;
+
+-- Whole-history Flow counters maintained by triggers. The live overview reads
+-- one row instead of scanning the whole table every few seconds.
+CREATE TABLE IF NOT EXISTS flow_stats (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    flows_total INTEGER NOT NULL,
+    active_flows INTEGER NOT NULL,
+    flows_with_domain INTEGER NOT NULL
+);
+INSERT OR IGNORE INTO flow_stats (id, flows_total, active_flows, flows_with_domain)
+VALUES (1, 0, 0, 0);
+CREATE TRIGGER IF NOT EXISTS trg_flow_stats_insert AFTER INSERT ON flows
+BEGIN
+    UPDATE flow_stats SET
+        flows_total = flows_total + 1,
+        active_flows = active_flows + (NEW.state = 'active'),
+        flows_with_domain = flows_with_domain + (NEW.domains_json <> '[]')
+    WHERE id = 1;
+END;
+CREATE TRIGGER IF NOT EXISTS trg_flow_stats_update AFTER UPDATE ON flows
+BEGIN
+    UPDATE flow_stats SET
+        active_flows = active_flows + (NEW.state = 'active') - (OLD.state = 'active'),
+        flows_with_domain = flows_with_domain + (NEW.domains_json <> '[]')
+            - (OLD.domains_json <> '[]')
+    WHERE id = 1;
+END;
+CREATE TRIGGER IF NOT EXISTS trg_flow_stats_delete AFTER DELETE ON flows
+BEGIN
+    UPDATE flow_stats SET
+        flows_total = flows_total - 1,
+        active_flows = active_flows - (OLD.state = 'active'),
+        flows_with_domain = flows_with_domain - (OLD.domains_json <> '[]')
+    WHERE id = 1;
+END;
 
 CREATE TABLE IF NOT EXISTS applications (
     id TEXT PRIMARY KEY,
@@ -172,6 +250,10 @@ CREATE TABLE IF NOT EXISTS entity_buckets (
     out_bytes INTEGER NOT NULL,
     PRIMARY KEY (kind, key, resolution, start_ms, ifindex)
 );
+-- Retention deletes filter by resolution and time without a `kind`, which the
+-- primary key cannot serve; this index keeps the periodic cleanup ranged.
+CREATE INDEX IF NOT EXISTS idx_entity_buckets_retention
+    ON entity_buckets(resolution, start_ms);
 
 CREATE TABLE IF NOT EXISTS entity_rates (
     kind TEXT NOT NULL,
@@ -218,7 +300,8 @@ const FLOW_COLUMNS: &str = "id, direction, protocol, src_addr, src_port, dst_add
      remote_asn, remote_org, remote_db_version, remote_enriched_at_ms, domains_json, service, \
      app_id, \
      (SELECT name FROM applications WHERE applications.id = flows.app_id) AS app_name, \
-     (SELECT kind FROM applications WHERE applications.id = flows.app_id) AS app_kind";
+     (SELECT kind FROM applications WHERE applications.id = flows.app_id) AS app_kind, \
+     dst_scope";
 
 /// Aggregate projection of Flows grouped by `flows.app_id`, joined to the
 /// Application record for display metadata.
@@ -273,13 +356,14 @@ impl Default for ApiConfig {
 }
 
 /// Number of trailing collection intervals a reported rate averages over.
-pub(crate) const RATE_WINDOW_TICKS: usize = 5;
+/// One interval keeps rates current: a quiet interval reports zero instead of
+/// decaying an old burst.
+pub(crate) const RATE_WINDOW_TICKS: usize = 1;
 
 /// Trailing byte window for one direction: `(bytes, interval seconds)` samples.
 ///
 /// Every collection interval starts a new sample, zero bytes when the entity
-/// was idle, so a burst decays over the window instead of dropping straight to
-/// zero after one quiet second.
+/// was idle; samples beyond [`RATE_WINDOW_TICKS`] are dropped.
 #[derive(Clone, Debug, Default)]
 struct RateWindow {
     samples: VecDeque<(u64, f64)>,
@@ -376,6 +460,10 @@ pub(crate) struct StreamEvent {
     pub inbound_bps: u64,
     pub outbound_bps: u64,
     pub flows: Vec<FlowDto>,
+    /// Ids inside `flows` whose tick representation is a compact counter
+    /// patch. The full record is kept so subscriber filters can still be
+    /// evaluated without a second Flow copy.
+    pub patched_flows: HashSet<String>,
     /// Refreshed aggregates for every remote peer touched by this interval.
     pub endpoints: Vec<EndpointSummaryDto>,
     /// Refreshed aggregates for every Associated Domain touched by this
@@ -414,12 +502,16 @@ impl StreamEvent {
     /// Aggregate lists are keyed by the filtered Flows: a subscriber only
     /// receives endpoint and domain summaries that its filter can observe.
     pub(crate) fn tick(&self, filter: &super::dto::StreamFilter) -> TickDto {
-        let flows: Vec<FlowDto> = self
-            .flows
-            .iter()
-            .filter(|flow| filter.matches(flow))
-            .cloned()
-            .collect();
+        let matched = self.flows.iter().filter(|flow| filter.matches(flow));
+        let mut flows: Vec<FlowDto> = Vec::new();
+        let mut flow_updates: Vec<FlowPatchDto> = Vec::new();
+        for flow in matched {
+            if self.patched_flows.contains(&flow.id) {
+                flow_updates.push(FlowPatchDto::from(flow));
+            } else {
+                flows.push(flow.clone());
+            }
+        }
         let endpoints: Vec<EndpointSummaryDto> = {
             let keys: HashSet<&str> = flows
                 .iter()
@@ -471,6 +563,7 @@ impl StreamEvent {
                 },
             },
             flows,
+            flow_updates,
             endpoints,
             domains: domain_summaries,
             applications,
@@ -481,7 +574,12 @@ impl StreamEvent {
                 .cloned()
                 .collect(),
             overview: self.overview,
-            health: Some(self.health.clone()),
+            // Collection health changes slowly; one tick in ten carries it and
+            // clients fall back to REST state in between.
+            health: self
+                .sequence
+                .is_multiple_of(HEALTH_TICK_INTERVAL)
+                .then(|| self.health.clone()),
         }
     }
 }
@@ -508,6 +606,17 @@ pub(crate) struct TrafficRuleDraft {
     pub selector: Selector,
     pub enabled: bool,
 }
+
+/// Rows of the `entity_rates` mirror: `(inbound_bps, outbound_bps)` per
+/// `(kind, key)`.
+type StoredRates = HashMap<(String, String), (i64, i64)>;
+
+/// Rows per multi-value `entity_rates` upsert. SQLite's limit is far higher,
+/// but a moderate batch keeps the SQL string and binding vectors small.
+const ENTITY_RATE_CHUNK: usize = 64;
+
+/// One changed `entity_rates` row: its `(kind, key)` and the new rates.
+type RateBinding<'a> = (&'a (String, String), (i64, i64));
 
 /// SQLite connection plus live state that does not belong in the database.
 pub(crate) struct Db {
@@ -538,9 +647,16 @@ pub(crate) struct Db {
     /// collection interval; the table is capped, so a few seconds of slack is
     /// invisible while the full-table scans are not.
     last_policy_at: Option<Instant>,
-    /// `tick_overview` counters change slowly and scan the whole table; cache
-    /// them for a few intervals.
-    overview_cache: Option<(Instant, TickOverviewDto)>,
+    /// Serialized `/v1/overview` responses keyed by range/scope/interface,
+    /// shared by concurrent clients and dropped whenever Flows are ingested.
+    overview_pages: Mutex<HashMap<String, (Instant, OverviewDto)>>,
+    /// Last live-tick representation of each Flow's descriptive fields. When
+    /// only counters move, the next tick carries a compact patch instead of
+    /// the full record.
+    tick_details: HashMap<u64, String>,
+    /// Mirror of the `entity_rates` rows last written, so each interval only
+    /// touches rows whose rate moved or that left the window.
+    stored_rates: StoredRates,
     /// Monotonic token for Traffic Rule changes; applied programs carry it.
     rules_revision: u64,
 }
@@ -567,6 +683,12 @@ impl Db {
         let _: String = conn.query_row("PRAGMA journal_mode = WAL", [], |row| row.get(0))?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         conn.pragma_update(None, "busy_timeout", 5_000)?;
+        // The default 2 MiB page cache cannot hold a multi-day flow history, so
+        // every aggregate re-reads the same pages from the file. A larger cache
+        // and a read-only mapping cut those pread round trips; the mapping is a
+        // hint and may be capped by the kernel.
+        conn.pragma_update(None, "cache_size", -(32 * 1024i64))?;
+        conn.pragma_update(None, "mmap_size", 256 * 1024 * 1024i64)?;
         register_functions(&conn)?;
 
         let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
@@ -648,6 +770,24 @@ impl Db {
             // place instead of recreating tables.
             add_column_if_missing(&conn, "flows", "service", "TEXT")?;
             add_column_if_missing(&conn, "flows", "app_id", "TEXT")?;
+            if add_column_if_missing(&conn, "flows", "dst_scope", "TEXT")? {
+                backfill_dst_scope(&conn)?;
+            }
+            // Schema v12 replaces the single-column Flow indexes with
+            // `(address, last_seen_ms)` pairs and derives `flow_domains` from
+            // the rows already stored.
+            if version > 0 && version < 12 {
+                conn.execute_batch(
+                    "DROP INDEX IF EXISTS idx_flows_remote; \
+                     DROP INDEX IF EXISTS idx_flows_app_id;",
+                )?;
+                backfill_flow_domains(&conn)?;
+            }
+            // Schema v13 seeds the trigger-maintained whole-history counters
+            // from the rows already stored.
+            if version > 0 && version < 13 {
+                backfill_flow_stats(&conn)?;
+            }
             conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         }
 
@@ -659,6 +799,9 @@ impl Db {
                 enrichment_error = Some(format!("{error:#}"));
             }
         }
+        // Mirror persisted rates so the first interval diffs against the table
+        // instead of assuming it is empty.
+        let stored_rates = load_entity_rates(&conn)?;
 
         Ok(Self {
             conn,
@@ -682,7 +825,9 @@ impl Db {
             export_ttl: config.export_ttl,
             flow_capacity: config.flow_capacity.max(1),
             last_policy_at: None,
-            overview_cache: None,
+            overview_pages: Mutex::new(HashMap::new()),
+            tick_details: HashMap::new(),
+            stored_rates,
             rules_revision: 0,
         })
     }
@@ -714,6 +859,7 @@ impl Db {
                     inbound_bps: self.rates.inbound_bps(),
                     outbound_bps: self.rates.outbound_bps(),
                     flows: Vec::new(),
+                    patched_flows: HashSet::new(),
                     endpoints: Vec::new(),
                     domain_summaries: Vec::new(),
                     applications: Vec::new(),
@@ -744,6 +890,12 @@ impl Db {
             health,
         } = batch;
 
+        // Any new observation changes what a page overview would report; keep
+        // the shared cache from serving counters older than the last interval.
+        if !flows.is_empty() || !domains.is_empty() {
+            self.invalidate_overview_pages();
+        }
+
         self.batch_sequence = sequence;
         self.last_batch_at = Some(collected_at);
         self.last_interval = interval;
@@ -770,6 +922,7 @@ impl Db {
         self.rates.add(FlowDirection::Outbound, outbound.bytes);
 
         let mut touched: Vec<u64> = Vec::new();
+        let mut ended_ids: HashSet<u64> = HashSet::new();
         let mut domain_events: Vec<DomainObservationDto> = Vec::new();
         let mut changed_addresses: HashSet<(IpAddr, i64)> = HashSet::new();
         let mut flow_deltas: HashMap<u64, (FlowDirection, TrafficCounters, i64)> = HashMap::new();
@@ -820,6 +973,9 @@ impl Db {
             let mut domains_cache: HashMap<(IpAddr, i64), String> = HashMap::new();
             for update in flows {
                 let id = flow_id(&update.key);
+                if matches!(update.state, FlowState::Ended(_)) {
+                    ended_ids.insert(id);
+                }
                 flow_deltas.insert(
                     id,
                     (
@@ -865,8 +1021,14 @@ impl Db {
 
         touched.sort_unstable();
         touched.dedup();
+        // Only Flows with counter movement or a closure need their stored
+        // record read back: everything downstream (rates, buckets, aggregate
+        // touch sets, live ticks) skips unchanged Flows anyway.
         let mut updated: Vec<(u64, FlowDto)> = Vec::new();
         for id in touched {
+            if !flow_moved(&flow_deltas, &id) && !ended_ids.contains(&id) {
+                continue;
+            }
             if let Some(dto) = self.flow_by_id(id)? {
                 updated.push((id, dto));
             }
@@ -982,7 +1144,10 @@ impl Db {
             .map(|event| event.domain.clone())
             .collect();
         let mut touched_applications: HashSet<String> = HashSet::new();
-        for (_, flow) in &updated {
+        for (id, flow) in &updated {
+            if !flow_moved(&flow_deltas, id) {
+                continue;
+            }
             touched_addresses.insert(flow.remote.address.clone());
             if let Some(application) = &flow.application {
                 touched_applications.insert(application.id.clone());
@@ -992,10 +1157,10 @@ impl Db {
             }
         }
 
-        // Aggregates only matter to live subscribers and only every few
-        // intervals: the whole-history scans are the most expensive part of
-        // the pipeline, while Flows themselves still ride every tick.
-        let aggregate = publish && sequence.saturating_sub(1) % AGGREGATE_TICKS == 0;
+        // Aggregates only matter to live subscribers: the whole-history scans
+        // are the most expensive part of the pipeline, so idle streams skip
+        // them while Flows themselves still ride every tick.
+        let aggregate = publish;
         let (endpoints, domain_summaries, applications, overview) = if aggregate {
             (
                 self.endpoint_summaries_for(&touched_addresses)?,
@@ -1012,6 +1177,43 @@ impl Db {
             )
         };
 
+        // Live ticks carry full Flow records only for first observations,
+        // descriptive changes and closures; routine counter movement rides a
+        // compact patch so idle Flows do not repeat ~900 bytes every second.
+        let mut tick_flows: Vec<FlowDto> = Vec::with_capacity(updated.len());
+        let mut patched_flows: HashSet<String> = HashSet::new();
+        for (id, dto) in updated {
+            let moved = flow_moved(&flow_deltas, &id);
+            if !moved && dto.state != "ended" {
+                self.tick_details.remove(&id);
+                continue;
+            }
+            if dto.state == "ended" {
+                // A closed Flow never patches: the record itself must travel
+                // so clients learn the end reason, and a later reuse of the
+                // same id starts from a full record again.
+                self.tick_details.remove(&id);
+                tick_flows.push(dto);
+                continue;
+            }
+            let signature = flow_detail_signature(&dto);
+            let detail_changed = self
+                .tick_details
+                .get(&id)
+                .map(String::as_str)
+                .is_none_or(|previous| previous != signature);
+            self.tick_details.insert(id, signature);
+            if detail_changed {
+                tick_flows.push(dto);
+            } else {
+                patched_flows.insert(dto.id.clone());
+                tick_flows.push(dto);
+            }
+        }
+        if self.tick_details.len() > self.flow_capacity {
+            self.tick_details.clear();
+        }
+
         Ok(StreamEvent {
             sequence,
             collected_at,
@@ -1020,7 +1222,8 @@ impl Db {
             outbound,
             inbound_bps: self.rates.inbound_bps(),
             outbound_bps: self.rates.outbound_bps(),
-            flows: updated.into_iter().map(|(_, dto)| dto).collect(),
+            flows: tick_flows,
+            patched_flows,
             endpoints,
             domain_summaries,
             applications,
@@ -1059,42 +1262,85 @@ impl Db {
     }
 
     /// Persists the latest interval's entity rates so list queries can sort by
-    /// them with plain SQL. The table mirrors the in-memory maps exactly:
-    /// stale rows are cleared, then the current interval is written.
+    /// them with plain SQL. Only rows whose rate actually moved are rewritten;
+    /// rows that left the window are deleted.
     fn store_entity_rates(&mut self) -> Result<(), ApiError> {
+        let mut next: StoredRates =
+            HashMap::with_capacity(self.rates_by_flow.len() + self.rates_by_connection.len() + 32);
+        let mut record = |kind: &str, key: &str, rate: &EntityRates| {
+            next.insert(
+                (kind.to_owned(), key.to_owned()),
+                (rate.inbound_bps() as i64, rate.outbound_bps() as i64),
+            );
+        };
+        for (id, rate) in &self.rates_by_flow {
+            record("flow", &id.to_string(), rate);
+        }
+        for (id, rate) in &self.rates_by_connection {
+            record("connection", id, rate);
+        }
+        for (address, rate) in &self.rates_by_endpoint {
+            record("endpoint", address, rate);
+        }
+        for (domain, rate) in &self.rates_by_domain {
+            record("domain", domain, rate);
+        }
+        for (id, rate) in &self.rates_by_application {
+            record("application", id, rate);
+        }
+
+        if next == self.stored_rates {
+            return Ok(());
+        }
+        let upserts: Vec<RateBinding<'_>> = next
+            .iter()
+            .filter_map(|(key, rate)| {
+                (self.stored_rates.get(key) != Some(rate)).then_some((key, *rate))
+            })
+            .collect();
         let tx = self.conn.transaction()?;
-        tx.execute("DELETE FROM entity_rates", [])?;
+        for chunk in upserts.chunks(ENTITY_RATE_CHUNK) {
+            let mut sql = String::from(
+                "INSERT INTO entity_rates (kind, key, inbound_bps, outbound_bps) VALUES ",
+            );
+            for index in 0..chunk.len() {
+                if index > 0 {
+                    sql.push(',');
+                }
+                let base = index * 4;
+                sql.push_str(&format!(
+                    "(?{},?{},?{},?{})",
+                    base + 1,
+                    base + 2,
+                    base + 3,
+                    base + 4
+                ));
+            }
+            sql.push_str(
+                " ON CONFLICT(kind, key) DO UPDATE SET \
+                 inbound_bps = excluded.inbound_bps, outbound_bps = excluded.outbound_bps",
+            );
+            let mut bindings: Vec<Value> = Vec::with_capacity(chunk.len() * 4);
+            for (key, rate) in chunk.iter() {
+                bindings.push(Value::Text(key.0.clone()));
+                bindings.push(Value::Text(key.1.clone()));
+                bindings.push(Value::Integer(rate.0));
+                bindings.push(Value::Integer(rate.1));
+            }
+            tx.prepare_cached(&sql)?
+                .execute(params_from_iter(bindings))?;
+        }
         {
-            let mut statement = tx.prepare(
-                "INSERT INTO entity_rates (kind, key, inbound_bps, outbound_bps) \
-                 VALUES (?1, ?2, ?3, ?4)",
-            )?;
-            let mut insert = |kind: &str, key: &str, rate: &EntityRates| -> rusqlite::Result<()> {
-                statement.execute(params![
-                    kind,
-                    key,
-                    rate.inbound_bps() as i64,
-                    rate.outbound_bps() as i64,
-                ])?;
-                Ok(())
-            };
-            for (id, rate) in &self.rates_by_flow {
-                insert("flow", &id.to_string(), rate)?;
-            }
-            for (id, rate) in &self.rates_by_connection {
-                insert("connection", id, rate)?;
-            }
-            for (address, rate) in &self.rates_by_endpoint {
-                insert("endpoint", address, rate)?;
-            }
-            for (domain, rate) in &self.rates_by_domain {
-                insert("domain", domain, rate)?;
-            }
-            for (id, rate) in &self.rates_by_application {
-                insert("application", id, rate)?;
+            let mut delete =
+                tx.prepare_cached("DELETE FROM entity_rates WHERE kind = ?1 AND key = ?2")?;
+            for key in self.stored_rates.keys() {
+                if !next.contains_key(key) {
+                    delete.execute(params![key.0, key.1])?;
+                }
             }
         }
         tx.commit()?;
+        self.stored_rates = next;
         Ok(())
     }
 
@@ -1107,9 +1353,13 @@ impl Db {
             }
         }
         self.last_policy_at = Some(now_instant);
-        let count: i64 = self
-            .conn
-            .query_row("SELECT COUNT(*) FROM flows", [], |row| row.get(0))?;
+        // `flow_stats` is trigger-maintained, so capacity checks need no
+        // whole-table count.
+        let count: i64 = self.conn.query_row(
+            "SELECT flows_total FROM flow_stats WHERE id = 1",
+            [],
+            |row| row.get(0),
+        )?;
         let overflow = count - self.flow_capacity as i64;
         if overflow > 0 {
             self.conn.execute(
@@ -1256,15 +1506,34 @@ impl Db {
             .next()
             .ok_or_else(|| ApiError::not_found(format!("no Flow observed for application {id}")))?;
 
-        let mut statement = self
-            .conn
-            .prepare("SELECT domains_json FROM flows WHERE app_id = ?1")?;
+        let mut statement = self.conn.prepare(
+            "SELECT DISTINCT fd.domain, fd.evidence, fd.confidence \
+             FROM flow_domains fd JOIN flows ON flows.id = fd.flow_id \
+             WHERE flows.app_id = ?1",
+        )?;
         let mut domains: Vec<DomainRefDto> = Vec::new();
-        for row in statement.query_map([id], |row| row.get::<_, String>(0))? {
-            let parsed: Vec<DomainRefDto> = serde_json::from_str(&row?).unwrap_or_default();
-            for association in parsed {
-                push_domain(&mut domains, &association);
-            }
+        for row in statement.query_map([id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })? {
+            let (domain, evidence, confidence) = row?;
+            let (Some(evidence), Some(confidence)) = (
+                enum_from_value::<DomainEvidence>(&evidence),
+                enum_from_value::<AssociationConfidence>(&confidence),
+            ) else {
+                continue;
+            };
+            push_domain(
+                &mut domains,
+                &DomainRefDto {
+                    domain,
+                    evidence,
+                    confidence,
+                },
+            );
         }
         domains.sort_by(|left, right| left.domain.cmp(&right.domain));
         let destinations = self.application_destinations(id)?;
@@ -1298,9 +1567,9 @@ impl Db {
         let mut domains_by_address: HashMap<String, Vec<DomainRefDto>> = HashMap::new();
         {
             let mut statement = self.conn.prepare(
-                "SELECT flows.remote_addr, je.value->>'domain', je.value->>'evidence', \
-                 je.value->>'confidence' FROM flows, json_each(flows.domains_json) je \
-                 WHERE flows.app_id = ?1 AND je.value->>'domain' IS NOT NULL",
+                "SELECT flows.remote_addr, fd.domain, fd.evidence, fd.confidence \
+                 FROM flow_domains fd JOIN flows ON flows.id = fd.flow_id \
+                 WHERE flows.app_id = ?1",
             )?;
             let rows = statement.query_map([id], |row| {
                 Ok((
@@ -1374,6 +1643,50 @@ impl Db {
         }
 
         Ok(destinations)
+    }
+
+    /// Aggregates one entity's Flows by Application Identity.
+    ///
+    /// `from` is the SQL source (with alias `f`), `predicate` the entity filter
+    /// and `params` its bindings. Attributed Applications are capped at
+    /// [`MAX_ENTITY_APPLICATIONS`]; the unattributed remainder (`application:
+    /// null`) is always returned so the split stays honest.
+    fn entity_applications(
+        &self,
+        from: &str,
+        predicate: &str,
+        params: &[Value],
+    ) -> Result<Vec<ApplicationUsageDto>, ApiError> {
+        let sql = format!(
+            "WITH usage AS ( \
+             SELECT f.app_id AS app_id, MAX(a.name) AS name, MAX(a.kind) AS kind, \
+             SUM(f.packets) AS packets, SUM(f.bytes) AS bytes, \
+             COALESCE(SUM(CASE WHEN f.direction = 'inbound' THEN f.packets ELSE 0 END), 0) AS in_packets, \
+             COALESCE(SUM(CASE WHEN f.direction = 'inbound' THEN f.bytes ELSE 0 END), 0) AS in_bytes, \
+             COALESCE(SUM(CASE WHEN f.direction = 'outbound' THEN f.packets ELSE 0 END), 0) AS out_packets, \
+             COALESCE(SUM(CASE WHEN f.direction = 'outbound' THEN f.bytes ELSE 0 END), 0) AS out_bytes, \
+             COUNT(*) AS flow_count, \
+             CASE WHEN f.app_id IS NULL AND f.direction = 'inbound' \
+                  AND f.dst_scope IN ('multicast', 'broadcast') THEN 1 ELSE 0 END AS broadcast \
+             FROM {from} LEFT JOIN applications a ON a.id = f.app_id \
+             WHERE {predicate} GROUP BY f.app_id, broadcast ) \
+             SELECT app_id, name, kind, packets, bytes, in_packets, in_bytes, out_packets, \
+             out_bytes, flow_count, broadcast FROM ( \
+                 SELECT * FROM usage WHERE app_id IS NOT NULL \
+                 ORDER BY bytes DESC, app_id LIMIT ?{} \
+             ) UNION ALL \
+             SELECT app_id, name, kind, packets, bytes, in_packets, in_bytes, out_packets, \
+             out_bytes, flow_count, broadcast FROM usage WHERE app_id IS NULL \
+             ORDER BY bytes DESC",
+            params.len() + 1
+        );
+        let mut bindings = params.to_vec();
+        bindings.push(Value::Integer(MAX_ENTITY_APPLICATIONS as i64));
+        let mut statement = self.conn.prepare(&sql)?;
+        let applications = statement
+            .query_map(params_from_iter(bindings), application_usage_from_row)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(applications)
     }
 
     pub(crate) fn application_timeline(
@@ -1551,7 +1864,12 @@ impl Db {
              (MAX(last_seen_ms) - MIN(first_seen_ms)) AS duration_ms, \
              MAX(service) AS service, \
              MIN(json_extract(domains_json, '$[0].domain')) AS first_domain, \
-             json_group_array(domains_json) AS domains_all \
+             json_group_array(domains_json) AS domains_all, \
+             COALESCE(MAX(CASE WHEN direction = 'outbound' THEN app_id END), MAX(app_id)) \
+                 AS connection_app_id, \
+             MAX(CASE WHEN direction = 'inbound' \
+                 AND dst_scope IN ('multicast', 'broadcast') THEN 1 ELSE 0 END) \
+                 AS inbound_broadcast \
              FROM flows {where_clause} \
              GROUP BY protocol, ifindex, pair_lo, pair_hi {having_clause} \
              ORDER BY {order} LIMIT ?{} OFFSET ?{}",
@@ -1576,6 +1894,9 @@ impl Db {
                 let remote_address: String = row.get(5)?;
                 let host_port = row.get::<_, Option<i64>>(16)?.map(|port| port as u16);
                 let remote_port = row.get::<_, Option<i64>>(6)?.map(|port| port as u16);
+                let app_id = row.get::<_, Option<String>>(31)?;
+                let unattributed_reason = (app_id.is_none() && row.get::<_, i64>(32)? != 0)
+                    .then_some(UnattributedReason::LanBroadcast);
                 Ok((
                     ConnectionDto {
                         id: connection_id(protocol, ifindex, &pair_lo, &pair_hi),
@@ -1624,14 +1945,49 @@ impl Db {
                         last_seen: row.get(26)?,
                         duration_ms: row.get::<_, i64>(27)?.max(0) as u64,
                         domains: Vec::new(),
+                        application: None,
+                        unattributed_reason,
                     },
+                    app_id,
                     row.get::<_, String>(30)?,
                 ))
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
 
+        let app_ids: Vec<String> = rows
+            .iter()
+            .filter_map(|(_, app_id, _)| app_id.clone())
+            .collect();
+        let mut applications: HashMap<String, ApplicationRefDto> = HashMap::new();
+        if !app_ids.is_empty() {
+            let keys = json_key_list(app_ids.iter())?;
+            let mut statement = self.conn.prepare(
+                "SELECT id, name, kind FROM applications \
+                 WHERE id IN (SELECT value FROM json_each(?1))",
+            )?;
+            let records = statement.query_map([keys], |row| {
+                let id: String = row.get(0)?;
+                let name: Option<String> = row.get(1)?;
+                let kind: Option<String> = row.get(2)?;
+                Ok(ApplicationRefDto {
+                    name: name
+                        .filter(|name| !name.is_empty())
+                        .unwrap_or_else(|| id.clone()),
+                    kind: match kind.as_deref() {
+                        Some("container") => "container",
+                        _ => "process",
+                    },
+                    id,
+                })
+            })?;
+            for record in records {
+                let record = record?;
+                applications.insert(record.id.clone(), record);
+            }
+        }
+
         let mut items = Vec::with_capacity(rows.len());
-        for (mut connection, domains_json) in rows {
+        for (mut connection, app_id, domains_json) in rows {
             let groups: Vec<String> = serde_json::from_str(&domains_json).unwrap_or_default();
             let mut domains: Vec<DomainRefDto> = Vec::new();
             for group in &groups {
@@ -1643,6 +1999,16 @@ impl Db {
             }
             domains.sort_by(|left, right| left.domain.cmp(&right.domain));
             connection.domains = domains;
+            connection.application = app_id.map(|id| {
+                applications
+                    .get(&id)
+                    .cloned()
+                    .unwrap_or_else(|| ApplicationRefDto {
+                        name: id.clone(),
+                        kind: "process",
+                        id,
+                    })
+            });
             if connection.service.is_none() {
                 // Historical rows predate fingerprinting: Domain Evidence from
                 // a parsed TLS/HTTP handshake still names the protocol.
@@ -1811,6 +2177,12 @@ impl Db {
         }
         domains.sort_by(|a, b| a.domain.cmp(&b.domain));
 
+        let applications = self.entity_applications(
+            "flows f",
+            "f.remote_addr = ?1",
+            &[Value::Text(address_string.clone())],
+        )?;
+
         Ok(EndpointDetailDto {
             address: address_string.clone(),
             profile,
@@ -1821,6 +2193,7 @@ impl Db {
             last_seen: summary.12,
             ports,
             domains,
+            applications,
             flows_url: format!("/v1/flows?ip={}", encode_uri_component(&address_string)),
         })
     }
@@ -1931,8 +2304,8 @@ impl Db {
         })?;
 
         let mut evidence_statement = self.conn.prepare(
-            "SELECT je.value->>'evidence', COUNT(*) FROM flows, json_each(flows.domains_json) je \
-             WHERE je.value->>'domain' = ?1 GROUP BY 1",
+            "SELECT fd.evidence, COUNT(*) FROM flow_domains fd \
+             WHERE fd.domain = ?1 GROUP BY 1",
         )?;
         let evidence = evidence_statement
             .query_map([&domain], |row| {
@@ -1952,9 +2325,9 @@ impl Db {
             "SELECT f.remote_addr, MAX(f.remote_country), MAX(f.remote_asn), MAX(f.remote_org), \
              COALESCE(SUM(f.bytes), 0), COALESCE(MIN(f.first_seen_ms), 0), \
              COALESCE(MAX(f.last_seen_ms), 0), \
-             GROUP_CONCAT(DISTINCT je.value->>'evidence'), \
-             MAX(CASE WHEN je.value->>'confidence' = 'direct' THEN 1 ELSE 0 END) \
-             FROM flows f, json_each(f.domains_json) je WHERE je.value->>'domain' = ?1 \
+             GROUP_CONCAT(DISTINCT fd.evidence), \
+             MAX(CASE WHEN fd.confidence = 'direct' THEN 1 ELSE 0 END) \
+             FROM flow_domains fd JOIN flows f ON f.id = fd.flow_id WHERE fd.domain = ?1 \
              GROUP BY f.remote_addr ORDER BY 5 DESC, f.remote_addr",
         )?;
         let addresses = addresses_statement
@@ -2009,8 +2382,8 @@ impl Db {
 
         let mut countries_statement = self.conn.prepare(
             "SELECT f.remote_country, SUM(f.bytes), COUNT(*) \
-             FROM flows f, json_each(f.domains_json) je \
-             WHERE je.value->>'domain' = ?1 AND f.remote_country IS NOT NULL \
+             FROM flow_domains fd JOIN flows f ON f.id = fd.flow_id \
+             WHERE fd.domain = ?1 AND f.remote_country IS NOT NULL \
              GROUP BY 1 ORDER BY 2 DESC LIMIT ?2",
         )?;
         let countries = countries_statement
@@ -2025,8 +2398,8 @@ impl Db {
 
         let mut asns_statement = self.conn.prepare(
             "SELECT f.remote_asn, MAX(f.remote_org), SUM(f.bytes), COUNT(*) \
-             FROM flows f, json_each(f.domains_json) je \
-             WHERE je.value->>'domain' = ?1 AND f.remote_asn IS NOT NULL \
+             FROM flow_domains fd JOIN flows f ON f.id = fd.flow_id \
+             WHERE fd.domain = ?1 AND f.remote_asn IS NOT NULL \
              GROUP BY 1 ORDER BY 3 DESC LIMIT ?2",
         )?;
         let asns = asns_statement
@@ -2040,6 +2413,12 @@ impl Db {
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
 
+        let applications = self.entity_applications(
+            "flow_domains fd JOIN flows f ON f.id = fd.flow_id",
+            "fd.domain = ?1",
+            &[Value::Text(domain.clone())],
+        )?;
+
         Ok(DomainDetailDto {
             domain: domain.clone(),
             packets: summary.packets,
@@ -2051,6 +2430,7 @@ impl Db {
             addresses,
             countries,
             asns,
+            applications,
             flows_url: format!("/v1/flows?domain={}", encode_uri_component(&domain)),
         })
     }
@@ -2063,25 +2443,24 @@ impl Db {
     ) -> Result<(Vec<DomainSummaryDto>, usize), ApiError> {
         let now = SystemTime::now();
         let (mut clauses, mut params) = self.flow_clauses(query, now, "flows.", false)?;
-        clauses.push("je.value->>'domain' IS NOT NULL".to_owned());
         if let Some(domain) = query.domain.as_deref().map(normalize_domain) {
-            clauses.push("je.value->>'domain' = ?".to_owned());
+            clauses.push("fd.domain = ?".to_owned());
             params.push(Value::Text(domain));
         }
         if let Some(evidence) = query.evidence {
-            clauses.push("je.value->>'evidence' = ?".to_owned());
+            clauses.push("fd.evidence = ?".to_owned());
             params.push(Value::Text(enum_value(evidence)));
         }
         if let Some(confidence) = query.confidence {
-            clauses.push("je.value->>'confidence' = ?".to_owned());
+            clauses.push("fd.confidence = ?".to_owned());
             params.push(Value::Text(enum_value(confidence)));
         }
         let where_clause = where_sql(&clauses);
 
         let total: i64 = self.conn.query_row(
             &format!(
-                "SELECT COUNT(DISTINCT je.value->>'domain') \
-                 FROM flows, json_each(flows.domains_json) je {where_clause}"
+                "SELECT COUNT(DISTINCT fd.domain) FROM flow_domains fd \
+                 JOIN flows ON flows.id = fd.flow_id {where_clause}"
             ),
             params_from_iter(params.clone()),
             |row| row.get(0),
@@ -2089,7 +2468,7 @@ impl Db {
 
         let order = domain_order(query.sort.as_deref())?;
         let sql = format!(
-            "SELECT je.value->>'domain' AS domain, SUM(flows.packets) AS total_packets, \
+            "SELECT fd.domain AS domain, SUM(flows.packets) AS total_packets, \
              SUM(flows.bytes) AS total_bytes, \
              COALESCE(SUM(CASE WHEN flows.direction = 'inbound' THEN flows.packets ELSE 0 END), 0) \
                  AS in_packets, \
@@ -2100,8 +2479,9 @@ impl Db {
              COALESCE(SUM(CASE WHEN flows.direction = 'outbound' THEN flows.bytes ELSE 0 END), 0) \
                  AS out_bytes, \
              COUNT(*) AS flow_count, MIN(flows.first_seen_ms), MAX(flows.last_seen_ms), \
-             GROUP_CONCAT(DISTINCT je.value->>'evidence') AS evidences \
-             FROM flows, json_each(flows.domains_json) je {where_clause} GROUP BY 1 \
+             GROUP_CONCAT(DISTINCT fd.evidence) AS evidences \
+             FROM flow_domains fd JOIN flows ON flows.id = fd.flow_id {where_clause} \
+             GROUP BY fd.domain \
              ORDER BY {order} LIMIT ?{} OFFSET ?{}",
             params.len() + 1,
             params.len() + 2
@@ -2212,7 +2592,7 @@ impl Db {
         }
         let keys = json_key_list(domains.iter())?;
         let mut statement = self.conn.prepare(
-            "SELECT je.value->>'domain' AS domain, SUM(flows.packets) AS total_packets, \
+            "SELECT fd.domain AS domain, SUM(flows.packets) AS total_packets, \
              SUM(flows.bytes) AS total_bytes, \
              COALESCE(SUM(CASE WHEN flows.direction = 'inbound' THEN flows.packets ELSE 0 END), 0) \
                  AS in_packets, \
@@ -2223,10 +2603,10 @@ impl Db {
              COALESCE(SUM(CASE WHEN flows.direction = 'outbound' THEN flows.bytes ELSE 0 END), 0) \
                  AS out_bytes, \
              COUNT(*) AS flow_count, MIN(flows.first_seen_ms), MAX(flows.last_seen_ms), \
-             GROUP_CONCAT(DISTINCT je.value->>'evidence') \
-             FROM flows, json_each(flows.domains_json) je \
-             WHERE je.value->>'domain' IN (SELECT value FROM json_each(?1)) \
-             GROUP BY 1 ORDER BY total_bytes DESC, domain LIMIT ?2",
+             GROUP_CONCAT(DISTINCT fd.evidence) \
+             FROM flow_domains fd JOIN flows ON flows.id = fd.flow_id \
+             WHERE fd.domain IN (SELECT value FROM json_each(?1)) \
+             GROUP BY fd.domain ORDER BY total_bytes DESC, domain LIMIT ?2",
         )?;
         let mut items = statement
             .query_map(params![keys, TICK_AGGREGATE_LIMIT as i64], |row| {
@@ -2260,17 +2640,13 @@ impl Db {
     }
 
     /// Live counters over the whole retained history.
-    fn tick_overview(&mut self) -> Result<TickOverviewDto, ApiError> {
-        let now = Instant::now();
-        if let Some((cached_at, cached)) = self.overview_cache {
-            if now.saturating_duration_since(cached_at) < OVERVIEW_CACHE_TTL {
-                return Ok(cached);
-            }
-        }
-
+    ///
+    /// [`flow_stats`] is maintained by the `flows` triggers, so this is one
+    /// indexed row read instead of a whole-table scan per aggregate tick.
+    fn tick_overview(&self) -> Result<TickOverviewDto, ApiError> {
         let (flows_total, flows_with_domain, active_flows): (i64, i64, i64) = self.conn.query_row(
-            "SELECT COUNT(*), COALESCE(SUM(domains_json <> '[]'), 0), \
-                 COALESCE(SUM(state = 'active'), 0) FROM flows",
+            "SELECT flows_total, flows_with_domain, active_flows \
+             FROM flow_stats WHERE id = 1",
             [],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )?;
@@ -2279,14 +2655,12 @@ impl Db {
         } else {
             flows_with_domain as f64 / flows_total as f64
         };
-        let overview = TickOverviewDto {
+        Ok(TickOverviewDto {
             active_flows: active_flows as u64,
             flows_total: flows_total as u64,
             flows_with_domain: flows_with_domain as u64,
             ratio,
-        };
-        self.overview_cache = Some((now, overview));
-        Ok(overview)
+        })
     }
 
     // --------------------------------------------------------------- overview
@@ -2298,6 +2672,15 @@ impl Db {
         interface: Option<&str>,
         now: SystemTime,
     ) -> Result<OverviewDto, ApiError> {
+        let cache_key = overview_page_key(range, exclude_scope, interface);
+        if let Ok(cache) = self.overview_pages.lock() {
+            if let Some((cached_at, cached)) = cache.get(&cache_key) {
+                if cached_at.elapsed() < OVERVIEW_PAGE_CACHE_TTL {
+                    return Ok(cached.clone());
+                }
+            }
+        }
+
         let query = FlowQuery {
             range: Some(range),
             limit: Some(TOP_LIST_LIMIT),
@@ -2353,7 +2736,7 @@ impl Db {
         let by_evidence = self.aggregate_evidence(&query, now)?;
         let proxied = self.aggregate_proxied(&query, now)?;
 
-        Ok(OverviewDto {
+        let overview = OverviewDto {
             range: range.as_str(),
             generated_at: unix_millis(now),
             rates: if self.rates_are_fresh(now) {
@@ -2379,7 +2762,14 @@ impl Db {
             },
             proxied,
             health: self.health.as_ref().map(CollectorHealthDto::from_health),
-        })
+        };
+        if let Ok(mut cache) = self.overview_pages.lock() {
+            if cache.len() >= OVERVIEW_PAGE_CACHE_CAPACITY {
+                cache.clear();
+            }
+            cache.insert(cache_key, (Instant::now(), overview.clone()));
+        }
+        Ok(overview)
     }
 
     /// Fake-IP traffic totals: present at the boundary, but terminated by the
@@ -2415,11 +2805,22 @@ impl Db {
         query: &FlowQuery,
         now: SystemTime,
     ) -> Result<Vec<EvidenceCountDto>, ApiError> {
-        let (mut clauses, params) = self.flow_clauses(query, now, "flows.", true)?;
-        clauses.push("je.value->>'evidence' IS NOT NULL".to_owned());
+        let (mut clauses, mut params) = self.flow_clauses(query, now, "flows.", false)?;
+        if let Some(domain) = query.domain.as_deref().map(normalize_domain) {
+            clauses.push("fd.domain = ?".to_owned());
+            params.push(Value::Text(domain));
+        }
+        if let Some(confidence) = query.confidence {
+            clauses.push("fd.confidence = ?".to_owned());
+            params.push(Value::Text(enum_value(confidence)));
+        }
+        if let Some(evidence) = query.evidence {
+            clauses.push("fd.evidence = ?".to_owned());
+            params.push(Value::Text(enum_value(evidence)));
+        }
         let sql = format!(
-            "SELECT je.value->>'evidence', COUNT(DISTINCT flows.id) FROM flows, \
-             json_each(flows.domains_json) je {} GROUP BY 1 ORDER BY 2 DESC",
+            "SELECT fd.evidence, COUNT(DISTINCT flows.id) FROM flow_domains fd \
+             JOIN flows ON flows.id = fd.flow_id {} GROUP BY 1 ORDER BY 2 DESC",
             where_sql(&clauses)
         );
         let mut statement = self.conn.prepare(&sql)?;
@@ -2814,6 +3215,9 @@ impl Db {
         self.rates_by_endpoint.clear();
         self.rates_by_domain.clear();
         self.rates_by_application.clear();
+        self.tick_details.clear();
+        self.stored_rates.clear();
+        self.invalidate_overview_pages();
         self.audit("history.clear", "completed");
     }
 
@@ -2845,7 +3249,17 @@ impl Db {
              ON CONFLICT(id) DO UPDATE SET json = excluded.json, version = excluded.version",
             params![json, version as i64],
         )?;
+        // Retention and capacity can delete Flows immediately.
+        self.tick_details.clear();
+        self.invalidate_overview_pages();
         self.enforce_policy(settings, SystemTime::now())
+    }
+
+    /// Drops cached page overviews after stored Flows change.
+    fn invalidate_overview_pages(&self) {
+        if let Ok(mut cache) = self.overview_pages.lock() {
+            cache.clear();
+        }
     }
 
     // ----------------------------------------------------------- traffic rules
@@ -3400,9 +3814,9 @@ fn upsert_flow(
          ifindex, interface, packets, bytes, first_seen_ms, last_seen_ms, state, end_reason, \
          remote_addr, remote_port, remote_scope, remote_country, remote_region, remote_city, \
          remote_asn, remote_org, remote_db_version, remote_enriched_at_ms, domains_json, \
-         service, app_id) \
+         service, app_id, dst_scope) \
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, \
-         ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28) \
+         ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29) \
          ON CONFLICT(id) DO UPDATE SET \
          packets = excluded.packets, bytes = excluded.bytes, \
          first_seen_ms = MIN(flows.first_seen_ms, excluded.first_seen_ms), \
@@ -3411,6 +3825,7 @@ fn upsert_flow(
          interface = excluded.interface, domains_json = excluded.domains_json, \
          service = COALESCE(excluded.service, flows.service), \
          app_id = COALESCE(excluded.app_id, flows.app_id), \
+         dst_scope = excluded.dst_scope, \
          remote_scope = excluded.remote_scope, \
          remote_country = CASE WHEN excluded.remote_scope = 'fake_ip' \
              THEN COALESCE(excluded.remote_country, flows.remote_country) \
@@ -3467,6 +3882,7 @@ fn upsert_flow(
         application
             .as_ref()
             .map(|application| application.id.as_str()),
+        enum_value(AddressScope::classify(update.key.destination.address)),
     ])?;
     Ok(())
 }
@@ -3592,6 +4008,7 @@ fn flow_dto_from_row(row: &Row<'_>) -> rusqlite::Result<FlowDto> {
     let domains_json: String = row.get(25)?;
     let first_seen: i64 = row.get(11)?;
     let last_seen: i64 = row.get(12)?;
+    let application = flow_application_from_row(row)?;
 
     Ok(FlowDto {
         id: format!("{:016x}", row.get::<_, i64>(0)? as u64),
@@ -3631,8 +4048,29 @@ fn flow_dto_from_row(row: &Row<'_>) -> rusqlite::Result<FlowDto> {
         last_seen,
         duration_ms: (last_seen - first_seen).max(0) as u64,
         domains: serde_json::from_str(&domains_json).unwrap_or_default(),
-        application: flow_application_from_row(row)?,
+        application: application.clone(),
+        unattributed_reason: unattributed_reason(
+            &direction,
+            row.get::<_, Option<String>>(30)?,
+            application.is_none(),
+        ),
     })
+}
+
+/// Explains an absent Application Identity when the destination is an inbound
+/// LAN multicast or broadcast address: discovery chatter, not an Application.
+fn unattributed_reason(
+    direction: &str,
+    dst_scope: Option<String>,
+    unattributed: bool,
+) -> Option<UnattributedReason> {
+    if !unattributed || direction != "inbound" {
+        return None;
+    }
+    match dst_scope.as_deref() {
+        Some("multicast" | "broadcast") => Some(UnattributedReason::LanBroadcast),
+        _ => None,
+    }
 }
 
 fn flow_application_from_row(row: &Row<'_>) -> rusqlite::Result<Option<ApplicationRefDto>> {
@@ -3647,6 +4085,42 @@ fn flow_application_from_row(row: &Row<'_>) -> rusqlite::Result<Option<Applicati
             _ => "process",
         },
     }))
+}
+
+fn application_usage_from_row(row: &Row<'_>) -> rusqlite::Result<ApplicationUsageDto> {
+    let id: Option<String> = row.get(0)?;
+    let name: Option<String> = row.get(1)?;
+    let kind: Option<String> = row.get(2)?;
+    let broadcast = row.get::<_, i64>(10)? != 0;
+    let application = id.map(|id| ApplicationRefDto {
+        name: name
+            .filter(|name| !name.is_empty())
+            .unwrap_or_else(|| id.clone()),
+        kind: match kind.as_deref() {
+            Some("container") => "container",
+            _ => "process",
+        },
+        id,
+    });
+    let unattributed_reason =
+        (application.is_none() && broadcast).then_some(UnattributedReason::LanBroadcast);
+    Ok(ApplicationUsageDto {
+        application,
+        unattributed_reason,
+        packets: row.get::<_, i64>(3)? as u64,
+        bytes: row.get::<_, i64>(4)? as u64,
+        traffic: DirectionTotalsDto {
+            inbound: CountersDto {
+                packets: row.get::<_, i64>(5)? as u64,
+                bytes: row.get::<_, i64>(6)? as u64,
+            },
+            outbound: CountersDto {
+                packets: row.get::<_, i64>(7)? as u64,
+                bytes: row.get::<_, i64>(8)? as u64,
+            },
+        },
+        flow_count: row.get::<_, i64>(9)? as u64,
+    })
 }
 
 fn application_summary_from_row(row: &Row<'_>) -> rusqlite::Result<ApplicationSummaryDto> {
@@ -3843,9 +4317,9 @@ fn domain_order(sort: Option<&str>) -> Result<String, ApiError> {
         "in_bytes" => "in_bytes".to_owned(),
         "out_bytes" => "out_bytes".to_owned(),
         "last_seen" => "last_seen_ms".to_owned(),
-        "domain" => "domain_sort_key(je.value->>'domain')".to_owned(),
+        "domain" => "domain_sort_key(fd.domain)".to_owned(),
         "evidence" => "evidences".to_owned(),
-        "rate" | "in_rate" | "out_rate" => rate_order("domain", "je.value->>'domain'", field),
+        "rate" | "in_rate" | "out_rate" => rate_order("domain", "fd.domain", field),
         _ => return Err(unsupported_sort(field)),
     };
     let direction = if descending { "DESC" } else { "ASC" };
@@ -3863,6 +4337,7 @@ fn connection_order(sort: Option<&str>) -> Result<String, ApiError> {
         "in_bytes" => "in_bytes".to_owned(),
         "out_bytes" => "out_bytes".to_owned(),
         "service" => "service".to_owned(),
+        "application" => "connection_app_id".to_owned(),
         "remote" => "ip_sort_key(MAX(remote_addr))".to_owned(),
         "domain" => "domain_sort_key(MIN(json_extract(domains_json, '$[0].domain')))".to_owned(),
         "rate" | "in_rate" | "out_rate" => rate_order(
@@ -3936,6 +4411,62 @@ fn where_sql(clauses: &[String]) -> String {
     } else {
         format!("WHERE {}", clauses.join(" AND "))
     }
+}
+
+/// Stable cache key for one `/v1/overview` variant.
+fn overview_page_key(
+    range: TimeRange,
+    exclude_scope: &[AddressScope],
+    interface: Option<&str>,
+) -> String {
+    let mut scopes: Vec<String> = exclude_scope
+        .iter()
+        .map(|scope| enum_value(*scope))
+        .collect();
+    scopes.sort_unstable();
+    format!(
+        "{}|{}|{}",
+        range.as_str(),
+        scopes.join(","),
+        interface.unwrap_or("")
+    )
+}
+
+/// Whether a Flow carried new counters this interval.
+fn flow_moved(deltas: &HashMap<u64, (FlowDirection, TrafficCounters, i64)>, id: &u64) -> bool {
+    deltas
+        .get(id)
+        .is_some_and(|(_, delta, _)| delta.packets > 0 || delta.bytes > 0)
+}
+
+/// Descriptive fields of a Flow that force a full live record when they
+/// change. Counters and timestamps are deliberately excluded: those ride the
+/// compact patch instead.
+fn flow_detail_signature(flow: &FlowDto) -> String {
+    let mut signature = String::with_capacity(48);
+    signature.push_str(flow.state);
+    if let Some(reason) = flow.end_reason {
+        signature.push('|');
+        signature.push_str(&format!("{reason:?}"));
+    }
+    if let Some(application) = &flow.application {
+        signature.push('|');
+        signature.push_str(&application.id);
+        signature.push(':');
+        signature.push_str(application.kind);
+    }
+    if flow.unattributed_reason.is_some() {
+        signature.push_str("|unattributed");
+    }
+    for domain in &flow.domains {
+        signature.push('|');
+        signature.push_str(&domain.domain);
+        signature.push(':');
+        signature.push_str(&format!("{:?}", domain.evidence));
+        signature.push(':');
+        signature.push_str(&format!("{:?}", domain.confidence));
+    }
+    signature
 }
 
 /// Registers the SQLite scalar helpers used by ordering expressions.
@@ -4083,17 +4614,50 @@ fn add_column_if_missing(
     table: &str,
     column: &str,
     definition: &str,
-) -> Result<(), ApiError> {
+) -> Result<bool, ApiError> {
     let mut statement = conn.prepare(&format!("PRAGMA table_info({table})"))?;
     let existing = statement
         .query_map([], |row| row.get::<_, String>(1))?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     if existing.iter().any(|name| name == column) {
-        return Ok(());
+        return Ok(false);
     }
     conn.execute_batch(&format!(
         "ALTER TABLE {table} ADD COLUMN {column} {definition}"
     ))?;
+    Ok(true)
+}
+
+/// Classifies the destination address of every retained Flow once, for the
+/// databases that gain the `dst_scope` column on upgrade. The scope is
+/// otherwise written at ingest; classifying in Rust keeps one definition.
+fn backfill_dst_scope(conn: &rusqlite::Connection) -> Result<(), ApiError> {
+    let mut statement =
+        conn.prepare("SELECT DISTINCT dst_addr FROM flows WHERE dst_scope IS NULL")?;
+    let addresses = statement
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(statement);
+
+    // One UPDATE per distinct scope keeps this to a handful of table scans.
+    let mut by_scope: HashMap<String, Vec<String>> = HashMap::new();
+    for address in addresses {
+        let Ok(address) = address.parse::<IpAddr>() else {
+            continue;
+        };
+        by_scope
+            .entry(enum_value(AddressScope::classify(address)))
+            .or_default()
+            .push(address.to_string());
+    }
+    for (scope, addresses) in by_scope {
+        let keys = json_key_list(addresses.iter())?;
+        conn.execute(
+            "UPDATE flows SET dst_scope = ?1 WHERE dst_scope IS NULL \
+             AND dst_addr IN (SELECT value FROM json_each(?2))",
+            params![scope, keys],
+        )?;
+    }
     Ok(())
 }
 
@@ -4102,6 +4666,55 @@ fn split_enum_list(value: &str) -> Vec<DomainEvidence> {
         .split(',')
         .filter_map(|kind| enum_from_value(kind.trim()))
         .collect()
+}
+
+/// Rebuilds the normalized `flow_domains` rows from `flows.domains_json`.
+///
+/// Only used by the schema v12 migration; new rows are mirrored by triggers.
+fn backfill_flow_domains(conn: &rusqlite::Connection) -> Result<(), ApiError> {
+    conn.execute_batch(
+        "INSERT OR REPLACE INTO flow_domains (flow_id, domain, evidence, confidence) \
+         SELECT flows.id, je.value->>'domain', je.value->>'evidence', \
+                je.value->>'confidence' \
+         FROM flows, json_each(flows.domains_json) je \
+         WHERE flows.domains_json <> '[]' AND je.value->>'domain' IS NOT NULL",
+    )?;
+    Ok(())
+}
+
+/// Seeds the trigger-maintained whole-history counters for existing rows.
+///
+/// Only used by the schema v13 migration; afterwards the triggers keep
+/// `flow_stats` exact on every write.
+fn backfill_flow_stats(conn: &rusqlite::Connection) -> Result<(), ApiError> {
+    conn.execute_batch(
+        "UPDATE flow_stats SET \
+             flows_total = (SELECT COUNT(*) FROM flows), \
+             active_flows = (SELECT COUNT(*) FROM flows WHERE state = 'active'), \
+             flows_with_domain = \
+                 (SELECT COUNT(*) FROM flows WHERE domains_json <> '[]') \
+         WHERE id = 1",
+    )?;
+    Ok(())
+}
+
+/// Reads the persisted entity rates into the in-memory mirror used by
+/// [`Db::store_entity_rates`] for diffing.
+fn load_entity_rates(conn: &rusqlite::Connection) -> Result<StoredRates, ApiError> {
+    let mut statement =
+        conn.prepare("SELECT kind, key, inbound_bps, outbound_bps FROM entity_rates")?;
+    let rows = statement.query_map([], |row| {
+        Ok((
+            (row.get::<_, String>(0)?, row.get::<_, String>(1)?),
+            (row.get::<_, i64>(2)?, row.get::<_, i64>(3)?),
+        ))
+    })?;
+    let mut rates = HashMap::new();
+    for row in rows {
+        let (key, value) = row?;
+        rates.insert(key, value);
+    }
+    Ok(rates)
 }
 
 /// Sorted, deduplicated JSON array used as a `json_each` key list.
@@ -4548,6 +5161,317 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(path.with_extension("db-wal"));
         let _ = std::fs::remove_file(path.with_extension("db-shm"));
+    }
+
+    #[test]
+    fn migrates_a_v10_database_and_classifies_destination_scopes() {
+        let unique = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_nanos();
+        let path =
+            std::env::temp_dir().join(format!("zs-dst-scope-{}-{unique}.db", std::process::id()));
+        {
+            let conn = Connection::open(&path).expect("open old database");
+            conn.execute_batch(
+                "CREATE TABLE flows ( \
+                     id INTEGER PRIMARY KEY, direction TEXT NOT NULL, protocol TEXT NOT NULL, \
+                     src_addr TEXT NOT NULL, src_port INTEGER, dst_addr TEXT NOT NULL, \
+                     dst_port INTEGER, ifindex INTEGER NOT NULL, interface TEXT, \
+                     packets INTEGER NOT NULL, bytes INTEGER NOT NULL, \
+                     first_seen_ms INTEGER NOT NULL, last_seen_ms INTEGER NOT NULL, \
+                     state TEXT NOT NULL, end_reason TEXT, remote_addr TEXT NOT NULL, \
+                     remote_port INTEGER, remote_scope TEXT NOT NULL, remote_country TEXT, \
+                     remote_region TEXT, remote_city TEXT, remote_asn INTEGER, \
+                     remote_org TEXT, remote_db_version TEXT, \
+                     remote_enriched_at_ms INTEGER NOT NULL, \
+                     domains_json TEXT NOT NULL DEFAULT '[]', service TEXT, app_id TEXT); \
+                 INSERT INTO flows (id, direction, protocol, src_addr, src_port, dst_addr, \
+                     dst_port, ifindex, packets, bytes, first_seen_ms, last_seen_ms, state, \
+                     remote_addr, remote_scope, remote_enriched_at_ms) VALUES \
+                     (1, 'inbound', 'udp', '10.0.0.50', 53000, '224.0.0.251', 5353, \
+                      7, 1, 10, 0, 0, 'active', '10.0.0.50', 'private', 0), \
+                     (2, 'outbound', 'tcp', '10.0.0.2', 40000, '93.184.216.34', 443, \
+                      7, 1, 10, 0, 0, 'active', '93.184.216.34', 'public', 0); \
+                 PRAGMA user_version = 10;",
+            )
+            .expect("seed v10 schema");
+        }
+
+        let db = Db::open(&ApiConfig {
+            database: Some(path.clone()),
+            ..ApiConfig::default()
+        })
+        .expect("open upgraded database");
+
+        let scope: String = db
+            .conn
+            .query_row("SELECT dst_scope FROM flows WHERE id = 1", [], |row| {
+                row.get(0)
+            })
+            .expect("multicast row classified");
+        assert_eq!(scope, "multicast");
+        let scope: String = db
+            .conn
+            .query_row("SELECT dst_scope FROM flows WHERE id = 2", [], |row| {
+                row.get(0)
+            })
+            .expect("unicast row classified");
+        assert_eq!(scope, "public");
+
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("db-wal"));
+        let _ = std::fs::remove_file(path.with_extension("db-shm"));
+    }
+
+    #[test]
+    fn migrates_a_v11_database_and_backfills_flow_domains() {
+        let unique = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "zs-flow-domains-{}-{unique}.db",
+            std::process::id()
+        ));
+        {
+            let conn = Connection::open(&path).expect("open old database");
+            conn.execute_batch(
+                "CREATE TABLE flows ( \
+                     id INTEGER PRIMARY KEY, direction TEXT NOT NULL, protocol TEXT NOT NULL, \
+                     src_addr TEXT NOT NULL, src_port INTEGER, dst_addr TEXT NOT NULL, \
+                     dst_port INTEGER, ifindex INTEGER NOT NULL, interface TEXT, \
+                     packets INTEGER NOT NULL, bytes INTEGER NOT NULL, \
+                     first_seen_ms INTEGER NOT NULL, last_seen_ms INTEGER NOT NULL, \
+                     state TEXT NOT NULL, end_reason TEXT, remote_addr TEXT NOT NULL, \
+                     remote_port INTEGER, remote_scope TEXT NOT NULL, remote_country TEXT, \
+                     remote_region TEXT, remote_city TEXT, remote_asn INTEGER, \
+                     remote_org TEXT, remote_db_version TEXT, \
+                     remote_enriched_at_ms INTEGER NOT NULL, \
+                     domains_json TEXT NOT NULL DEFAULT '[]', service TEXT, app_id TEXT, \
+                     dst_scope TEXT); \
+                 CREATE INDEX idx_flows_remote ON flows(remote_addr); \
+                 CREATE INDEX idx_flows_app_id ON flows(app_id); \
+                 INSERT INTO flows (id, direction, protocol, src_addr, src_port, dst_addr, \
+                     dst_port, ifindex, packets, bytes, first_seen_ms, last_seen_ms, state, \
+                     remote_addr, remote_scope, remote_enriched_at_ms, domains_json) VALUES \
+                     (1, 'outbound', 'tcp', '10.0.0.2', 40000, '93.184.216.34', 443, \
+                      7, 1, 10, 0, 0, 'active', '93.184.216.34', 'public', 0, \
+                      '[{\"domain\":\"example.com\",\"evidence\":\"tls_sni\",\
+                         \"confidence\":\"direct\"}]'); \
+                 PRAGMA user_version = 11;",
+            )
+            .expect("seed v11 schema");
+        }
+
+        let db = Db::open(&ApiConfig {
+            database: Some(path.clone()),
+            ..ApiConfig::default()
+        })
+        .expect("open upgraded database");
+
+        let mapped: (i64, String, String) = db
+            .conn
+            .query_row(
+                "SELECT flow_id, domain, evidence FROM flow_domains",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("backfilled mapping");
+        assert_eq!(mapped, (1, "example.com".to_owned(), "tls_sni".to_owned()));
+
+        // The old single-column indexes are replaced by the grouped ones.
+        let old_indexes: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' \
+                 AND name IN ('idx_flows_remote', 'idx_flows_app_id')",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count old indexes");
+        assert_eq!(old_indexes, 0);
+        let new_indexes: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' \
+                 AND name IN ('idx_flows_remote_last_seen', 'idx_flows_app_last_seen')",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count new indexes");
+        assert_eq!(new_indexes, 2);
+
+        // Triggers keep the mapping in step with the row and with deletes.
+        db.conn
+            .execute(
+                "UPDATE flows SET domains_json = ?1 WHERE id = 1",
+                [r#"[{"domain":"cdn.example","evidence":"http_host","confidence":"direct"}]"#],
+            )
+            .expect("update domains");
+        let mapped: (String, String) = db
+            .conn
+            .query_row("SELECT domain, evidence FROM flow_domains", [], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })
+            .expect("updated mapping");
+        assert_eq!(mapped, ("cdn.example".to_owned(), "http_host".to_owned()));
+
+        db.conn
+            .execute("DELETE FROM flows WHERE id = 1", [])
+            .expect("delete flow");
+        let remaining: i64 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM flow_domains", [], |row| row.get(0))
+            .expect("count mappings");
+        assert_eq!(remaining, 0);
+
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("db-wal"));
+        let _ = std::fs::remove_file(path.with_extension("db-shm"));
+    }
+
+    #[test]
+    fn migrates_a_v12_database_and_backfills_flow_stats() {
+        let unique = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_nanos();
+        let path =
+            std::env::temp_dir().join(format!("zs-flow-stats-{}-{unique}.db", std::process::id()));
+        {
+            let conn = Connection::open(&path).expect("open old database");
+            conn.execute_batch(
+                "CREATE TABLE flows ( \
+                     id INTEGER PRIMARY KEY, direction TEXT NOT NULL, protocol TEXT NOT NULL, \
+                     src_addr TEXT NOT NULL, src_port INTEGER, dst_addr TEXT NOT NULL, \
+                     dst_port INTEGER, ifindex INTEGER NOT NULL, interface TEXT, \
+                     packets INTEGER NOT NULL, bytes INTEGER NOT NULL, \
+                     first_seen_ms INTEGER NOT NULL, last_seen_ms INTEGER NOT NULL, \
+                     state TEXT NOT NULL, end_reason TEXT, remote_addr TEXT NOT NULL, \
+                     remote_port INTEGER, remote_scope TEXT NOT NULL, remote_country TEXT, \
+                     remote_region TEXT, remote_city TEXT, remote_asn INTEGER, \
+                     remote_org TEXT, remote_db_version TEXT, \
+                     remote_enriched_at_ms INTEGER NOT NULL, \
+                     domains_json TEXT NOT NULL DEFAULT '[]', service TEXT, app_id TEXT, \
+                     dst_scope TEXT); \
+                 INSERT INTO flows (id, direction, protocol, src_addr, dst_addr, ifindex, \
+                     packets, bytes, first_seen_ms, last_seen_ms, state, remote_addr, \
+                     remote_scope, remote_enriched_at_ms, domains_json) VALUES \
+                     (1, 'outbound', 'tcp', '10.0.0.2', '93.184.216.34', 7, 1, 10, 0, 0, \
+                      'active', '93.184.216.34', 'public', 0, \
+                      '[{\"domain\":\"example.com\",\"evidence\":\"tls_sni\",\
+                         \"confidence\":\"direct\"}]'), \
+                     (2, 'outbound', 'tcp', '10.0.0.2', '8.8.8.8', 7, 1, 10, 0, 0, \
+                      'active', '8.8.8.8', 'public', 0, '[]'), \
+                     (3, 'outbound', 'tcp', '10.0.0.2', '1.1.1.1', 7, 1, 10, 0, 0, \
+                      'ended', '1.1.1.1', 'public', 0, '[]'); \
+                 PRAGMA user_version = 12;",
+            )
+            .expect("seed v12 schema");
+        }
+
+        let db = Db::open(&ApiConfig {
+            database: Some(path.clone()),
+            ..ApiConfig::default()
+        })
+        .expect("open upgraded database");
+
+        let stats: (i64, i64, i64) = db
+            .conn
+            .query_row(
+                "SELECT flows_total, active_flows, flows_with_domain FROM flow_stats",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("backfilled stats");
+        assert_eq!(stats, (3, 2, 1));
+
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("db-wal"));
+        let _ = std::fs::remove_file(path.with_extension("db-shm"));
+    }
+
+    #[test]
+    fn flow_stats_triggers_track_inserts_updates_and_deletes() {
+        let db = db();
+        let stats = |db: &Db| -> (i64, i64, i64) {
+            db.conn
+                .query_row(
+                    "SELECT flows_total, active_flows, flows_with_domain FROM flow_stats",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .expect("stats row")
+        };
+        assert_eq!(stats(&db), (0, 0, 0));
+
+        db.conn
+            .execute_batch(
+                "INSERT INTO flows (id, direction, protocol, src_addr, dst_addr, ifindex, \
+                     packets, bytes, first_seen_ms, last_seen_ms, state, remote_addr, \
+                     remote_scope, remote_enriched_at_ms, domains_json) VALUES \
+                     (1, 'outbound', 'tcp', '10.0.0.2', '93.184.216.34', 7, 1, 10, 0, 0, \
+                      'active', '93.184.216.34', 'public', 0, \
+                      '[{\"domain\":\"example.com\",\"evidence\":\"tls_sni\",\
+                         \"confidence\":\"direct\"}]'), \
+                     (2, 'outbound', 'tcp', '10.0.0.2', '8.8.8.8', 7, 1, 10, 0, 0, \
+                      'active', '8.8.8.8', 'public', 0, '[]');",
+            )
+            .expect("insert flows");
+        assert_eq!(stats(&db), (2, 2, 1));
+
+        db.conn
+            .execute("UPDATE flows SET state = 'ended' WHERE id = 2", [])
+            .expect("end flow");
+        assert_eq!(stats(&db), (2, 1, 1));
+
+        db.conn
+            .execute(
+                "UPDATE flows SET domains_json = ?1 WHERE id = 2",
+                [r#"[{"domain":"cdn.example","evidence":"http_host","confidence":"direct"}]"#],
+            )
+            .expect("attach domain");
+        assert_eq!(stats(&db), (2, 1, 2));
+
+        db.conn
+            .execute("DELETE FROM flows WHERE id = 1", [])
+            .expect("delete flow");
+        assert_eq!(stats(&db), (1, 0, 1));
+    }
+
+    #[test]
+    fn entity_rates_are_written_incrementally() {
+        let mut db = db();
+        let bps = |db: &Db, key: &str| -> Option<(i64, i64)> {
+            db.conn
+                .query_row(
+                    "SELECT inbound_bps, outbound_bps FROM entity_rates \
+                     WHERE kind = 'endpoint' AND key = ?1",
+                    [key],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()
+                .expect("rate row")
+        };
+
+        let mut rate = EntityRates::started(1.0);
+        rate.add(FlowDirection::Outbound, 100);
+        db.rates_by_endpoint.insert("203.0.113.9".to_owned(), rate);
+        db.store_entity_rates().expect("first write");
+        // 100 bytes over one interval is 800 bits per second.
+        assert_eq!(bps(&db, "203.0.113.9"), Some((0, 800)));
+
+        // A later interval both moves the known key and drops it.
+        db.rates_by_endpoint.clear();
+        db.rates_by_endpoint
+            .insert("198.51.100.7".to_owned(), EntityRates::started(1.0));
+        db.store_entity_rates().expect("second write");
+        assert_eq!(bps(&db, "203.0.113.9"), None);
+        assert_eq!(bps(&db, "198.51.100.7"), Some((0, 0)));
     }
 
     #[test]

@@ -244,8 +244,8 @@ function TimelineTooltip({
         {day}
       </p>
       {[
-        { label: "Inbound", color: inboundColor, value: datum.inbound },
-        { label: "Outbound", color: outboundColor, value: datum.outbound },
+        { label: "Download", color: inboundColor, value: datum.inbound },
+        { label: "Upload", color: outboundColor, value: datum.outbound },
       ].map((entry) => (
         <p key={entry.label} className="flex items-center justify-between gap-2 text-xs">
           <span className="inline-flex items-center gap-1.5">

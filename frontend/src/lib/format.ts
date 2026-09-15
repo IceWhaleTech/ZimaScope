@@ -1,6 +1,14 @@
 /** Human-readable formatting for network telemetry. */
 
-import type { Confidence, Evidence, Scope, TimeRange } from "../types";
+import type {
+  Confidence,
+  Direction,
+  Evidence,
+  RuleDirection,
+  Scope,
+  TimeRange,
+  UnattributedReason,
+} from "../types";
 
 export function formatBytes(value: number, digits = 1): string {
   const units = ["B", "KB", "MB", "GB", "TB"];
@@ -90,6 +98,37 @@ export function evidenceTitle(evidence: Evidence): string {
 
 export function confidenceLabel(confidence: Confidence): string {
   return confidence === "direct" ? "Direct" : "Inferred";
+}
+
+/**
+ * Label for traffic without an Application Identity. Inbound LAN
+ * multicast/broadcast is expected to stay unattributed, so it is named
+ * instead of presented as a blind spot.
+ */
+export function unattributedLabel(reason?: UnattributedReason | null): string {
+  return reason === "lan_broadcast" ? "LAN broadcast" : "Unattributed";
+}
+
+/** Tooltip explaining why an Application Identity is absent. */
+export function unattributedTitle(reason?: UnattributedReason | null): string {
+  return reason === "lan_broadcast"
+    ? "Inbound multicast or broadcast from the LAN with no local listener or sender"
+    : "No socket ownership was observed for this traffic";
+}
+
+/**
+ * User-facing direction label: inbound traffic enters ZimaOS (download),
+ * outbound traffic leaves it (upload).
+ */
+export function directionLabel(direction: Direction | RuleDirection): string {
+  switch (direction) {
+    case "inbound":
+      return "Download";
+    case "outbound":
+      return "Upload";
+    default:
+      return "Both";
+  }
 }
 
 export function scopeLabel(scope: Scope): string {

@@ -11,7 +11,13 @@ import { memo } from "react";
 import { Boxes, Terminal } from "lucide-react";
 import { TableCell, TableRow } from "@/components/ui/table";
 import { ByteValues, DirectionBadge, EvidenceChip, FlowStateDot, RateValues } from "@/components/flow-bits";
-import { flagEmoji, formatDuration, relativeTime } from "@/lib/format";
+import {
+  flagEmoji,
+  formatDuration,
+  relativeTime,
+  unattributedLabel,
+  unattributedTitle,
+} from "@/lib/format";
 import { cn } from "@/lib/utils";
 import type { Flow } from "@/types";
 
@@ -79,8 +85,11 @@ export const FlowRow = memo(function FlowRow({
             <span className="truncate font-medium">{flow.application.name}</span>
           </span>
         ) : (
-          <span className="text-muted-foreground italic" title="No socket ownership observed">
-            Unattributed
+          <span
+            className="text-muted-foreground italic"
+            title={unattributedTitle(flow.unattributed_reason)}
+          >
+            {unattributedLabel(flow.unattributed_reason)}
           </span>
         )}
       </TableCell>
@@ -120,11 +129,11 @@ export const FlowRow = memo(function FlowRow({
 });
 
 export const FLOW_COLUMNS = [
-  { label: "Direction", sort: "direction", width: "8%" },
-  { label: "Remote endpoint", sort: "remote", width: "20%" },
-  { label: "Application", sort: "application", width: "13%" },
-  { label: "Associated domain", sort: "domain", width: "20%" },
-  { label: "Rate", sort: "rate", width: "17%" },
-  { label: "Total", sort: "bytes", width: "14%" },
-  { label: "Last seen", sort: "last_seen", width: "8%" },
+  { label: "Direction", sort: "direction", width: "12%" },
+  { label: "Remote endpoint", sort: "remote", width: "19%" },
+  { label: "Application", sort: "application", width: "12%" },
+  { label: "Associated domain", sort: "domain", width: "19%" },
+  { label: "Rate", sort: "rate", width: "16%" },
+  { label: "Total", sort: "bytes", width: "13%" },
+  { label: "Last seen", sort: "last_seen", width: "9%" },
 ] as const;

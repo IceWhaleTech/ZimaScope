@@ -1,11 +1,12 @@
-//! Startup seeding of pre-existing TCP listeners.
+//! Startup seeding of pre-existing listeners.
 //!
 //! `TCP_LISTEN_CB` only fires for sockets that start listening after the
-//! agent attached. Long-lived services (sshd, the OS web UI, media servers)
-//! already listen at boot, so their inbound Flows would never be attributed.
-//! One `/proc` sweep at startup seeds the tracker's listener cache with the
-//! processes that currently own a listening port; live `sock_ops` events keep
-//! the cache up to date from then on.
+//! agent attached, and UDP ownership is only captured when the host sends
+//! (`cgroup/sendmsg4`). Long-lived services (sshd, systemd-resolved, the OS
+//! web UI, media servers) already bind at boot, so inbound Flows to them
+//! would never be attributed. One `/proc` sweep at startup — refreshed
+//! periodically because owner entries expire — seeds the tracker's listener
+//! cache with the processes that currently own a bound TCP or UDP port.
 
 use std::{collections::HashMap, fs, os::unix::fs::MetadataExt, time::Instant};
 
@@ -21,29 +22,41 @@ pub(crate) fn seed(tracker: &mut FlowTracker, now: Instant) {
     }
 }
 
-/// Scans `/proc/net/tcp` and the file descriptor tables for listening
-/// sockets and their owning processes.
+/// Scans the `/proc` socket tables for bound ports and their owning processes.
 fn scan() -> Vec<(OwnerKey, OwnerValue)> {
-    let Ok(table) = fs::read_to_string("/proc/net/tcp") else {
-        return Vec::new();
-    };
-    let listeners = parse_listen_ports(&table);
-    if listeners.is_empty() {
+    let mut bound: Vec<(u8, u16, u64)> = Vec::new();
+    if let Ok(table) = fs::read_to_string("/proc/net/tcp") {
+        bound.extend(
+            parse_listen_ports(&table)
+                .into_iter()
+                .map(|(port, inode)| (TransportProtocol::Tcp as u8, port, inode)),
+        );
+    }
+    for path in ["/proc/net/udp", "/proc/net/udp6"] {
+        if let Ok(table) = fs::read_to_string(path) {
+            bound.extend(
+                parse_bound_ports(&table)
+                    .into_iter()
+                    .map(|(port, inode)| (TransportProtocol::Udp as u8, port, inode)),
+            );
+        }
+    }
+    if bound.is_empty() {
         return Vec::new();
     }
 
-    let inodes: Vec<u64> = listeners.iter().map(|(_, inode)| *inode).collect();
+    let inodes: Vec<u64> = bound.iter().map(|(_, _, inode)| *inode).collect();
     let owners = find_owner_pids(&inodes);
 
-    let mut seeded = Vec::with_capacity(listeners.len());
-    for (port, inode) in listeners {
+    let mut seeded = Vec::with_capacity(bound.len());
+    for (protocol, port, inode) in bound {
         let Some(pid) = owners.get(&inode) else {
             continue;
         };
         let Some(value) = owner_value(*pid) else {
             continue;
         };
-        seeded.push((listener_key(port), value));
+        seeded.push((listener_key(protocol, port), value));
     }
     seeded
 }
@@ -62,11 +75,7 @@ fn parse_listen_ports(table: &str) -> Vec<(u16, u64)> {
         if state != "0A" {
             continue;
         }
-        // `0100007F:1F90` — address:port, both hex.
-        let Some((_, port)) = local.split_once(':') else {
-            continue;
-        };
-        let Ok(port) = u16::from_str_radix(port, 16) else {
+        let Some(port) = local_port(local) else {
             continue;
         };
         // Columns after state: tx/rx queue, timer, retransmits, uid, timeout,
@@ -77,6 +86,41 @@ fn parse_listen_ports(table: &str) -> Vec<(u16, u64)> {
         }
     }
     listeners
+}
+
+/// Parses `local_port`/`inode` pairs of bound entries from `/proc/net/udp`.
+///
+/// Connected and unconnected sockets are both seeded: an inbound datagram for
+/// the port is owned by that process either way.
+fn parse_bound_ports(table: &str) -> Vec<(u16, u64)> {
+    let mut sockets = Vec::new();
+    for line in table.lines().skip(1) {
+        let mut fields = line.split_whitespace();
+        let Some(_slot) = fields.next() else { continue };
+        let Some(local) = fields.next() else { continue };
+        let Some(_remote) = fields.next() else {
+            continue;
+        };
+        let Some(_state) = fields.next() else {
+            continue;
+        };
+        let Some(port) = local_port(local) else {
+            continue;
+        };
+        let inode = fields.nth(5).and_then(|value| value.parse::<u64>().ok());
+        if let Some(inode) = inode {
+            sockets.push((port, inode));
+        }
+    }
+    sockets
+}
+
+/// Extracts the port from a `/proc/net` `address:port` field; port zero means
+/// the socket is not bound and cannot own an inbound datagram.
+fn local_port(local: &str) -> Option<u16> {
+    let (_, port) = local.split_once(':')?;
+    let port = u16::from_str_radix(port, 16).ok()?;
+    (port != 0).then_some(port)
 }
 
 /// Finds the process owning each socket inode by scanning `/proc/<pid>/fd`.
@@ -147,12 +191,12 @@ fn owner_value(pid: u32) -> Option<OwnerValue> {
     })
 }
 
-fn listener_key(port: u16) -> OwnerKey {
+fn listener_key(protocol: u8, port: u16) -> OwnerKey {
     OwnerKey {
         remote_addr: [0u8; 16],
         remote_port_be: 0,
         local_port_be: port.to_be(),
-        protocol: TransportProtocol::Tcp as u8,
+        protocol,
         kind: OwnerKind::Listener as u8,
         ip_family: IpFamily::V4 as u8,
         reserved: 0,
@@ -171,10 +215,24 @@ mod tests {
    3: 00000000:0016 00000000:0000 0A 00000000:00000000 00:00000000 00000000     0        0 11111 1 0000 100 0 0 10 0
 ";
 
+    const UDP_TABLE: &str = "\
+   sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode ref pointer drops
+  0: 0100007F:0035 00000000:0000 07 00000000:00000000 00:00000000 00000000   102        0 22222 2 0000000000000000 0
+  1: 00000000:14E9 00000000:0000 07 00000000:00000000 00:00000000 00000000     0        0 33333 2 0000000000000000 0
+  2: 0100007F:C350 0100007F:0035 01 00000000:00000000 00:00000000 00000000  1000        0 44444 2 0000000000000000 0
+  3: 00000000:0000 00000000:0000 07 00000000:00000000 00:00000000 00000000     0        0 55555 2 0000000000000000 0
+";
+
     #[test]
     fn parses_only_listening_sockets() {
         let listeners = parse_listen_ports(TABLE);
         assert_eq!(listeners, vec![(8080, 12345), (80, 54321), (22, 11111)]);
+    }
+
+    #[test]
+    fn parses_bound_udp_sockets_and_skips_unbound() {
+        let sockets = parse_bound_ports(UDP_TABLE);
+        assert_eq!(sockets, vec![(53, 22222), (5353, 33333), (50000, 44444)]);
     }
 
     #[test]
@@ -186,8 +244,9 @@ mod tests {
 
     #[test]
     fn builds_network_order_listener_keys() {
-        let key = listener_key(8080);
-        assert_eq!(u16::from_be(key.local_port_be), 8080);
+        let key = listener_key(TransportProtocol::Udp as u8, 5353);
+        assert_eq!(u16::from_be(key.local_port_be), 5353);
+        assert_eq!(key.protocol, TransportProtocol::Udp as u8);
         assert_eq!(key.kind, OwnerKind::Listener as u8);
         assert_eq!(key.remote_addr, [0u8; 16]);
         assert_eq!(key.remote_port_be, 0);

@@ -47,7 +47,10 @@ failed insert increments `owner_events_dropped`.
 
 Listeners that existed before the agent started never emit `TCP_LISTEN_CB`,
 so startup seeds the listener cache with one `/proc/net/tcp` +
-`/proc/<pid>/fd` sweep.
+`/proc/<pid>/fd` sweep. The same sweep covers bound UDP ports from
+`/proc/net/udp` and `/proc/net/udp6`: inbound datagrams to a local UDP service
+have no `sendmsg4` event of their own, so the listener entry is their only
+evidence. The sweep repeats every 20 s because owner entries expire.
 
 ## Join
 
@@ -102,3 +105,10 @@ Schema v4 adds `applications` (identity key, kind, display name, exe, comm,
 uid, container fields, first/last seen) and `flows.app_id`. Each Flow delta is
 also added to `entity_buckets` with `kind = 'application'`, so application
 timelines use the existing bucket machinery without new aggregation code.
+
+Schema v11 adds `flows.dst_scope`, the destination address class computed at
+ingest. Flows that stay unattributed because they are inbound LAN
+multicast/broadcast carry `unattributed_reason = "lan_broadcast"` on the API
+(Flow, Connection and per-entity Application usage); the remainder is
+explained, never attributed to an Application. Databases upgraded from v10
+backfill the column with the same Rust classifier.

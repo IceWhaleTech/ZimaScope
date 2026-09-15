@@ -643,7 +643,10 @@ export function ExplorerView() {
           const peers = new Set(
             connectionItemsRef.current.map((connection) => connection.remote.address),
           );
-          const updates = tick.flows.filter((flow) => peers.has(flow.remote.address));
+          const updates = [
+            ...tick.flows.map((flow) => flow.remote.address),
+            ...tick.flow_updates.map((patch) => patch.remote),
+          ].filter((address) => peers.has(address));
           if (updates.length) setPendingCount((count) => count + updates.length);
         }
       }),

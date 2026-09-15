@@ -8,7 +8,7 @@
 
 use std::{collections::HashMap, fs};
 
-use zimascope_common::model::ApplicationRef;
+use zimascope_common::model::{ApplicationRef, comm_bytes};
 
 use crate::cgroup::{self, CgroupIndex};
 
@@ -31,7 +31,9 @@ pub(crate) struct ResolvedApplication {
 /// Cached resolver for Application Identities.
 #[derive(Default)]
 pub(crate) struct ApplicationResolver {
-    cache: HashMap<(u32, String), ProcessFacts>,
+    /// Keyed by `(tgid, comm)` in kernel byte form so a cache hit needs no
+    /// allocation; the kernel already normalized `comm` to 16 bytes.
+    cache: HashMap<(u32, [u8; 16]), ProcessFacts>,
     cgroups: CgroupIndex,
 }
 
@@ -86,7 +88,7 @@ impl ApplicationResolver {
     }
 
     fn facts(&mut self, tgid: u32, comm: &str, cgroup_id: u64) -> ProcessFacts {
-        let key = (tgid, comm.to_owned());
+        let key = (tgid, comm_bytes(comm));
         if let Some(facts) = self.cache.get(&key) {
             return facts.clone();
         }

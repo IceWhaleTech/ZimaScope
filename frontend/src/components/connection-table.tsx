@@ -7,12 +7,18 @@
  */
 
 import { memo } from "react";
-import { ChevronRight } from "lucide-react";
+import { Boxes, ChevronRight, Terminal } from "lucide-react";
 import { TableCell, TableRow } from "@/components/ui/table";
 import { ByteValues, EvidenceChip, FlowStateDot, RateValues } from "@/components/flow-bits";
-import { flagEmoji, formatDuration, relativeTime } from "@/lib/format";
+import {
+  flagEmoji,
+  formatDuration,
+  relativeTime,
+  unattributedLabel,
+  unattributedTitle,
+} from "@/lib/format";
 import { cn } from "@/lib/utils";
-import type { Connection, DirectionTotals } from "@/types";
+import type { ApplicationRef, Connection, DirectionTotals, UnattributedReason } from "@/types";
 
 function endpointLabel(endpoint: Connection["remote"]): string {
   return `${endpoint.address}${endpoint.port ? `:${endpoint.port}` : ""}`;
@@ -90,6 +96,38 @@ function EvidenceCell({ domains }: { domains: Connection["domains"] }) {
   );
 }
 
+/** Application Identity of a row or group; clusters fold to `Name +N`. */
+function ApplicationCell({
+  applications,
+  reason,
+}: {
+  applications: ApplicationRef[];
+  reason?: UnattributedReason | null;
+}) {
+  const [first] = applications;
+  if (!first) {
+    return (
+      <span className="text-muted-foreground italic" title={unattributedTitle(reason)}>
+        {unattributedLabel(reason)}
+      </span>
+    );
+  }
+  const Icon = first.kind === "container" ? Boxes : Terminal;
+  const title =
+    applications.length === 1
+      ? `${first.kind === "container" ? "Container" : "Process"} · ${first.id}`
+      : applications.map((application) => application.id).join(", ");
+  return (
+    <span className="flex min-w-0 items-center gap-1.5" title={title}>
+      <Icon className="size-3 shrink-0 text-muted-foreground" />
+      <span className="truncate font-medium">{first.name}</span>
+      {applications.length > 1 && (
+        <span className="shrink-0 text-2xs text-muted-foreground">+{applications.length - 1}</span>
+      )}
+    </span>
+  );
+}
+
 /// Numeric key for IPv4 so `2.2.2.2` sorts before `10.0.0.1`; anything else
 /// sorts after IPv4 and falls back to the group-key tie-break.
 function ipSortKey(address: string): number {
@@ -130,6 +168,10 @@ export interface ConnectionGroup {
   first_seen: number;
   last_seen: number;
   domains: Connection["domains"];
+  /** Distinct Application Identities inside the group. */
+  applications: ApplicationRef[];
+  /** Every unattributed connection in the group is inbound LAN broadcast. */
+  broadcast: boolean;
 }
 
 /**
@@ -168,6 +210,8 @@ export function groupConnections(connections: Connection[], sort: string): Conne
         first_seen: connection.first_seen,
         last_seen: connection.last_seen,
         domains: [],
+        applications: [],
+        broadcast: true,
       };
       groups.set(key, group);
     }
@@ -189,6 +233,14 @@ export function groupConnections(connections: Connection[], sort: string): Conne
         group.domains.push(ref);
       }
     }
+    if (
+      connection.application &&
+      !group.applications.some((application) => application.id === connection.application!.id)
+    ) {
+      group.applications.push(connection.application);
+    }
+    group.broadcast =
+      group.broadcast && connection.unattributed_reason === "lan_broadcast";
   }
 
   const field = sort.startsWith("-") ? sort.slice(1) : sort;
@@ -295,6 +347,12 @@ const ConnectionRow = memo(function ConnectionRow({
         </span>
       </TableCell>
       <TableCell>
+        <ApplicationCell
+          applications={connection.application ? [connection.application] : []}
+          reason={connection.unattributed_reason}
+        />
+      </TableCell>
+      <TableCell>
         <DomainCell domains={connection.domains} />
       </TableCell>
       <TableCell>
@@ -379,6 +437,12 @@ function GroupRow({
         )}
       </TableCell>
       <TableCell>
+        <ApplicationCell
+          applications={group.applications}
+          reason={group.broadcast ? "lan_broadcast" : null}
+        />
+      </TableCell>
+      <TableCell>
         {domainGroup ? <EvidenceCell domains={group.domains} /> : <DomainCell domains={group.domains} />}
       </TableCell>
       <TableCell>
@@ -455,6 +519,12 @@ const ChildRow = memo(function ChildRow({
             <span title="This device side">:{connection.host.port ?? "—"}</span>
           </span>
         )}
+      </TableCell>
+      <TableCell>
+        <ApplicationCell
+          applications={connection.application ? [connection.application] : []}
+          reason={connection.unattributed_reason}
+        />
       </TableCell>
       <TableCell>
         <DomainCell domains={connection.domains} />
@@ -542,15 +612,16 @@ export function ConnectionRows({
 }
 
 export const CONNECTION_COLUMNS = [
-  { label: "Service", sort: "service", width: "10%" },
-  { label: "Remote endpoint", sort: "remote", width: "24%" },
-  { label: "Associated domain", sort: "domain", width: "22%" },
-  { label: "Rate", sort: "rate", sorts: ["rate", "in_rate", "out_rate"], width: "17%" },
+  { label: "Service", sort: "service", width: "9%" },
+  { label: "Remote endpoint", sort: "remote", width: "21%" },
+  { label: "Application", sort: "application", width: "13%" },
+  { label: "Associated domain", sort: "domain", width: "20%" },
+  { label: "Rate", sort: "rate", sorts: ["rate", "in_rate", "out_rate"], width: "15%" },
   {
     label: "Total",
     sort: "bytes",
     sorts: ["bytes", "in_bytes", "out_bytes"],
-    width: "15%",
+    width: "12%",
   },
-  { label: "Last seen", sort: "last_seen", width: "12%" },
+  { label: "Last seen", sort: "last_seen", width: "10%" },
 ] as const;

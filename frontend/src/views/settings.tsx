@@ -47,7 +47,7 @@ import {
 } from "@/hooks/use-data";
 import { useSetTopbar } from "@/hooks/use-topbar";
 import { downloadExport } from "@/lib/download";
-import { formatDuration, formatNumber, formatRateText, relativeTime } from "@/lib/format";
+import { directionLabel, formatDuration, formatNumber, formatRateText, relativeTime } from "@/lib/format";
 import { cn } from "@/lib/utils";
 import type {
   InterfaceInfo,
@@ -792,7 +792,7 @@ function TrafficRulesCard({
                 <div className="min-w-0 flex-1">
                   <div className="flex items-center gap-2">
                     <span className="truncate font-mono text-xs">{ruleTarget(rule)}</span>
-                    <span className="shrink-0 text-2xs text-muted-foreground">{rule.direction}</span>
+                    <span className="shrink-0 text-2xs text-muted-foreground">{directionLabel(rule.direction)}</span>
                   </div>
                   <p className="mt-0.5 text-2xs text-muted-foreground">
                     {rule.action === "limit"

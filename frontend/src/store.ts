@@ -46,6 +46,9 @@ let openQueryKey = "";
 /// Delay before the last unsubscriber closes the stream, so view transitions
 /// do not cancel and reopen the connection.
 let stopTimer: number | undefined;
+/// Hidden tabs stop streaming entirely; a background page that keeps a 1 Hz
+/// connection open spends bandwidth for nobody.
+let visibilityPaused = false;
 
 /** Notified when the stream reports `resync`: reload REST state. */
 export function onResync(listener: () => void): () => void {
@@ -180,6 +183,7 @@ export function subscribeTicks(listener: (tick: Tick) => void): () => void {
 }
 
 function ensureTicker(): void {
+  if (visibilityPaused) return;
   if (tickerStarted) {
     // Reuse the open connection unless it carries stale filters.
     if (!eventSource || openQueryKey !== streamQueryKey) openStream();
@@ -187,6 +191,26 @@ function ensureTicker(): void {
   }
   tickerStarted = true;
   openStream();
+}
+
+function handleVisibilityChange(): void {
+  if (typeof document === "undefined") return;
+  if (document.visibilityState === "hidden") {
+    if (tickerStarted) stopTicker();
+    visibilityPaused = true;
+    return;
+  }
+  if (!visibilityPaused) return;
+  visibilityPaused = false;
+  if (listeners.size) {
+    ensureTicker();
+    // Ticks missed while hidden are not replayed; reload REST state instead.
+    notifyResync();
+  }
+}
+
+if (typeof document !== "undefined") {
+  document.addEventListener("visibilitychange", handleVisibilityChange);
 }
 
 function openStream(): void {

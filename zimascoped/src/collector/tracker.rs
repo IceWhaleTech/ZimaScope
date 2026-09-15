@@ -830,6 +830,41 @@ mod tests {
     }
 
     #[test]
+    fn udp_listener_owner_joins_inbound_datagrams() {
+        let mut tracker = FlowTracker::new(Duration::from_secs(30));
+        let now = Instant::now();
+        let mut kernel_key = key();
+        kernel_key.direction = kernel_abi::Direction::Inbound as u8;
+        kernel_key.protocol = TransportProtocol::Udp as u8;
+        kernel_key.src_addr = addr([9, 9, 9, 9]);
+        kernel_key.src_port_be = 55_000u16.to_be();
+        kernel_key.dst_addr = addr([10, 0, 0, 2]);
+        kernel_key.dst_port_be = 5353u16.to_be();
+
+        // Seeded from /proc/net/udp: no local send happened, so the listener
+        // entry is the only evidence for the process behind the port.
+        let lookup = super::owner_key(
+            TransportProtocol::Udp as u8,
+            OwnerKind::Listener,
+            5353,
+            "0.0.0.0".parse().expect("unspecified"),
+            None,
+        );
+        tracker.record_owner(&lookup, &owner_value(777, 0, "avahi-daemon"), now);
+
+        let updates = observe(
+            &mut tracker,
+            &kernel_key,
+            &[value(1, 100, 100, 200, 0)],
+            now,
+        );
+
+        let application = updates[0].application.as_ref().expect("application");
+        assert_eq!(application.tgid, 777);
+        assert_eq!(application.comm.as_ref(), "avahi-daemon");
+    }
+
+    #[test]
     fn exact_socket_owner_wins_over_the_listener_fallback() {
         let mut tracker = FlowTracker::new(Duration::from_secs(30));
         let now = Instant::now();

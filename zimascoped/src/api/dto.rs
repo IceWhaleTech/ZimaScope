@@ -220,6 +220,35 @@ pub struct ApplicationRefDto {
     pub kind: &'static str,
 }
 
+/// Why a Flow carries no Application Identity, when the absence is expected.
+///
+/// This explains the remainder; it never attributes it to an Application.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UnattributedReason {
+    /// Inbound LAN multicast or broadcast with no local listener or sender:
+    /// discovery chatter addressed at the device, not an Application.
+    LanBroadcast,
+}
+
+/// One Application's share of an Endpoint, Domain or Connection.
+///
+/// `application` is `None` for boundary traffic with no observed socket
+/// ownership. The unattributed remainder is reported as its own entry and is
+/// never redistributed across the attributed Applications.
+#[derive(Clone, Debug, Serialize)]
+pub struct ApplicationUsageDto {
+    pub application: Option<ApplicationRefDto>,
+    /// Set when `application` is `None` and the absence has a known,
+    /// non-Application explanation.
+    pub unattributed_reason: Option<UnattributedReason>,
+    pub packets: u64,
+    pub bytes: u64,
+    /// Directional split relative to the Device Boundary.
+    pub traffic: DirectionTotalsDto,
+    pub flow_count: u64,
+}
+
 /// One Application Identity with its traffic over the requested window.
 #[derive(Clone, Debug, Serialize)]
 pub struct ApplicationSummaryDto {
@@ -232,7 +261,7 @@ pub struct ApplicationSummaryDto {
     pub container_id: Option<String>,
     pub packets: u64,
     pub bytes: u64,
-    /// Trailing average over the last few collection intervals (~5 s).
+    /// Rate over the latest collection interval (~1 s).
     pub inbound_bps: u64,
     pub outbound_bps: u64,
     /// Directional split relative to the Device Boundary.
@@ -299,7 +328,7 @@ pub struct FlowDto {
     pub interface: Option<String>,
     pub packets: u64,
     pub bytes: u64,
-    /// Trailing average over the last few collection intervals (~5 s). A directional
+    /// Rate over the latest collection interval (~1 s). A directional
     /// Flow only carries the side matching its `direction`.
     pub inbound_bps: u64,
     pub outbound_bps: u64,
@@ -309,6 +338,9 @@ pub struct FlowDto {
     pub domains: Vec<DomainRefDto>,
     /// Application Identity resolved from socket ownership, when observed.
     pub application: Option<ApplicationRefDto>,
+    /// Set when `application` is `None` and the absence has a known,
+    /// non-Application explanation.
+    pub unattributed_reason: Option<UnattributedReason>,
 }
 
 /// One connection: both directions of a Flow merged into a single record.
@@ -337,7 +369,7 @@ pub struct ConnectionDto {
     pub interface: Option<String>,
     pub packets: u64,
     pub bytes: u64,
-    /// Trailing average over the last few collection intervals (~5 s).
+    /// Rate over the latest collection interval (~1 s).
     pub inbound_bps: u64,
     pub outbound_bps: u64,
     /// Directional counters relative to the Device Boundary.
@@ -346,6 +378,11 @@ pub struct ConnectionDto {
     pub last_seen: i64,
     pub duration_ms: u64,
     pub domains: Vec<DomainRefDto>,
+    /// Application Identity resolved from socket ownership, when observed.
+    pub application: Option<ApplicationRefDto>,
+    /// Set when `application` is `None` and the absence has a known,
+    /// non-Application explanation.
+    pub unattributed_reason: Option<UnattributedReason>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -371,7 +408,7 @@ pub struct EndpointSummaryDto {
     pub organization: Option<String>,
     pub packets: u64,
     pub bytes: u64,
-    /// Trailing average over the last few collection intervals (~5 s).
+    /// Rate over the latest collection interval (~1 s).
     pub inbound_bps: u64,
     pub outbound_bps: u64,
     /// Directional split relative to the Device Boundary.
@@ -402,6 +439,9 @@ pub struct EndpointDetailDto {
     pub last_seen: i64,
     pub ports: Vec<PortUsageDto>,
     pub domains: Vec<DomainRefDto>,
+    /// Applications observed talking to this Endpoint, plus the unattributed
+    /// remainder as `application: null`.
+    pub applications: Vec<ApplicationUsageDto>,
     pub flows_url: String,
 }
 
@@ -416,7 +456,7 @@ pub struct DomainSummaryDto {
     pub domain: String,
     pub packets: u64,
     pub bytes: u64,
-    /// Trailing average over the last few collection intervals (~5 s).
+    /// Rate over the latest collection interval (~1 s).
     pub inbound_bps: u64,
     pub outbound_bps: u64,
     /// Directional split relative to the Device Boundary.
@@ -467,6 +507,9 @@ pub struct DomainDetailDto {
     pub addresses: Vec<DomainAddressDto>,
     pub countries: Vec<CountryCountDto>,
     pub asns: Vec<AsnCountDto>,
+    /// Applications observed contacting this Domain, plus the unattributed
+    /// remainder as `application: null`.
+    pub applications: Vec<ApplicationUsageDto>,
     pub flows_url: String,
 }
 
@@ -930,12 +973,47 @@ pub struct TickDto {
     pub interval_ms: u64,
     pub traffic: TickTrafficDto,
     pub flows: Vec<FlowDto>,
+    /// Compact counter patches for Flows whose descriptive fields did not
+    /// change this interval. Idle or slow Flows ride here instead of
+    /// repeating their full record every second.
+    pub flow_updates: Vec<FlowPatchDto>,
     pub endpoints: Vec<EndpointSummaryDto>,
     pub domains: Vec<DomainSummaryDto>,
     pub applications: Vec<ApplicationSummaryDto>,
     pub observations: Vec<DomainObservationDto>,
     pub overview: TickOverviewDto,
     pub health: Option<CollectorHealthDto>,
+}
+
+/// Counter-only update for one Flow on the live stream.
+///
+/// Clients merge these into locally known Flows by `id`; a Flow never
+/// appears in both `flows` and `flow_updates` in the same tick.
+#[derive(Clone, Debug, Serialize)]
+pub struct FlowPatchDto {
+    pub id: String,
+    /// Remote peer address, so list views can match the patch without the
+    /// full Flow record.
+    pub remote: String,
+    pub packets: u64,
+    pub bytes: u64,
+    pub last_seen: i64,
+    pub inbound_bps: u64,
+    pub outbound_bps: u64,
+}
+
+impl From<&FlowDto> for FlowPatchDto {
+    fn from(flow: &FlowDto) -> Self {
+        Self {
+            id: flow.id.clone(),
+            remote: flow.remote.address.clone(),
+            packets: flow.packets,
+            bytes: flow.bytes,
+            last_seen: flow.last_seen,
+            inbound_bps: flow.inbound_bps,
+            outbound_bps: flow.outbound_bps,
+        }
+    }
 }
 
 /// Live counters over all retained history, updated every interval.

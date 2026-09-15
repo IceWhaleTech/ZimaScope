@@ -38,8 +38,8 @@ export interface TrafficRulePreset {
 const MBPS_TO_BYTES_PER_S = 125_000;
 
 const DIRECTION_OPTIONS = [
-  { value: "outbound", label: "Outbound" },
-  { value: "inbound", label: "Inbound" },
+  { value: "outbound", label: "Upload" },
+  { value: "inbound", label: "Download" },
   { value: "both", label: "Both" },
 ];
 

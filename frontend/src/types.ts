@@ -62,6 +62,28 @@ export interface ApplicationRef {
   kind: "process" | "container";
 }
 
+/**
+ * Why traffic carries no Application Identity, when the absence is expected.
+ * The remainder is explained, never attributed to an app.
+ */
+export type UnattributedReason = "lan_broadcast";
+
+/**
+ * One Application's share of an Endpoint, Domain or Connection. `application`
+ * is null for traffic with no observed socket ownership; the remainder is
+ * reported as its own entry, never redistributed across the attributed apps.
+ */
+export interface ApplicationUsage {
+  application: ApplicationRef | null;
+  /** Set when `application` is null and the absence has a known explanation. */
+  unattributed_reason: UnattributedReason | null;
+  packets: number;
+  bytes: number;
+  /** Directional split relative to the Device Boundary. */
+  traffic: DirectionTotals;
+  flow_count: number;
+}
+
 export interface Flow {
   id: string;
   direction: Direction;
@@ -75,7 +97,7 @@ export interface Flow {
   interface: string | null;
   packets: number;
   bytes: number;
-  /** Trailing average over the last few collection intervals (~5 s). */
+  /** Rate over the latest collection interval (~1 s). */
   inbound_bps: number;
   outbound_bps: number;
   first_seen: number;
@@ -83,6 +105,8 @@ export interface Flow {
   duration_ms: number;
   domains: DomainRef[];
   application: ApplicationRef | null;
+  /** Set when `application` is null and the absence has a known explanation. */
+  unattributed_reason: UnattributedReason | null;
 }
 
 /**
@@ -106,7 +130,7 @@ export interface Connection {
   interface: string | null;
   packets: number;
   bytes: number;
-  /** Trailing average over the last few collection intervals (~5 s). */
+  /** Rate over the latest collection interval (~1 s). */
   inbound_bps: number;
   outbound_bps: number;
   /** Directional counters relative to the Device Boundary. */
@@ -115,6 +139,10 @@ export interface Connection {
   last_seen: number;
   duration_ms: number;
   domains: DomainRef[];
+  /** Application Identity resolved from socket ownership, when observed. */
+  application: ApplicationRef | null;
+  /** Set when `application` is null and the absence has a known explanation. */
+  unattributed_reason: UnattributedReason | null;
 }
 
 export interface EndpointSummary {
@@ -126,7 +154,7 @@ export interface EndpointSummary {
   organization: string | null;
   packets: number;
   bytes: number;
-  /** Trailing average over the last few collection intervals (~5 s). */
+  /** Rate over the latest collection interval (~1 s). */
   inbound_bps: number;
   outbound_bps: number;
   traffic: DirectionTotals;
@@ -154,6 +182,8 @@ export interface EndpointDetail {
   last_seen: number;
   ports: PortUsage[];
   domains: DomainRef[];
+  /** Applications using this Endpoint, with the unattributed remainder. */
+  applications: ApplicationUsage[];
   flows_url: string;
 }
 
@@ -168,7 +198,7 @@ export interface ApplicationSummary {
   container_id: string | null;
   packets: number;
   bytes: number;
-  /** Trailing average over the last few collection intervals (~5 s). */
+  /** Rate over the latest collection interval (~1 s). */
   inbound_bps: number;
   outbound_bps: number;
   traffic: DirectionTotals;
@@ -187,7 +217,7 @@ export interface ApplicationDetail {
   container_id: string | null;
   packets: number;
   bytes: number;
-  /** Trailing average over the last few collection intervals (~5 s). */
+  /** Rate over the latest collection interval (~1 s). */
   inbound_bps: number;
   outbound_bps: number;
   traffic: DirectionTotals;
@@ -222,7 +252,7 @@ export interface DomainSummary {
   domain: string;
   packets: number;
   bytes: number;
-  /** Trailing average over the last few collection intervals (~5 s). */
+  /** Rate over the latest collection interval (~1 s). */
   inbound_bps: number;
   outbound_bps: number;
   traffic: DirectionTotals;
@@ -268,6 +298,8 @@ export interface DomainDetail {
   addresses: DomainAddress[];
   countries: CountryCount[];
   asns: AsnCount[];
+  /** Applications using this Domain, with the unattributed remainder. */
+  applications: ApplicationUsage[];
   flows_url: string;
 }
 
@@ -641,6 +673,17 @@ export interface TickOverview {
   ratio: number;
 }
 
+/** Counter-only update for one Flow on the live stream. */
+export interface FlowPatch {
+  id: string;
+  remote: string;
+  packets: number;
+  bytes: number;
+  last_seen: number;
+  inbound_bps: number;
+  outbound_bps: number;
+}
+
 /** One collection interval pushed over `/v1/stream` (`event: tick`). */
 export interface Tick {
   sequence: number;
@@ -648,6 +691,8 @@ export interface Tick {
   interval_ms: number;
   traffic: Rates & { inbound: Counters; outbound: Counters };
   flows: Flow[];
+  /** Counter patches for Flows whose full record did not change. */
+  flow_updates: FlowPatch[];
   /** Refreshed aggregates for every peer touched by this interval. */
   endpoints: EndpointSummary[];
   /** Refreshed aggregates for every Associated Domain touched. */

@@ -6,6 +6,7 @@
 import { ArrowDown, ArrowDownLeft, ArrowUp, ArrowUpRight } from "lucide-react";
 import { cn } from "@/lib/utils";
 import {
+  directionLabel,
   evidenceTitle,
   flagEmoji,
   formatBytes,
@@ -13,7 +14,7 @@ import {
   formatRateText,
   scopeLabel,
 } from "@/lib/format";
-import type { Confidence, Counters, Evidence, FlowState, Scope } from "@/types";
+import type { Confidence, Counters, Direction, Evidence, FlowState, Scope } from "@/types";
 
 export function StateBadge({ state }: { state: FlowState }) {
   const active = state === "active";
@@ -40,25 +41,26 @@ export function FlowStateDot({ state }: { state: FlowState }) {
   );
 }
 
-export function DirectionBadge({ direction }: { direction: string }) {
+export function DirectionBadge({ direction }: { direction: Direction }) {
   const outbound = direction === "outbound";
   const Icon = outbound ? ArrowUpRight : ArrowDownLeft;
   return (
     <span
+      title={outbound ? "Upload — leaving ZimaOS" : "Download — entering ZimaOS"}
       className={cn(
         "inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-sm font-medium whitespace-nowrap",
         outbound ? "bg-series-outbound/12 text-series-outbound" : "bg-series-inbound/10 text-series-inbound",
       )}
     >
       <Icon className="size-3" strokeWidth={2.2} />
-      {outbound ? "Out" : "In"}
+      {directionLabel(direction)}
     </span>
   );
 }
 
 /**
- * Live rate with its direction arrow, e.g. `↓ 8.4 Mbps`. Inbound means
- * entering ZimaOS (download); outbound means leaving it (upload).
+ * Live rate with its direction arrow, e.g. `↓ 8.4 Mbps`. Download enters
+ * ZimaOS (inbound); upload leaves it (outbound).
  */
 export function RateValue({
   direction,
@@ -78,7 +80,7 @@ export function RateValue({
         inbound ? "text-series-inbound" : "text-series-outbound",
         className,
       )}
-      title={`${inbound ? "Download (entering ZimaOS)" : "Upload (leaving ZimaOS)"}: ${formatRateText(bps ?? 0)}, averaged over the last few seconds`}
+      title={`${inbound ? "Download (entering ZimaOS)" : "Upload (leaving ZimaOS)"}: ${formatRateText(bps ?? 0)}, rate over the latest interval`}
     >
       <Icon className="size-3" strokeWidth={2.2} />
       {formatRateText(bps ?? 0)}
