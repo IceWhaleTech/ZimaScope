@@ -350,8 +350,7 @@ impl CollectorCore {
     /// rollback if any attachment in the requested set fails.
     #[cfg(target_os = "linux")]
     fn open(config: CollectorConfig) -> Result<Self> {
-        let source =
-            aya::AyaKernelSource::open(&config).context("open Z-Scope eBPF collector")?;
+        let source = aya::AyaKernelSource::open(&config).context("open Z-Scope eBPF collector")?;
         let mut core = Self::new(config, Box::new(source));
         // Services already listening at startup never emit TCP_LISTEN_CB, so
         // seed their ownership once before the first poll; poll_once refreshes
