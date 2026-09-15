@@ -1,6 +1,20 @@
 {
   "name": "zimascope",
   "version": "v__ZIMASCOPE_VERSION__",
+  "ui": {
+    "name": "zimascope",
+    "title": {
+      "en_us": "ZimaScope"
+    },
+    "description": "Network observability at the ZimaOS device boundary",
+    "prefetch": false,
+    "show": true,
+    "entry": "/modules/zimascope/index.html",
+    "icon": "/modules/zimascope/appicon.png",
+    "formality": {
+      "type": "newtab"
+    }
+  },
   "services": [
     {
       "name": "zimascoped"
